@@ -2,7 +2,7 @@ const path = require('path')
 module.exports = {
   version: "3.7",
   title: "FlashVSR_plus",
-  description: "",
+  description: "FlashVSR - Video Upscaler: [Runs on 12GB vram, 32GB ram] Diffusion-Based Streaming Video Super-Resolution",
   icon: "icon.png",
   menu: async (kernel, info) => {
     let installed = info.exists("app/env")

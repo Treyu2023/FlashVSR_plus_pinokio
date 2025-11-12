@@ -1,4 +1,6 @@
-This repo is a 1-click [Pinokio](https://pinokio.co/) install for [ai-anchorite/FlashVSR_plus](https://github.com/ai-anchorite/FlashVSR_plus)
+This repo has a [Pinokio](https://pinokio.co/) 1-click-installer available [here:](https://pinokio.co/item.html?uri=https%3A%2F%2Fgithub.com%2Fai-anchorite%2FFlashVSR_plus_pinokio&parent_frame=&theme=null)
+
+Installing outside of Pinokio will require ffmepg on PATH and self-installed pytorch. Torch install info can be seen [here:](https://github.com/ai-anchorite/FlashVSR_plus_pinokio/blob/main/torch.js)
 
 Forked from: [lihaoyun6/FlashVSR_plus](https://github.com/lihaoyun6/FlashVSR_plus)
 
@@ -7,22 +9,22 @@ Original Project: [OpenImagingLab/FlashVSR](https://github.com/OpenImagingLab/Fl
 # FlashVSR: Efficient & High-Quality Video Super-Resolution
 A user-friendly fork of FlashVSR, enhanced and packaged for the Pinokio community. This version is optimized for consumer-grade hardware, enabling users to access powerful video and image upscaling without the demanding VRAM requirements of the original project.
 
- <summary>Tab Screenshots</summary>
+<summary>Tab Screenshots</summary>
 <table>
   <tr>
     <td valign="top">
-      <a href="https://github.com/user-attachments/assets/86e3b88b-e534-4fc8-b52c-365fcd7beaab">
-        <img src="https://github.com/user-attachments/assets/86e3b88b-e534-4fc8-b52c-365fcd7beaab" alt="flashvsr_video_screen" width="250">
+      <a href="https://raw.githubusercontent.com/ai-anchorite/FlashVSR_plus/main/inputs/flashvsr_video_screen.png">
+        <img src="https://raw.githubusercontent.com/ai-anchorite/FlashVSR_plus/main/inputs/flashvsr_video_screen.png" alt="flashvsr_video_screen" width="250">
       </a>
     </td>
     <td valign="top">
-      <a href="https://github.com/user-attachments/assets/345a9e7e-614e-474b-95e0-ea63f79b5e95">
-        <img src="https://github.com/user-attachments/assets/345a9e7e-614e-474b-95e0-ea63f79b5e95" alt="flashvsr_img_screen" width="250">
+      <a href="https://raw.githubusercontent.com/ai-anchorite/FlashVSR_plus/main/inputs/flashvsr_img_screen.png">
+        <img src="https://raw.githubusercontent.com/ai-anchorite/FlashVSR_plus/main/inputs/flashvsr_img_screen.png" alt="flashvsr_img_screen" width="250">
       </a>
     </td>
     <td valign="top">
-      <a href="https://github.com/user-attachments/assets/5191fd0b-f98b-4dac-abaa-7363707e9823">
-        <img src="https://github.com/user-attachments/assets/5191fd0b-f98b-4dac-abaa-7363707e9823" alt="flashvsr_toolbox_screen" width="250">
+      <a href="https://raw.githubusercontent.com/ai-anchorite/FlashVSR_plus/main/inputs/flashvsr_toolbox_screen.png">
+        <img src="https://raw.githubusercontent.com/ai-anchorite/FlashVSR_plus/main/inputs/flashvsr_toolbox_screen.png" alt="flashvsr_toolbox_screen" width="250">
       </a>
     </td>
   </tr>

@@ -1,8 +1,8 @@
 const path = require('path')
 module.exports = {
   version: "3.7",
-  title: "FlashVSR_v0.5",
-  description: "FlashVSR - Video Upscaler: [Runs on 12GB vram, 32GB ram] Diffusion-Based Streaming Video Super-Resolution",
+  title: "FlashVSR_v0.6",
+  description: "FlashVSR - Video and Image Upscaler: [Runs on 12GB vram, 32GB ram] Diffusion-Based Streaming Video Super-Resolution",
   icon: "icon.png",
   menu: async (kernel, info) => {
     let installed = info.exists("app/env")
@@ -39,7 +39,7 @@ module.exports = {
             default: true,
             icon: 'fa-solid fa-terminal',
             text: "Terminal",
-            href: "start.js",
+            href: "start.js?ts=" + Date.now(), // forces a "fresh" webui avoiding having to click refresh to re-activate
           }]
         }
       } else if (running.update) {
@@ -68,7 +68,7 @@ module.exports = {
           default: true,
           icon: "fa-solid fa-power-off",
           text: "Start",
-          href: "start.js",
+          href: "start.js?ts=" + Date.now(),
         }, {
           icon: "fa-solid fa-plug",
           text: "Update",

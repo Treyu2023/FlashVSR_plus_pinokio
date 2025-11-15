@@ -1,11 +1,13 @@
 This repo has a [Pinokio](https://pinokio.co/) 1-click-installer available [here:](https://pinokio.co/item.html?uri=https%3A%2F%2Fgithub.com%2Fai-anchorite%2FFlashVSR_plus_pinokio&parent_frame=&theme=null)
 
 Installing outside of Pinokio will require ffmepg on PATH and self-installed pytorch. Torch install info can be seen [here:](https://github.com/ai-anchorite/FlashVSR_plus_pinokio/blob/main/torch.js)
+---
+Installs a custom fork: [ai-anchorite/FlashVSR_plus](https://github.com/ai-anchorite/FlashVSR_plus)
 
 Forked from: [lihaoyun6/FlashVSR_plus](https://github.com/lihaoyun6/FlashVSR_plus)
 
 Original Project: [OpenImagingLab/FlashVSR](https://github.com/OpenImagingLab/FlashVSR )
-
+---
 # FlashVSR: Efficient & High-Quality Video Super-Resolution
 A user-friendly fork of FlashVSR, enhanced and packaged for the Pinokio community. This version is optimized for consumer-grade hardware, enabling users to access powerful video and image upscaling without the demanding VRAM requirements of the original project.
 

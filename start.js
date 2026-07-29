@@ -5,10 +5,12 @@ module.exports = {
       method: "shell.run",
       params: {
         venv: "env",                // Edit this to customize the venv folder path
-        env: { },                   // Edit this to customize environment variables (see documentation)
+        env: {
+          PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,max_split_size_mb:512",
+        },
         path: "app",                // Edit this to customize the path to start the shell from
         message: [
-          "python webui.py",    // Edit with your custom commands
+          "python webui.py",        // Edit with your custom commands
         ],
         on: [{
           // The regular expression pattern to monitor.

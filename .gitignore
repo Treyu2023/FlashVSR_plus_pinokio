@@ -1,0 +1,20 @@
+# Runtime / bulk (never commit)
+app/env/
+app/models/
+app/outputs/
+app/_temp/
+app/inputs/
+app/**/__pycache__/
+app/**/*.pyc
+app/**/.cache/
+**/__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+
+# Local user config (machine-specific paths) — keep tracked example optional
+# app/webui_config is machine-specific; still useful — track it if present
+
+# Logs / caches at repo root
+cache/
+logs/

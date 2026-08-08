@@ -1,0 +1,33 @@
+# FlashVSR+ defaults — profiled for RTX 4090 24GB / i9-14900K / 64GB RAM
+# Last tuned: 2026-07-31
+clear_temp_on_start=True
+autosave=True
+tb_autosave=True
+naming_mode=both
+theme=Interstellar
+toolbox_output_dir=D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV
+chunk_duration=12
+enable_chunks=True
+tiled_dit=True
+tiled_vae=True
+unload_dit=True
+tile_size=320
+tile_overlap=40
+attention_mode=sage
+sparse_ratio=1.5
+local_range=11
+kv_ratio=3
+quality=7
+randomize_seed=False
+scale=4
+mode=tiny
+model_version=v1.1
+dtype=bf16
+color_fix=True
+fps_override=30
+device=cuda:0
+batch_resize_preset=768px
+tb_frames_quality=95
+tb_export_quality=92
+tb_export_max_width=3840
+output_dir=

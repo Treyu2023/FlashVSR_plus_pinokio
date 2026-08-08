@@ -1,0 +1,23 @@
+# Core UI
+gradio>=5.49.0,<6.0.0
+gradio-videoslider
+
+# Core dependencies
+numpy>=2.2.0,<3.0.0
+einops~=0.8.0
+safetensors~=0.6.0
+tqdm~=4.67.0
+pillow>=11.0.0,<12.0.0
+devicetorch
+
+# Video processing
+imageio~=2.37.0
+imageio-ffmpeg~=0.6.0
+ffmpeg-python~=0.2.0
+
+# Model management
+huggingface_hub>=1.0.0,<2.0.0
+hf-xet~=1.2.0
+
+# System monitoring
+psutil~=7.1.0

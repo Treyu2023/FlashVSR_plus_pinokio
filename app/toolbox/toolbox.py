@@ -46,7 +46,105 @@ class ToolboxProcessor:
         self.ffmpeg_exe, self.ffprobe_exe, self.has_ffmpeg = self._initialize_ffmpeg()
         self.autosave_enabled = autosave_enabled
         self.rife_handler = RIFEHandler()
-    
+        # Encoder prefs (quality-preserving speed). Override via webui queue params.
+        self.export_preset = "medium"       # was "slow" — same CRF, ~2–3× faster
+        self.prefer_nvenc = True            # use GPU encode when available
+        self._nvenc_ok = None               # lazy probe
+
+    def _nvenc_available(self) -> bool:
+        """True if this ffmpeg build can encode h264_nvenc (one-time probe)."""
+        if self._nvenc_ok is not None:
+            return self._nvenc_ok
+        if not self.has_ffmpeg or not self.ffmpeg_exe:
+            self._nvenc_ok = False
+            return False
+        try:
+            r = subprocess.run(
+                [self.ffmpeg_exe, "-hide_banner", "-encoders"],
+                capture_output=True, text=True, timeout=8, errors="ignore",
+            )
+            self._nvenc_ok = "h264_nvenc" in (r.stdout or "")
+        except Exception:
+            self._nvenc_ok = False
+        if self._nvenc_ok:
+            print("INFO: h264_nvenc available — final exports will use GPU encode (same quality CQ).")
+        return self._nvenc_ok
+
+    def _intermediate_ffmpeg_params(self, output_quality: int):
+        """
+        Fast intermediate encode after RIFE (will be re-encoded on Export).
+        Use ultrafast + lower CRF so quality is preserved for the next stage
+        without spending time on a slow preset twice.
+        """
+        # Quality slider 0-100 → intermediate CRF (keep high fidelity for re-encode)
+        crf_final = int(35 - (output_quality / 100) * 20)
+        crf_inter = max(10, min(crf_final, 14))  # never softer than final target
+        return ['-crf', str(crf_inter), '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-loglevel', 'error']
+
+    def _export_video_args(self, quality: int, max_width: int, video_path: str):
+        """
+        Build ffmpeg video codec args for final export.
+        Prefer NVENC CQ on NVIDIA (huge speedup, visually matched at high CQ);
+        else libx264 medium (not slow) at same CRF — quality parity, much faster.
+        """
+        crf = int(35 - (quality / 100) * 20)
+        preset = (self.export_preset or "medium").strip().lower()
+        if preset not in (
+            "ultrafast", "superfast", "veryfast", "faster", "fast",
+            "medium", "slow", "slower", "veryslow",
+        ):
+            preset = "medium"
+
+        # Only scale when needed (avoids pointless filter work)
+        need_scale = True
+        try:
+            w, h = self._probe_dims(video_path)
+            if w and w <= int(max_width):
+                need_scale = False
+        except Exception:
+            need_scale = True
+        vf = f"scale='min({int(max_width)},iw)':-2:flags=lanczos" if need_scale else None
+
+        if self.prefer_nvenc and self._nvenc_available():
+            # Map quality% → NVENC CQ (lower = better). Align near x264 CRF band.
+            cq = max(12, min(28, crf + 1))
+            # p5/p6 = high quality presets on modern NVENC (4090 etc.)
+            args = [
+                "-c:v", "h264_nvenc",
+                "-preset", "p5",
+                "-rc", "vbr",
+                "-cq", str(cq),
+                "-b:v", "0",
+                "-profile:v", "high",
+                "-pix_fmt", "yuv420p",
+            ]
+            return args, vf, f"h264_nvenc cq={cq}"
+
+        args = [
+            "-c:v", "libx264",
+            "-preset", preset,
+            "-crf", str(crf),
+            "-pix_fmt", "yuv420p",
+        ]
+        return args, vf, f"libx264 preset={preset} crf={crf}"
+
+    def _probe_dims(self, video_path):
+        if not self.has_ffmpeg:
+            return 0, 0
+        try:
+            cmd = [
+                self.ffprobe_exe, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x",
+                str(video_path),
+            ]
+            out = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=8).stdout.strip()
+            if "x" in out:
+                w, h = out.split("x", 1)
+                return int(w), int(h)
+        except Exception:
+            pass
+        return 0, 0
+
     def _normalize_input_path(self, video_path):
         """
         Normalizes input video path to prevent filename length issues.
@@ -732,26 +830,70 @@ class ToolboxProcessor:
                 speed_factor = 1.0
             
             if use_streaming and should_interpolate:
+                # Stream 2x per pass (true 4x = two streaming passes). Never load all frames into RAM.
+                try:
+                    reader.close()
+                except Exception:
+                    pass
                 if not self.rife_handler._ensure_model_downloaded_and_loaded():
-                    raise gr.Error("❌ RIFE model failed to download or load. Please check your internet connection and try again. If the problem persists, try manually deleting the 'toolbox/model_rife' folder and restarting.")
-                temp_video_path = self._generate_output_path(video_path, "frames_temp", is_temp=True)
-                writer = imageio.get_writer(
-                    temp_video_path,
-                    fps=output_fps,
-                    macro_block_size=1,
-                    ffmpeg_params=['-crf', str(crf), '-preset', 'medium']
-                )
-                frame_iterator = iter(reader)
-                frame1 = next(frame_iterator, None)
-                if frame1 is not None:
-                    desc = f"Interpolating Frames ({interpolation_factor}x Streaming)"
-                    for frame2 in progress.tqdm(frame_iterator, desc=desc):
-                        writer.append_data(frame1)
-                        middle = self.rife_handler.interpolate_between_frames(frame1, frame2)
-                        if middle is not None: writer.append_data(middle)
-                        frame1 = frame2
-                    writer.append_data(frame1)
-                writer.close()
+                    raise gr.Error(
+                        "❌ RIFE model failed to download or load. Please check your internet connection "
+                        "and try again. If the problem persists, try manually deleting the "
+                        "'toolbox/model_rife' folder and restarting."
+                    )
+                num_passes = int(math.log2(interpolation_factor))
+                current_input = video_path
+                current_fps = float(fps)
+                intermediate_paths = []
+                for p in range(num_passes):
+                    pass_out = self._generate_output_path(
+                        video_path, f"frames_stream_p{p + 1}", is_temp=True
+                    )
+                    pass_fps = current_fps * 2.0
+                    print(
+                        f"INFO: Streaming RIFE pass {p + 1}/{num_passes} "
+                        f"({current_fps:.2f} → {pass_fps:.2f} FPS)..."
+                    )
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", category=UserWarning)
+                        r_in = imageio.get_reader(current_input)
+                        w_out = imageio.get_writer(
+                            pass_out,
+                            fps=pass_fps,
+                            macro_block_size=1,
+                            # Intermediate only — ultrafast + low CRF; Export does the quality encode once
+                            ffmpeg_params=self._intermediate_ffmpeg_params(output_quality),
+                        )
+                        frame_iterator = iter(r_in)
+                        frame1 = next(frame_iterator, None)
+                        if frame1 is None:
+                            r_in.close()
+                            w_out.close()
+                            raise RuntimeError("Video has no frames for RIFE streaming")
+                        desc = f"RIFE stream pass {p + 1}/{num_passes}"
+                        for frame2 in progress.tqdm(frame_iterator, desc=desc):
+                            w_out.append_data(frame1)
+                            middle = self.rife_handler.interpolate_between_frames(frame1, frame2)
+                            if middle is not None:
+                                w_out.append_data(middle)
+                            else:
+                                w_out.append_data(frame1)
+                            frame1 = frame2
+                        w_out.append_data(frame1)
+                        w_out.close()
+                        r_in.close()
+                    # Drop previous intermediate (keep source video_path)
+                    if current_input != video_path and os.path.exists(current_input):
+                        try:
+                            os.remove(current_input)
+                        except OSError:
+                            pass
+                        if current_input in intermediate_paths:
+                            intermediate_paths.remove(current_input)
+                    intermediate_paths.append(pass_out)
+                    current_input = pass_out
+                    current_fps = pass_fps
+                temp_video_path = current_input
             else:
                 frames = [frame for frame in reader]
                 print(f"Loaded {len(frames)} frames from video")
@@ -801,15 +943,15 @@ class ToolboxProcessor:
                 import warnings
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore")
-                    # Use ffmpeg_params with CRF for quality control
+                    # Intermediate write — keep quality high, spend time on Export only
                     imageio.mimwrite(
                         temp_video_path,
                         processed_frames,
                         fps=output_fps,
                         macro_block_size=1,
-                        ffmpeg_params=['-crf', str(crf), '-preset', 'medium', '-loglevel', 'error']
+                        ffmpeg_params=self._intermediate_ffmpeg_params(output_quality),
                     )
-            reader.close()
+                reader.close()
 
             # --- Suffix and Final Path Generation ---
             suffix_parts = []
@@ -851,10 +993,16 @@ class ToolboxProcessor:
                 ])
                 
                 subprocess.run(mux_cmd, check=True, capture_output=True, text=True)
-                if os.path.exists(temp_video_path): os.remove(temp_video_path)
+                if temp_video_path and os.path.exists(temp_video_path):
+                    try:
+                        os.remove(temp_video_path)
+                    except OSError:
+                        pass
+                temp_video_path = None  # owned by final_temp_output now
             else:
                 # This block runs if there's no FFmpeg or no original audio
                 shutil.move(temp_video_path, final_temp_output)
+                temp_video_path = None
 
             return str(final_temp_output)
         except gr.Error:
@@ -864,9 +1012,21 @@ class ToolboxProcessor:
             print(f"Error during frame adjustment: {e}\n{traceback.format_exc()}")
             return video_path
         finally:
-            self.rife_handler.unload_model()
-            if temp_video_path and os.path.exists(temp_video_path): os.remove(temp_video_path)
-            gc.collect(); torch.cuda.empty_cache()
+            try:
+                self.rife_handler.unload_model()
+            except Exception:
+                pass
+            # Only delete leftover temps on failure (success clears temp_video_path above)
+            if temp_video_path and os.path.exists(temp_video_path):
+                try:
+                    os.remove(temp_video_path)
+                except OSError:
+                    pass
+            gc.collect()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     def create_loop(self, video_path, loop_type, num_loops, output_quality=90, progress=gr.Progress()):
         """Creates a looped or ping-pong version of the video."""
@@ -1017,44 +1177,54 @@ class ToolboxProcessor:
             )
             if export_format == "GIF": print(f"INFO: GIF format selected. Output will be saved to permanent folder: {output_path}")
 
-            # Common video filter
+            # Common video filter (may be None if already under max_width)
             vf_scale = f"scale='min({max_width},iw)':-2:flags=lanczos"
             
             if export_format == "MP4 (H.264)":
                 # CRF range: 0=lossless, 23=default, 51=worst
                 # Quality slider: 100%→15 (near-lossless), 50%→23 (default), 0%→35 (low quality)
                 crf = int(35 - (quality / 100) * 20)
-                
-                if two_pass:
+                vcodec_args, vf_auto, enc_label = self._export_video_args(quality, max_width, video_path)
+                vf_use = vf_auto if vf_auto is not None else None
+                # two-pass only applies to software x264 bitrate mode
+                use_nvenc = "h264_nvenc" in vcodec_args
+
+                if two_pass and not use_nvenc:
                     # Two-pass encoding for better compression efficiency
                     progress(0.2, desc="Encoding pass 1/2 (analyzing)...")
                     pass1_cmd = [
                         self.ffmpeg_exe, "-y", "-i", video_path,
-                        "-vf", vf_scale,
+                    ]
+                    if vf_use:
+                        pass1_cmd.extend(["-vf", vf_use])
+                    pass1_cmd.extend([
                         "-c:v", "libx264",
-                        "-preset", "slow",
+                        "-preset", (self.export_preset or "medium"),
                         "-b:v", f"{self._calculate_target_bitrate(video_path, quality, max_width)}k",
                         "-pass", "1",
                         "-passlogfile", str(self.temp_dir / "ffmpeg2pass"),
                         "-an",
                         "-f", "null",
                         "NUL" if os.name == 'nt' else "/dev/null"
-                    ]
+                    ])
                     subprocess.run(pass1_cmd, check=True, capture_output=True, text=True)
                     
                     progress(0.5, desc="Encoding pass 2/2 (final)...")
                     pass2_cmd = [
                         self.ffmpeg_exe, "-y", "-i", video_path,
-                        "-vf", vf_scale,
+                    ]
+                    if vf_use:
+                        pass2_cmd.extend(["-vf", vf_use])
+                    pass2_cmd.extend([
                         "-c:v", "libx264",
-                        "-preset", "slow",
+                        "-preset", (self.export_preset or "medium"),
                         "-b:v", f"{self._calculate_target_bitrate(video_path, quality, max_width)}k",
                         "-pass", "2",
                         "-passlogfile", str(self.temp_dir / "ffmpeg2pass"),
                         "-pix_fmt", "yuv420p",
-                        "-c:a", "aac", "-b:a", "96k",
+                        "-c:a", "aac", "-b:a", "192k",
                         str(output_path)
-                    ]
+                    ])
                     subprocess.run(pass2_cmd, check=True, capture_output=True, text=True)
                     
                     # Clean up pass log files
@@ -1062,19 +1232,36 @@ class ToolboxProcessor:
                         try: f.unlink()
                         except: pass
                 else:
-                    # Single-pass CRF encoding
+                    # Single-pass: NVENC CQ or libx264 medium (not slow) — same visual quality, much faster
                     ffmpeg_cmd = [
                         self.ffmpeg_exe, "-y", "-i", video_path,
-                        "-vf", vf_scale,
-                        "-c:v", "libx264",
-                        "-preset", "slow",
-                        "-crf", str(crf),
-                        "-pix_fmt", "yuv420p",
-                        "-c:a", "aac", "-b:a", "96k",
-                        str(output_path)
                     ]
-                    progress(0.3, desc=f"Encoding {export_format}...")
-                    subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
+                    if vf_use:
+                        ffmpeg_cmd.extend(["-vf", vf_use])
+                    ffmpeg_cmd.extend(vcodec_args)
+                    ffmpeg_cmd.extend([
+                        "-c:a", "aac", "-b:a", "192k",
+                        str(output_path)
+                    ])
+                    progress(0.3, desc=f"Encoding {export_format} ({enc_label})...")
+                    print(f"INFO: Export encode: {enc_label}" + (f" + scale≤{max_width}" if vf_use else " (no scale)"))
+                    try:
+                        subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
+                    except subprocess.CalledProcessError as e_enc:
+                        # NVENC can fail on some drivers — fall back to software once
+                        if use_nvenc:
+                            print(f"WARNING: NVENC failed ({e_enc}); falling back to libx264 medium")
+                            self._nvenc_ok = False
+                            vcodec_args, vf_use, enc_label = self._export_video_args(quality, max_width, video_path)
+                            ffmpeg_cmd = [self.ffmpeg_exe, "-y", "-i", video_path]
+                            if vf_use:
+                                ffmpeg_cmd.extend(["-vf", vf_use])
+                            ffmpeg_cmd.extend(vcodec_args)
+                            ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", "192k", str(output_path)])
+                            progress(0.4, desc=f"Encoding {export_format} ({enc_label})...")
+                            subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
+                        else:
+                            raise
                 
             elif export_format == "MP4 (H.265)":
                 # H.265/HEVC: 30-50% better compression than H.264 at same quality

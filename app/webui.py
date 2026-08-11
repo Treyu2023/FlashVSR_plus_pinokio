@@ -22,6 +22,7 @@ import subprocess
 import psutil
 import tempfile
 from pathlib import Path
+from typing import Optional, Sequence, Tuple
 from PIL import Image
 from tqdm import tqdm
 from einops import rearrange
@@ -40,7 +41,7 @@ from toolbox.batch_queue import (
     write_live_batch_progress,
     write_batch_inputs_list,
 )
-from flashvsr_work_queue import FlashVSRWorkQueue
+from flashvsr_work_queue import FlashVSRWorkQueue, ExclusiveQueueLock, VIDEO_EXTS, IMAGE_EXTS
 from naming_utils import (
     upscale_video_filename,
     upscale_image_filename,
@@ -305,9 +306,97 @@ def _apply_toolbox_output_dir():
         return
     toolbox_processor.output_dir = Path(get_toolbox_output_dir())
 
+def unique_dest_path(dest_dir: str, filename: str) -> str:
+    """Avoid overwriting when two outputs share a basename."""
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, filename)
+    if not os.path.exists(dest):
+        return dest
+    stem, ext = os.path.splitext(filename)
+    return os.path.join(dest_dir, f"{stem}_{time.strftime('%Y%m%d_%H%M%S')}{ext}")
+
+
+def _path_is_under(path: str, root: str) -> bool:
+    try:
+        p = os.path.abspath(path)
+        r = os.path.abspath(root)
+        return os.path.commonpath([p, r]) == r
+    except (ValueError, OSError):
+        return False
+
+
+def finalize_output_once(src_path: str, dest_dir: str) -> str:
+    """
+    Ensure the deliverable exists once under dest_dir.
+
+    Bug this fixes: toolbox autosave already writes into Ready for CIV, then the
+    queue called unique_dest_path() which saw the file, invented a longer
+    ``_YYYYMMDD_HHMMSS`` name, and copied again — two full-size copies per job.
+    """
+    if not src_path or not os.path.isfile(src_path):
+        return src_path or ""
+    os.makedirs(dest_dir, exist_ok=True)
+    src_abs = os.path.abspath(src_path)
+    dest_dir_abs = os.path.abspath(dest_dir)
+    name = os.path.basename(src_abs)
+    dest = os.path.join(dest_dir_abs, name)
+
+    # Already the final path — nothing to do
+    if os.path.normcase(src_abs) == os.path.normcase(dest):
+        return dest
+
+    # Already under the destination folder (autosave wrote it there) — do NOT re-copy
+    if _path_is_under(src_abs, dest_dir_abs):
+        return src_abs
+
+    # Need to place into dest_dir from temp / other drive
+    if not os.path.exists(dest):
+        try:
+            # Prefer move out of temp to avoid a second full file
+            if _path_is_under(src_abs, TEMP_DIR) or _path_is_under(
+                src_abs, os.path.join(ROOT_DIR, "_temp")
+            ):
+                shutil.move(src_abs, dest)
+            else:
+                shutil.copy2(src_abs, dest)
+        except OSError:
+            shutil.copy2(src_abs, dest)
+        return dest
+
+    # Name collision with a different file already in dest
+    try:
+        if os.path.getsize(src_abs) == os.path.getsize(dest):
+            # Same size → treat as already delivered; drop temp source
+            if _path_is_under(src_abs, TEMP_DIR) or _path_is_under(
+                src_abs, os.path.join(ROOT_DIR, "_temp")
+            ):
+                try:
+                    os.remove(src_abs)
+                except OSError:
+                    pass
+            return dest
+    except OSError:
+        pass
+
+    # True clash: only then invent a longer unique name (one copy, not two of the same)
+    unique = unique_dest_path(dest_dir_abs, name)
+    try:
+        if _path_is_under(src_abs, TEMP_DIR) or _path_is_under(
+            src_abs, os.path.join(ROOT_DIR, "_temp")
+        ):
+            shutil.move(src_abs, unique)
+        else:
+            shutil.copy2(src_abs, unique)
+            # leave non-temp source alone
+    except OSError:
+        shutil.copy2(src_abs, unique)
+    return unique
+
+
 def get_gradio_allowed_paths():
     """Absolute paths Gradio may serve (required for outputs on other drives, e.g. D:)."""
     config = load_config()
+    ui = get_ui_defaults(config)
     candidates = [
         ROOT_DIR,
         TEMP_DIR,
@@ -317,6 +406,12 @@ def get_gradio_allowed_paths():
         get_toolbox_output_dir(),
         str(config.get("output_dir", "")).strip(),
         str(config.get("toolbox_output_dir", "")).strip(),
+        ui.get("batch_watch_folder", ""),
+        ui.get("batch_source_archive_dir", ""),
+        ui.get("batch_upscale_handoff_dir", ""),
+        ui.get("img_upscale_handoff_dir", ""),
+        ui.get("tb_inbox_folder", ""),
+        r"D:\OUTPUTS\__X_GROK",
         os.environ.get("TMPDIR", ""),
         os.environ.get("TEMP", ""),
         os.environ.get("TMP", ""),
@@ -395,9 +490,33 @@ def get_ui_defaults(config=None):
         "fps_override": (30, int),
         "device": ("cuda:0", str),
         "batch_resize_preset": ("768px", str),
+        "batch_watch_folder": (r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS", str),
+        "batch_source_archive_dir": (
+            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
+            str,
+        ),
+        # Next step after FlashVSR video upscale (hand-sort + toolbox inbox)
+        "batch_upscale_handoff_dir": (
+            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox",
+            str,
+        ),
+        # Image upscales skip RIFE → go straight to Ready for CIV
+        "img_upscale_handoff_dir": (
+            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV\images",
+            str,
+        ),
+        "tb_inbox_folder": (
+            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox",
+            str,
+        ),
+        "tb_fps_mode": ("4x Frames", str),
+        "tb_pipeline_ops": ("Frame Adjust,Export", str),
         "tb_frames_quality": (95, int),
         "tb_export_quality": (92, int),
         "tb_export_max_width": (3840, int),
+        # Quality-preserving speed (medium≈slow visually at same CRF; NVENC CQ matched)
+        "tb_export_preset": ("medium", str),
+        "tb_prefer_nvenc": (True, bool),
     }
     defaults = {}
     for key, (fallback, typ) in specs.items():
@@ -2345,7 +2464,340 @@ def run_flashvsr_batch(
 
 
 def get_flashvsr_work_queue() -> FlashVSRWorkQueue:
-    return FlashVSRWorkQueue(ROOT_DIR)
+    return FlashVSRWorkQueue(
+        ROOT_DIR, name="video", extensions=VIDEO_EXTS, label="FlashVSR video queue"
+    )
+
+
+def get_flashvsr_image_queue() -> FlashVSRWorkQueue:
+    return FlashVSRWorkQueue(
+        ROOT_DIR, name="image", extensions=IMAGE_EXTS, label="FlashVSR image queue"
+    )
+
+
+def get_toolbox_work_queue() -> FlashVSRWorkQueue:
+    return FlashVSRWorkQueue(
+        ROOT_DIR, name="toolbox", extensions=VIDEO_EXTS, label="Toolbox post-process queue"
+    )
+
+
+def get_exclusive_queue_lock() -> ExclusiveQueueLock:
+    return ExclusiveQueueLock(ROOT_DIR)
+
+
+def _queue_busy_html(wq: FlashVSRWorkQueue, message: str) -> str:
+    """Status panel when another queue owns the exclusive lock."""
+    return wq.status_html(message) + get_exclusive_queue_lock().status_html_snippet()
+
+
+def ensure_workflow_dirs(ui: Optional[dict] = None) -> dict:
+    """Create standard D: workflow folders (4090 pipeline)."""
+    ui = ui or get_ui_defaults()
+    paths = {
+        "watch": ui.get("batch_watch_folder", r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS"),
+        "pre_scaled": ui.get(
+            "batch_source_archive_dir",
+            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
+        ),
+        "ready_toolbox": ui.get(
+            "batch_upscale_handoff_dir",
+            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox",
+        ),
+        "ready_civ": str(
+            ui.get("toolbox_output_dir")
+            or r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV"
+        ),
+        "img_handoff": ui.get(
+            "img_upscale_handoff_dir",
+            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV\images",
+        ),
+        "tb_inbox": ui.get(
+            "tb_inbox_folder",
+            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox",
+        ),
+    }
+    # Prefer config toolbox_output_dir when set
+    try:
+        cfg = load_config()
+        if cfg.get("toolbox_output_dir"):
+            paths["ready_civ"] = str(cfg["toolbox_output_dir"]).strip()
+    except Exception:
+        pass
+    for p in paths.values():
+        if p:
+            try:
+                os.makedirs(p, exist_ok=True)
+            except OSError:
+                pass
+    return paths
+
+
+def archive_original_source(source_path: str, archive_dir: str) -> Optional[str]:
+    """
+    Move the original (pre-upscale) video into the archive folder for later pairing.
+    Upscaled output is left in its normal completed/output location.
+    """
+    if not source_path or not archive_dir:
+        return None
+    if not os.path.isfile(source_path):
+        log(f"Original not found to archive: {source_path}", message_type="warning")
+        return None
+    try:
+        os.makedirs(archive_dir, exist_ok=True)
+        name = os.path.basename(source_path)
+        dest = os.path.join(archive_dir, name)
+        if os.path.abspath(source_path) == os.path.abspath(dest):
+            return dest
+        if os.path.exists(dest):
+            stem, ext = os.path.splitext(name)
+            dest = os.path.join(
+                archive_dir, f"{stem}_src_{time.strftime('%Y%m%d_%H%M%S')}{ext}"
+            )
+        shutil.move(source_path, dest)
+        log(f"📦 Original moved for pairing → {dest}", message_type="info")
+        return dest
+    except Exception as e:
+        log(f"Could not archive original {source_path}: {e}", message_type="warning")
+        return None
+
+
+def _queue_search_dirs(source_path: str, *extra_dirs: str) -> list:
+    """Parent folder, parent/done, and any extra dirs (+ their done/)."""
+    dirs: list = []
+    parent = os.path.dirname(source_path) if source_path else ""
+    if parent:
+        dirs.append(parent)
+        dirs.append(os.path.join(parent, "done"))
+    for d in extra_dirs:
+        d = (d or "").strip()
+        if not d:
+            continue
+        if d not in dirs:
+            dirs.append(d)
+        done = os.path.join(d, "done")
+        if done not in dirs:
+            dirs.append(done)
+    return dirs
+
+
+def find_relocated_source(source_path: str, *extra_dirs: str) -> Optional[str]:
+    """If the queued path is gone, find the same basename in archive/done folders."""
+    if source_path and os.path.isfile(source_path):
+        return source_path
+    name = os.path.basename(source_path or "")
+    if not name:
+        return None
+    for d in _queue_search_dirs(source_path, *extra_dirs):
+        if not d or not os.path.isdir(d):
+            continue
+        cand = os.path.join(d, name)
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def find_matching_deliverable(
+    source_path: str,
+    *output_dirs: str,
+    prefer_exported: bool = False,
+) -> Optional[str]:
+    """
+    Find an existing handoff/export for a source whose inbox path is gone.
+
+    Matching is intentionally strict so siblings like ``…019f8889…`` vs
+    ``…019f8883…`` or chunk ``(3)`` vs ``(5)`` do not share a hit:
+    - require the Grok/video UUID (full or truncated for export names)
+    - prefer full stem / variant number when present
+    """
+    stem = Path(source_path or "").stem
+    if not stem or len(stem) < 8:
+        return None
+
+    uuid_re = re.compile(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{8,12}",
+        re.I,
+    )
+    uuids = uuid_re.findall(stem)
+    variant = None
+    vm = re.search(r"\((\d+)\)", stem)
+    if vm:
+        variant = vm.group(1)
+    else:
+        vm = re.search(r"(?:^|[\s_])(\d+)(?=_resized|_upscaled|$)", stem)
+        if vm:
+            variant = vm.group(1)
+
+    media_ext = {
+        ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v",
+        ".png", ".jpg", ".jpeg", ".webp",
+    }
+    scored: list = []  # (score, mtime, path)
+
+    for d in output_dirs:
+        d = (d or "").strip()
+        if not d or not os.path.isdir(d):
+            continue
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for fn in names:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in media_ext:
+                continue
+            score = 0
+            if stem in fn:
+                score = 100000
+            else:
+                if uuids:
+                    uuid_hit = False
+                    for u in uuids:
+                        for L in (len(u), 30, 26, 22):
+                            if L >= 22 and L <= len(u) and u[:L] in fn:
+                                score += 100 + L
+                                uuid_hit = True
+                                break
+                        if uuid_hit:
+                            break
+                    if not uuid_hit:
+                        continue
+                else:
+                    # No UUID — require a long unique stem prefix (min 40)
+                    best = 0
+                    for n in range(min(len(stem), 80), 39, -1):
+                        if stem[:n] in fn:
+                            best = n
+                            break
+                    if best < 40:
+                        continue
+                    score += best
+
+                if variant:
+                    # Prefer the same chunk index; reject clear other (N) variants
+                    other = re.search(r"\((\d+)\)", fn)
+                    if other and other.group(1) != variant:
+                        continue
+                    has_var = bool(
+                        re.search(
+                            rf"(?:\({re.escape(variant)}\)|"
+                            rf"(?:^|[\s_]){re.escape(variant)}(?=_resized|_upscaled|_exported|[\s_\.]|$))",
+                            fn,
+                        )
+                    )
+                    if has_var:
+                        score += 250
+                    elif prefer_exported:
+                        # Toolbox export names often drop the chunk index — UUID is enough
+                        score += 10
+                    else:
+                        # Video/image handoff should keep chunk identity when present
+                        continue
+
+            if prefer_exported and "_exported" in fn.lower():
+                score += 500
+
+            full = os.path.join(d, fn)
+            try:
+                mtime = os.path.getmtime(full)
+            except OSError:
+                mtime = 0
+            scored.append((score, mtime, full))
+
+    if not scored:
+        return None
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return scored[0][2]
+
+
+def reconcile_work_queue(
+    wq: FlashVSRWorkQueue,
+    *,
+    archive_dirs: Sequence[str],
+    output_dirs: Sequence[str],
+    prefer_exported: bool = False,
+    label: str = "queue",
+) -> Tuple[int, int]:
+    """
+    Auto-heal missing sources: mark done if output exists, or retarget path
+    if the file was moved to archive/done. Call at the start of each queue run.
+    """
+    archive_dirs = [d for d in archive_dirs if d]
+    output_dirs = [d for d in output_dirs if d]
+
+    def _find_out(path: str) -> Optional[str]:
+        return find_matching_deliverable(
+            path, *output_dirs, prefer_exported=prefer_exported
+        )
+
+    def _find_reloc(path: str) -> Optional[str]:
+        return find_relocated_source(path, *archive_dirs)
+
+    done_n, fix_n = wq.reconcile_missing_sources(
+        find_output=_find_out, find_relocated=_find_reloc
+    )
+    if done_n or fix_n:
+        log(
+            f"🔧 {label} reconcile: {done_n} marked done (output/archive found), "
+            f"{fix_n} path(s) updated",
+            message_type="info",
+        )
+    return done_n, fix_n
+
+
+def handle_missing_queue_source(
+    wq: FlashVSRWorkQueue,
+    source_path: str,
+    *,
+    archive_dirs: Sequence[str],
+    output_dirs: Sequence[str],
+    prefer_exported: bool = False,
+) -> str:
+    """
+    Resolve a single missing source during a queue pass.
+
+    Returns: 'done' | 'retry' | 'failed'
+      done  — existing deliverable or archived source; status set to done
+      retry  — path updated to a relocated file; caller should use new path
+      failed — truly missing; marked failed
+    """
+    out = find_matching_deliverable(
+        source_path, *output_dirs, prefer_exported=prefer_exported
+    )
+    if out and os.path.isfile(out):
+        wq.set_item_status(source_path, "done", output=out, error=None)
+        log(
+            f"✅ Recovered (already delivered): {os.path.basename(source_path)} → {out}",
+            message_type="finish",
+        )
+        return "done"
+
+    relocated = find_relocated_source(source_path, *archive_dirs)
+    if relocated and os.path.isfile(relocated):
+        parent_name = Path(relocated).parent.name.lower()
+        if parent_name == "done":
+            wq.set_item_status(
+                source_path, "done", output=out, error=None, new_path=relocated
+            )
+            log(
+                f"✅ Recovered (already in done/): {os.path.basename(source_path)}",
+                message_type="finish",
+            )
+            return "done"
+        wq.set_item_status(
+            source_path, "pending", error=None, new_path=relocated
+        )
+        log(
+            f"↪ Relocated source → {relocated}",
+            message_type="info",
+        )
+        return "retry"
+
+    wq.set_item_status(source_path, "failed", error="file not found")
+    log(
+        f"❌ Missing source (left failed): {os.path.basename(source_path)}",
+        message_type="error",
+    )
+    return "failed"
 
 
 def run_flashvsr_work_queue(
@@ -2374,20 +2826,99 @@ def run_flashvsr_work_queue(
 ):
     """Process pending items on the persistent work queue (start / resume). Soft-stop between files."""
     wq = get_flashvsr_work_queue()
+    lock = get_exclusive_queue_lock()
+    ok, lock_msg = lock.try_acquire("video")
+    if not ok:
+        log(lock_msg, message_type="warning")
+        return None, _queue_busy_html(wq, lock_msg)
+    try:
+        return _run_flashvsr_work_queue_body(
+            wq, mode, model_version, scale, color_fix, tiled_vae, tiled_dit,
+            tile_size, tile_overlap, unload_dit, dtype_str, seed, device, fps_override,
+            quality, attention_mode, sparse_ratio, kv_ratio, local_range,
+            batch_resize_preset, enable_chunks, chunk_duration, progress,
+        )
+    finally:
+        lock.release("video")
+
+
+def _run_flashvsr_work_queue_body(
+    wq,
+    mode,
+    model_version,
+    scale,
+    color_fix,
+    tiled_vae,
+    tiled_dit,
+    tile_size,
+    tile_overlap,
+    unload_dit,
+    dtype_str,
+    seed,
+    device,
+    fps_override,
+    quality,
+    attention_mode,
+    sparse_ratio,
+    kv_ratio,
+    local_range,
+    batch_resize_preset,
+    enable_chunks,
+    chunk_duration,
+    progress,
+):
     wq.clear_stop()
+    ui = get_ui_defaults()
+    paths = ensure_workflow_dirs(ui)
+    watch_folder = (ui.get("batch_watch_folder") or paths.get("watch") or "").strip()
+    source_archive = (
+        ui.get("batch_source_archive_dir") or paths.get("pre_scaled") or ""
+    ).strip()
+    handoff = (ui.get("batch_upscale_handoff_dir") or paths["ready_toolbox"]).strip()
+
+    # Auto-pick up new downloads from the watch folder each Start / Resume
+    if watch_folder and os.path.isdir(watch_folder):
+        added, skipped = wq.add_folder(watch_folder)
+        if added:
+            log(
+                f"Watch folder: added {added} from {watch_folder}"
+                + (f" (skipped {skipped} already queued)" if skipped else ""),
+                message_type="info",
+            )
+        elif skipped:
+            log(f"Watch folder: {skipped} already in queue ({watch_folder})", message_type="info")
+        else:
+            log(f"Watch folder empty or no new videos: {watch_folder}", message_type="info")
+    elif watch_folder:
+        log(f"Watch folder missing (create it or fix path): {watch_folder}", message_type="warning")
+
     stuck = wq.reset_stuck_running()
     if stuck:
         log(f"Re-queued {stuck} interrupted (was running) item(s)", message_type="info")
+
+    # Upscaled videos go to Ready for Toolbox (next pipeline step)
+    reconcile_work_queue(
+        wq,
+        archive_dirs=[watch_folder, source_archive, handoff],
+        output_dirs=[handoff, paths.get("ready_toolbox", ""), get_output_dir()],
+        prefer_exported=False,
+        label="Video queue",
+    )
+
     pending = wq.pending_items()
     if not pending:
-        note = "Queue is empty — add videos (upload or folder), then Start / Resume."
+        note = (
+            "Queue is empty — drop videos in the watch folder "
+            f"({watch_folder or 'set batch_watch_folder'}), then Start / Resume."
+        )
         log(note, message_type="warning")
         return None, wq.status_html(note)
 
-    output_root = get_output_dir()
-    # New batch folder every Start/Resume (like normal batch runs)
-    completed_dir = wq.start_new_completed_dir(output_root)
-    batch_output_dir = os.path.dirname(completed_dir.rstrip("\\/"))
+    completed_dir = wq.set_fixed_completed_dir(handoff)
+    # Progress logs still under app outputs
+    log_root = os.path.join(get_output_dir(), "work_queue_video", f"run_{time.strftime('%Y%m%d_%H%M%S')}")
+    os.makedirs(log_root, exist_ok=True)
+    batch_output_dir = log_root
     all_paths = [it["path"] for it in wq.all_items()]
     write_batch_inputs_list(batch_output_dir, all_paths)
 
@@ -2397,7 +2928,9 @@ def run_flashvsr_work_queue(
         f"Work queue: starting {pending_count} pending of {total} total",
         message_type="info",
     )
-    log(f"Completed files this run → {completed_dir}", message_type="info")
+    log(f"Upscaled videos → {completed_dir} (Ready for Toolbox)", message_type="info")
+    if source_archive:
+        log(f"Originals archive (pairing) → {source_archive}", message_type="info")
     if enable_chunks:
         log(f"Chunk mode: {chunk_duration}s segments", message_type="info")
     if batch_resize_preset != "No Resize":
@@ -2411,9 +2944,23 @@ def run_flashvsr_work_queue(
     for run_i, item in enumerate(list(pending)):
         video_path = item["path"]
         if not os.path.isfile(video_path):
-            wq.set_item_status(video_path, "failed", error="file not found")
-            log(f"❌ Missing file (removed from pending): {video_path}", message_type="error")
-            continue
+            result = handle_missing_queue_source(
+                wq,
+                video_path,
+                archive_dirs=[watch_folder, source_archive, handoff],
+                output_dirs=[completed_dir, handoff, get_output_dir()],
+                prefer_exported=False,
+            )
+            if result == "retry":
+                relocated = find_relocated_source(
+                    video_path, watch_folder, source_archive, handoff
+                )
+                if relocated:
+                    video_path = relocated
+                else:
+                    continue
+            else:
+                continue
 
         idx, total_q = wq.index_of(video_path)
         label = f"Queue {idx}/{total_q} (this run {run_i + 1}/{pending_count}): {os.path.basename(video_path)}"
@@ -2502,12 +3049,16 @@ def run_flashvsr_work_queue(
 
             if temp_output_path and os.path.exists(temp_output_path):
                 filename = os.path.basename(temp_output_path)
-                final_path = os.path.join(completed_dir, filename)
+                final_path = unique_dest_path(completed_dir, filename)
                 shutil.copy(temp_output_path, final_path)
                 last_output_path = final_path
                 processed_this_run += 1
+                # Mark done BEFORE archiving so a crash mid-move cannot requeue a missing path
                 wq.set_item_status(video_path, "done", output=final_path)
-                log(f"✅ [{idx}/{total_q}] Completed → {final_path}", message_type="finish")
+                archived = archive_original_source(video_path, source_archive)
+                log(f"✅ [{idx}/{total_q}] Upscaled → {final_path}", message_type="finish")
+                if archived:
+                    log(f"   Original archived for pairing → {archived}", message_type="info")
                 write_live_batch_progress(
                     batch_output_dir,
                     total=total_q,
@@ -2577,18 +3128,546 @@ def run_flashvsr_work_queue(
     remaining = len(wq.pending_items())
     if remaining == 0:
         note = (
-            f"✅ Queue complete — {processed_this_run} finished this run. "
-            f"Completed files: {completed_dir}"
+            f"✅ Video queue complete — {processed_this_run} finished. "
+            f"Upscaled → {completed_dir}. Sort if needed, then Toolbox queue → Ready for CIV."
         )
         log(note, message_type="finish")
     else:
         note = (
-            f"Finished this pass ({processed_this_run} files → {completed_dir}). "
-            f"{remaining} still pending — Start / Resume opens a new completed folder."
+            f"Finished this pass ({processed_this_run} → {completed_dir}). "
+            f"{remaining} pending — Start / Resume to continue."
         )
         log(note, message_type="info")
     progress(1.0, desc=note)
     return last_output_path, wq.status_html(note)
+
+
+def run_flashvsr_image_work_queue(
+    mode,
+    model_version,
+    scale,
+    color_fix,
+    tiled_vae,
+    tiled_dit,
+    tile_size,
+    tile_overlap,
+    unload_dit,
+    dtype_str,
+    seed,
+    device,
+    fps_override,
+    quality,
+    attention_mode,
+    sparse_ratio,
+    kv_ratio,
+    local_range,
+    create_comparison,
+    batch_resize_preset,
+    progress=gr.Progress(track_tqdm=True),
+):
+    """Image upscale queue: watch NEW DOWNLOADS → Ready for CIV/images; originals → Pre Scaled."""
+    wq = get_flashvsr_image_queue()
+    lock = get_exclusive_queue_lock()
+    ok, lock_msg = lock.try_acquire("image")
+    if not ok:
+        log(lock_msg, message_type="warning")
+        return None, _queue_busy_html(wq, lock_msg)
+    try:
+        return _run_flashvsr_image_work_queue_body(
+            wq, mode, model_version, scale, color_fix, tiled_vae, tiled_dit,
+            tile_size, tile_overlap, unload_dit, dtype_str, seed, device, fps_override,
+            quality, attention_mode, sparse_ratio, kv_ratio, local_range,
+            create_comparison, batch_resize_preset, progress,
+        )
+    finally:
+        lock.release("image")
+
+
+def _run_flashvsr_image_work_queue_body(
+    wq,
+    mode,
+    model_version,
+    scale,
+    color_fix,
+    tiled_vae,
+    tiled_dit,
+    tile_size,
+    tile_overlap,
+    unload_dit,
+    dtype_str,
+    seed,
+    device,
+    fps_override,
+    quality,
+    attention_mode,
+    sparse_ratio,
+    kv_ratio,
+    local_range,
+    create_comparison,
+    batch_resize_preset,
+    progress,
+):
+    wq.clear_stop()
+    ui = get_ui_defaults()
+    paths = ensure_workflow_dirs(ui)
+    watch_folder = (ui.get("batch_watch_folder") or "").strip()
+    source_archive = (ui.get("batch_source_archive_dir") or paths["pre_scaled"]).strip()
+    handoff = (ui.get("img_upscale_handoff_dir") or paths["img_handoff"]).strip()
+
+    if watch_folder and os.path.isdir(watch_folder):
+        added, skipped = wq.add_folder(watch_folder)
+        if added:
+            log(f"Image watch: added {added} from {watch_folder}", message_type="info")
+        elif not skipped:
+            log(f"Image watch: no new images in {watch_folder}", message_type="info")
+
+    stuck = wq.reset_stuck_running()
+    if stuck:
+        log(f"Re-queued {stuck} stuck image job(s)", message_type="info")
+
+    reconcile_work_queue(
+        wq,
+        archive_dirs=[watch_folder, source_archive, handoff],
+        output_dirs=[handoff, paths.get("img_handoff", "")],
+        prefer_exported=False,
+        label="Image queue",
+    )
+
+    pending = wq.pending_items()
+    if not pending:
+        note = f"Image queue empty — drop images in {watch_folder or 'watch folder'}."
+        return None, wq.status_html(note)
+
+    completed_dir = wq.set_fixed_completed_dir(handoff)
+    log(f"Image upscales → {completed_dir}", message_type="info")
+    last_output = None
+    processed = 0
+    pending_count = len(pending)
+
+    for run_i, item in enumerate(list(pending)):
+        image_path = item["path"]
+        if not os.path.isfile(image_path):
+            result = handle_missing_queue_source(
+                wq,
+                image_path,
+                archive_dirs=[watch_folder, source_archive, handoff],
+                output_dirs=[completed_dir, handoff],
+                prefer_exported=False,
+            )
+            if result == "retry":
+                relocated = find_relocated_source(
+                    image_path, watch_folder, source_archive, handoff
+                )
+                if relocated:
+                    image_path = relocated
+                else:
+                    continue
+            else:
+                if result == "done":
+                    processed += 1
+                continue
+        idx, total_q = wq.index_of(image_path)
+        label = f"Image {idx}/{total_q} (run {run_i + 1}/{pending_count}): {os.path.basename(image_path)}"
+        progress(run_i / max(pending_count, 1), desc=label)
+        log(f"\n--- {label} ---", message_type="info")
+        wq.set_item_status(image_path, "running")
+
+        try:
+            class DummyProgress:
+                def __call__(self, *args, **kwargs):
+                    pass
+                def tqdm(self, iterable, *args, **kwargs):
+                    return iterable
+
+            proc = image_path
+            if batch_resize_preset and batch_resize_preset != "No Resize":
+                max_width = int(str(batch_resize_preset).replace("px", ""))
+                cw, _ = get_image_dimensions(image_path)
+                if cw > max_width:
+                    proc = resize_input_image(image_path, max_width, progress=DummyProgress())
+
+            out_path, _, _, _ = run_flashvsr_image(
+                image_path=proc,
+                mode=mode,
+                model_version=model_version,
+                scale=scale,
+                color_fix=color_fix,
+                tiled_vae=tiled_vae,
+                tiled_dit=tiled_dit,
+                tile_size=tile_size,
+                tile_overlap=tile_overlap,
+                unload_dit=unload_dit,
+                dtype_str=dtype_str,
+                seed=seed,
+                device=device,
+                fps_override=fps_override,
+                quality=quality,
+                attention_mode=attention_mode,
+                sparse_ratio=sparse_ratio,
+                kv_ratio=kv_ratio,
+                local_range=local_range,
+                autosave=False,
+                create_comparison=create_comparison,
+                progress=DummyProgress(),
+            )
+            if out_path and os.path.exists(out_path):
+                final = unique_dest_path(completed_dir, os.path.basename(out_path))
+                shutil.copy(out_path, final)
+                last_output = final
+                processed += 1
+                # Mark done before archive so crash recovery never sees a missing source as pending
+                wq.set_item_status(image_path, "done", output=final)
+                archive_original_source(image_path, source_archive)
+                log(f"✅ Image → {final}", message_type="finish")
+            else:
+                wq.set_item_status(image_path, "failed", error="no output")
+        except Exception as e:
+            log(f"❌ Image error: {e}", message_type="error")
+            wq.set_item_status(image_path, "failed", error=str(e))
+        finally:
+            release_processing_vram()
+
+        if wq.stop_requested():
+            wq.clear_stop()
+            note = f"⏹ Stopped after image {idx}/{total_q}. {processed} done this run."
+            return last_output, wq.status_html(note)
+
+    remaining = len(wq.pending_items())
+    note = (
+        f"✅ Image queue done — {processed} this run → {completed_dir}"
+        if remaining == 0
+        else f"Pass done ({processed}). {remaining} pending."
+    )
+    progress(1.0, desc=note)
+    return last_output, wq.status_html(note)
+
+
+def run_toolbox_work_queue(progress=gr.Progress(track_tqdm=True)):
+    """
+    Post-upscale pipeline: scan Ready for Toolbox inbox,
+    Frame Adjust 4x + Export → Ready for CIV.
+    """
+    wq = get_toolbox_work_queue()
+    lock = get_exclusive_queue_lock()
+    ok, lock_msg = lock.try_acquire("toolbox")
+    if not ok:
+        log(lock_msg, message_type="warning")
+        return None, _queue_busy_html(wq, lock_msg)
+    try:
+        return _run_toolbox_work_queue_body(wq, progress)
+    finally:
+        lock.release("toolbox")
+
+
+def _toolbox_item_timeout_sec() -> int:
+    """Wall-clock limit per toolbox item (default 60 min). Env: FLASHVSR_TOOLBOX_ITEM_TIMEOUT."""
+    try:
+        return max(120, int(os.environ.get("FLASHVSR_TOOLBOX_ITEM_TIMEOUT", "3600")))
+    except (TypeError, ValueError):
+        return 3600
+
+
+def _toolbox_max_attempts() -> int:
+    try:
+        return max(1, int(os.environ.get("FLASHVSR_TOOLBOX_MAX_ATTEMPTS", "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _fail_toolbox_item_requeue(wq, video_path: str, reason: str, *, max_attempts: int) -> str:
+    """
+    Fail this attempt and put the source back at the END of the queue (pending)
+    so other jobs run first. Source file is left in place (inbox).
+    Returns: requeued | failed_permanent | missing
+    """
+    result = wq.requeue_to_end(video_path, error=reason, max_attempts=max_attempts)
+    name = os.path.basename(video_path)
+    if result == "requeued":
+        log(
+            f"↩️  {name} → end of queue (will retry later). Reason: {reason}",
+            message_type="warning",
+        )
+    elif result == "failed_permanent":
+        log(
+            f"❌ {name} permanently failed after max attempts. Reason: {reason}",
+            message_type="error",
+        )
+    else:
+        log(f"❌ {name}: {reason}", message_type="error")
+    return result
+
+
+def _run_toolbox_work_queue_body(wq, progress):
+    global toolbox_processor
+    import concurrent.futures
+
+    wq.clear_stop()
+    ui = get_ui_defaults()
+    paths = ensure_workflow_dirs(ui)
+    inbox = (ui.get("tb_inbox_folder") or paths["tb_inbox"]).strip()
+    ready_civ = get_toolbox_output_dir()
+    source_archive = (ui.get("batch_source_archive_dir") or paths["pre_scaled"]).strip()
+    item_timeout = _toolbox_item_timeout_sec()
+    max_attempts = _toolbox_max_attempts()
+
+    if toolbox_processor is None:
+        toolbox_processor = ToolboxProcessor(True)
+    toolbox_processor.output_dir = Path(ready_civ)
+    toolbox_processor.autosave_enabled = True
+
+    if inbox and os.path.isdir(inbox):
+        added, skipped = wq.add_folder(inbox)
+        if added:
+            log(f"Toolbox inbox: added {added} from {inbox}", message_type="info")
+        elif not skipped:
+            log(f"Toolbox inbox empty: {inbox}", message_type="info")
+    elif inbox:
+        log(f"Toolbox inbox missing: {inbox}", message_type="warning")
+
+    # Stuck "running" items go to the END (not front) so they don't immediately re-block
+    stuck = wq.reset_stuck_running(to_end=True, max_attempts=max_attempts)
+    if stuck:
+        log(
+            f"Re-queued {stuck} stuck toolbox job(s) → end of queue "
+            f"(source kept; will retry after others)",
+            message_type="info",
+        )
+
+    # Heal stale rows: exported already in Ready for CIV, or source only in inbox/done
+    reconcile_work_queue(
+        wq,
+        archive_dirs=[inbox, source_archive],
+        output_dirs=[ready_civ, paths.get("ready_civ", ""), str(Path(ROOT_DIR) / "outputs" / "toolbox")],
+        prefer_exported=True,
+        label="Toolbox queue",
+    )
+
+    pending = wq.pending_items()
+    if not pending:
+        note = (
+            f"Toolbox queue empty — place upscaled videos in:\n{inbox}\n"
+            f"then Start / Resume. Finals go to Ready for CIV."
+        )
+        return None, wq.status_html(note)
+
+    ops_raw = ui.get("tb_pipeline_ops") or "Frame Adjust,Export"
+    selected_ops = [o.strip() for o in str(ops_raw).split(",") if o.strip()]
+    if not selected_ops:
+        selected_ops = ["Frame Adjust", "Export"]
+    fps_mode = ui.get("tb_fps_mode") or "4x Frames"
+    frames_q = int(ui.get("tb_frames_quality") or 95)
+    export_q = int(ui.get("tb_export_quality") or 92)
+    export_w = int(ui.get("tb_export_max_width") or 3840)
+    # Streaming avoids loading full upscaled clips into RAM (main cause of silent hangs)
+    use_streaming = ui.get("tb_use_streaming")
+    if use_streaming is None:
+        use_streaming = True
+    else:
+        use_streaming = bool(use_streaming)
+    # Quality-preserving speed: medium x264 (not slow) + NVENC when available
+    export_preset = (ui.get("tb_export_preset") or "medium").strip().lower()
+    prefer_nvenc = ui.get("tb_prefer_nvenc")
+    if prefer_nvenc is None:
+        prefer_nvenc = True
+    else:
+        prefer_nvenc = bool(prefer_nvenc)
+
+    params = {
+        "frame_adjust": {
+            "fps_mode": fps_mode,
+            "speed_factor": 1.0,
+            "use_streaming": use_streaming,
+            "output_quality": frames_q,
+        },
+        "loop": {"loop_type": "loop", "num_loops": 1, "output_quality": frames_q},
+        "export": {
+            "export_format": "MP4 (H.264)",
+            "quality": export_q,
+            "max_width": export_w,
+            "output_name": "",
+            "two_pass": False,
+        },
+    }
+
+    toolbox_processor.export_preset = export_preset
+    toolbox_processor.prefer_nvenc = prefer_nvenc
+
+    completed_dir = wq.set_fixed_completed_dir(ready_civ)
+    log(
+        f"Toolbox: {selected_ops} | RIFE {fps_mode} "
+        f"(stream={use_streaming}, export={export_preset}, nvenc={prefer_nvenc}, "
+        f"timeout={item_timeout}s, max_try={max_attempts}) → {ready_civ}",
+        message_type="info",
+    )
+    last_out = None
+    processed = 0
+    requeued = 0
+    permanent_fail = 0
+    pending_count = len(pending)
+
+    class DummyProgress:
+        def __call__(self, *args, **kwargs):
+            pass
+
+        def tqdm(self, iterable, *args, **kwargs):
+            return iterable
+
+    for run_i, item in enumerate(list(pending)):
+        video_path = item["path"]
+        if not os.path.isfile(video_path):
+            result = handle_missing_queue_source(
+                wq,
+                video_path,
+                archive_dirs=[inbox, source_archive],
+                output_dirs=[
+                    ready_civ,
+                    paths.get("ready_civ", ""),
+                    str(Path(ROOT_DIR) / "outputs" / "toolbox"),
+                ],
+                prefer_exported=True,
+            )
+            if result == "done":
+                processed += 1
+                continue
+            if result == "retry":
+                relocated = find_relocated_source(video_path, inbox, source_archive)
+                if relocated:
+                    video_path = relocated
+                else:
+                    permanent_fail += 1
+                    continue
+            else:
+                permanent_fail += 1
+                continue
+
+        idx, total_q = wq.index_of(video_path)
+        attempt_n = int(item.get("attempts") or 0) + 1
+        label = (
+            f"Toolbox {idx}/{total_q} (run {run_i + 1}/{pending_count}, "
+            f"try {attempt_n}/{max_attempts}): {os.path.basename(video_path)}"
+        )
+        progress(run_i / max(pending_count, 1), desc=label)
+        log(f"\n--- {label} ---", message_type="info")
+        wq.set_item_status(video_path, "running")
+        t0 = time.time()
+
+        try:
+            # Hard wall-clock so a hung RIFE/ffmpeg cannot block the whole queue forever
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(
+                    toolbox_processor.process_pipeline,
+                    video_path,
+                    selected_ops,
+                    params,
+                    DummyProgress(),
+                )
+                try:
+                    result_path, messages = fut.result(timeout=item_timeout)
+                except concurrent.futures.TimeoutError:
+                    elapsed = int(time.time() - t0)
+                    reason = (
+                        f"Timed out after {elapsed}s (limit {item_timeout}s) — "
+                        f"source returned to end of queue"
+                    )
+                    log(
+                        f"⏱ TIMEOUT: {os.path.basename(video_path)} ({elapsed}s)",
+                        message_type="error",
+                    )
+                    try:
+                        if toolbox_processor and getattr(toolbox_processor, "rife_handler", None):
+                            toolbox_processor.rife_handler.unload_model()
+                    except Exception:
+                        pass
+                    res = _fail_toolbox_item_requeue(
+                        wq, video_path, reason, max_attempts=max_attempts
+                    )
+                    if res == "requeued":
+                        requeued += 1
+                    else:
+                        permanent_fail += 1
+                    continue
+
+            log(messages, message_type="info")
+            if result_path and os.path.exists(result_path):
+                # Single final only — autosave may already have written into Ready for CIV
+                final = finalize_output_once(result_path, ready_civ)
+                last_out = final
+                processed += 1
+                # Drop leftover RIFE stage-2 temps for this job (space)
+                try:
+                    stem_hint = Path(video_path).stem[:40]
+                    for folder in (
+                        Path(TEMP_DIR) / "toolbox",
+                        Path(ROOT_DIR) / "_temp" / "toolbox",
+                        Path(ROOT_DIR) / "outputs" / "toolbox",
+                    ):
+                        if not folder.is_dir():
+                            continue
+                        for f in folder.glob("*.mp4"):
+                            n = f.name
+                            if stem_hint and stem_hint[:24] in n and (
+                                "_frames_" in n or n.endswith("_2.mp4")
+                            ):
+                                try:
+                                    f.unlink()
+                                except OSError:
+                                    pass
+                except Exception:
+                    pass
+                inbox_done = (
+                    os.path.join(inbox, "done")
+                    if inbox
+                    else os.path.join(source_archive, "toolbox_done")
+                )
+                # Mark done BEFORE moving the inbox file — prevents "file not found"
+                # false failures after crash/restart between archive and status write.
+                wq.set_item_status(video_path, "done", output=final)
+                archive_original_source(video_path, inbox_done)
+                log(
+                    f"✅ Ready for CIV → {final} ({int(time.time() - t0)}s)",
+                    message_type="finish",
+                )
+            else:
+                reason = "pipeline returned no output"
+                res = _fail_toolbox_item_requeue(
+                    wq, video_path, reason, max_attempts=max_attempts
+                )
+                if res == "requeued":
+                    requeued += 1
+                else:
+                    permanent_fail += 1
+        except Exception as e:
+            log(f"❌ Toolbox error: {e}", message_type="error")
+            res = _fail_toolbox_item_requeue(
+                wq, video_path, str(e), max_attempts=max_attempts
+            )
+            if res == "requeued":
+                requeued += 1
+            else:
+                permanent_fail += 1
+        finally:
+            release_processing_vram()
+
+        if wq.stop_requested():
+            wq.clear_stop()
+            note = (
+                f"⏹ Toolbox stopped after {idx}/{total_q}. "
+                f"{processed} done, {requeued} requeued → {ready_civ}"
+            )
+            return last_out, wq.status_html(note)
+
+    remaining = len(wq.pending_items())
+    note = (
+        f"✅ Toolbox queue complete — {processed} → {ready_civ}"
+        f" (requeued {requeued}, permanent fail {permanent_fail})"
+        if remaining == 0
+        else (
+            f"Pass done: {processed} ok, {requeued} sent to end for later, "
+            f"{permanent_fail} permanent fail. {remaining} still pending."
+        )
+    )
+    progress(1.0, desc=note)
+    return last_out, wq.status_html(note)
 
 
 def get_video_dimensions(video_path):
@@ -3720,6 +4799,7 @@ def create_ui():
 
     config = load_config()
     ui = get_ui_defaults(config)
+    ensure_workflow_dirs(ui)
     
     # Initialize toolbox processor with shared config
     if toolbox_processor is None:
@@ -3803,12 +4883,22 @@ def create_ui():
                                     file_types=["video"],
                                     height="200px",                            
                                 )
-                                gr.Markdown("**Or** specify a folder path containing videos:")
+                                gr.Markdown(
+                                    "**Watch folder** (auto-scanned on Start / Resume) or paste another path:"
+                                )
                                 batch_folder_path = gr.Textbox(
-                                    placeholder="e.g., C:\\Users\\Videos\\batch",
-                                    label="Folder Path",
+                                    value=ui.get(
+                                        "batch_watch_folder",
+                                        r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS",
+                                    ),
+                                    placeholder=r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS",
+                                    label="Watch / folder path",
                                     show_label=True,
-                                    info=TIPS["folder_path"],
+                                    info=(
+                                        "Default: NEW DOWNLOADS. Start / Resume also scans this folder. "
+                                        "After upscale, originals move to Pre Scaled videos (for pairing); "
+                                        "upscaled files stay in the batch completed folder."
+                                    ),
                                 )
                                 
                                 # Batch resize preset
@@ -4089,22 +5179,22 @@ def create_ui():
                                 img_run_button = gr.Button("Start Processing", variant="primary", size="sm")
                             with gr.TabItem("Batch Image"):
                                 img_batch_input_files = gr.File(
-                                    label="Upload Multiple Images for Batch Processing",
+                                    label="Upload images to add to the work queue",
                                     file_count="multiple",
                                     type="filepath",
                                     file_types=["image"],
-                                    height="320px",
+                                    height="200px",
                                 )
-                                gr.Markdown("**Or** specify a folder path containing images:")
+                                gr.Markdown("**Watch folder** (same NEW DOWNLOADS as video — images auto-picked):")
                                 img_batch_folder_path = gr.Textbox(
-                                    placeholder="e.g., C:\\Users\\Pictures\\batch",
-                                    label="Folder Path",
-                                    show_label=False
+                                    value=ui.get("batch_watch_folder", r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS"),
+                                    placeholder=r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS",
+                                    label="Watch / folder path",
+                                    show_label=True,
+                                    info="Start/Resume scans this folder for images. Upscales → Ready for CIV\\images; originals → Pre Scaled.",
                                 )
-                                
-                                # Batch resize preset
                                 gr.Markdown("---")
-                                gr.Markdown('<span style="font-size: 0.9em; color: #666;">📐 **Batch Resize Preset** - Automatically resize images wider than selected width</span>')
+                                gr.Markdown('<span style="font-size: 0.9em; color: #666;">📐 **Batch Resize Preset**</span>')
                                 img_batch_resize_preset = gr.Dropdown(
                                     choices=["No Resize", "512px", "768px", "1024px", "1280px", "1920px"],
                                     value=ui["batch_resize_preset"],
@@ -4112,8 +5202,15 @@ def create_ui():
                                     info=TIPS["batch_resize"],
                                     interactive=True
                                 )
-                                
-                                img_batch_run_button = gr.Button("Start Batch Processing", variant="primary", size="sm")
+                                img_queue_status = gr.HTML(value=get_flashvsr_image_queue().status_html())
+                                with gr.Row():
+                                    img_add_queue_btn = gr.Button("➕ Add to Queue", size="sm")
+                                    img_batch_run_button = gr.Button("▶️ Start / Resume Image Queue", variant="primary", size="sm")
+                                    img_stop_queue_btn = gr.Button("⏹ Stop After Current", variant="stop", size="sm")
+                                with gr.Row():
+                                    img_requeue_failed_btn = gr.Button("↺ Re-queue Failed", size="sm")
+                                    img_clear_done_btn = gr.Button("Clear Done", size="sm")
+                                    img_clear_all_btn = gr.Button("Clear Entire Queue", size="sm", variant="stop")
                         
                         # Image Pre-Processing Accordion
                         with gr.Accordion("📊 Image Pre-Processing", open=False):
@@ -4335,12 +5432,57 @@ def create_ui():
                                 )
                             tb_start_pipeline_btn = gr.Button("🚀 Start Pipeline Processing", variant="primary", size="sm")                              
                             with gr.Group():
+                                _tb_ops_default = [
+                                    o.strip()
+                                    for o in str(ui.get("tb_pipeline_ops") or "Frame Adjust,Export").split(",")
+                                    if o.strip()
+                                ]
                                 tb_pipeline_steps_chkbox = gr.CheckboxGroup(
                                     choices=["Frame Adjust", "Video Loop", "Export"],
-                                    value=[],
+                                    value=_tb_ops_default or ["Frame Adjust", "Export"],
                                     show_label=False,
                                     info=TIPS["tb_pipeline"]
                                 )
+                            with gr.Accordion(
+                                "📦 Post-upscale queue (Ready for Toolbox → Ready for CIV)",
+                                open=True,
+                            ):
+                                _tb_inbox_default = ui.get(
+                                    "tb_inbox_folder",
+                                    r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox",
+                                )
+                                gr.Markdown(
+                                    "<span style='font-size:0.9em;color:#555;'>"
+                                    "Drop upscaled videos in <b>Ready for Toolbox</b>, then Start. "
+                                    "Default: <b>4× frames</b> + <b>Export</b> → "
+                                    f"<code>{_tb_inbox_default}</code> "
+                                    "→ Ready for CIV.</span>"
+                                )
+                                tb_inbox_path = gr.Textbox(
+                                    value=ui.get(
+                                        "tb_inbox_folder",
+                                        r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox",
+                                    ),
+                                    label="Toolbox inbox (hand-sort folder)",
+                                    info="Place FlashVSR completed upscales here. Start/Resume auto-scans.",
+                                )
+                                tb_queue_status = gr.HTML(value=get_toolbox_work_queue().status_html())
+                                with gr.Row():
+                                    tb_queue_add_btn = gr.Button("➕ Scan Inbox → Queue", size="sm")
+                                    tb_queue_run_btn = gr.Button(
+                                        "▶️ Start / Resume Toolbox Queue",
+                                        variant="primary",
+                                        size="sm",
+                                    )
+                                    tb_queue_stop_btn = gr.Button(
+                                        "⏹ Stop After Current", variant="stop", size="sm"
+                                    )
+                                with gr.Row():
+                                    tb_queue_requeue_btn = gr.Button("↺ Re-queue Failed", size="sm")
+                                    tb_queue_clear_done_btn = gr.Button("Clear Done", size="sm")
+                                    tb_queue_clear_all_btn = gr.Button(
+                                        "Clear Entire Queue", size="sm", variant="stop"
+                                    )
                             
                             # Video Analysis Section
                             tb_analyze_button = gr.Button("📊 Analyze Input Video", size="sm", variant="secondary", visible=False)
@@ -4389,8 +5531,10 @@ def create_ui():
                             with gr.Row():
                                 with gr.Group():
                                     process_fps_mode = gr.Radio(
-                                        choices=["No Interpolation", "2x Frames", "4x Frames"], value="2x Frames",  label="RIFE Frame Interpolation",
-                                        info=TIPS["rife"]
+                                        choices=["No Interpolation", "2x Frames", "4x Frames"],
+                                        value=ui.get("tb_fps_mode") or "4x Frames",
+                                        label="RIFE Frame Interpolation",
+                                        info=TIPS["rife"],
                                     )
                                     process_speed_factor = gr.Slider(
                                         minimum=0.5, maximum=2.0, step=0.05, value=1, label="Adjust Video Speed Factor",
@@ -5033,8 +6177,14 @@ def create_ui():
         def handle_batch_processing(
             mode, model_version, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap,
             unload_dit, dtype_str, seed, device, fps_override, quality, attention_mode,
-            sparse_ratio, kv_ratio, local_range, batch_resize_preset, enable_chunks, chunk_duration
+            sparse_ratio, kv_ratio, local_range, batch_resize_preset, enable_chunks, chunk_duration,
+            watch_folder,
         ):
+            # Persist watch folder from UI so Start/Resume picks up new downloads
+            if watch_folder and str(watch_folder).strip():
+                cfg = load_config()
+                cfg["batch_watch_folder"] = str(watch_folder).strip()
+                save_config(cfg)
             last_video, queue_html = run_flashvsr_work_queue(
                 mode, model_version, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap,
                 unload_dit, dtype_str, seed, device, fps_override, quality, attention_mode,
@@ -5089,7 +6239,7 @@ def create_ui():
                 tiled_dit_checkbox, tile_size_slider, tile_overlap_slider, unload_dit_checkbox,
                 dtype_radio, seed_number, device_textbox, fps_number, quality_slider, attention_mode_radio,
                 sparse_ratio_slider, kv_ratio_slider, local_range_slider, batch_resize_preset,
-                enable_chunk_processing, chunk_duration_slider,
+                enable_chunk_processing, chunk_duration_slider, batch_folder_path,
             ],
             outputs=[video_output, output_file_path, video_slider_output, completion_status, flashvsr_queue_status]
         ).then(
@@ -5251,32 +6401,69 @@ def create_ui():
             show_progress="hidden"
         )
         
-        # Batch image handler wrapper
-        def handle_img_batch_processing(
-            batch_files, folder_path, mode, model_version, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap,
-            unload_dit, dtype_str, seed, device, fps_override, quality, attention_mode,
-            sparse_ratio, kv_ratio, local_range, create_comparison, batch_resize_preset
-        ):
-            # Collect input paths from either files or folder
-            input_paths = []
+        # Image work queue handlers
+        def handle_img_queue_add(batch_files, folder_path):
+            wq = get_flashvsr_image_queue()
+            a, s = 0, 0
             if folder_path and os.path.isdir(folder_path):
-                image_extensions = ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif']
-                input_paths = [str(f) for f in Path(folder_path).iterdir() 
-                              if f.is_file() and f.suffix.lower() in image_extensions]
-                input_paths.sort()  # Sort for consistent ordering
-            elif batch_files:
-                input_paths = [file.name for file in batch_files]
-            
-            if not input_paths:
-                return None, "❌ No images found. Please upload files or specify a valid folder path.", None
-            
-            return run_flashvsr_batch_image(
-                input_paths, mode, model_version, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap,
+                a, s = wq.add_folder(folder_path)
+            paths = []
+            if batch_files:
+                for f in batch_files:
+                    p = f if isinstance(f, str) else getattr(f, "name", None)
+                    if p:
+                        paths.append(p)
+            if paths:
+                a2, s2 = wq.add_paths(paths)
+                a += a2
+                s += s2
+            note = f"Added {a} image(s)" + (f", skipped {s} dupes" if s else "")
+            if a == 0 and s == 0:
+                note = "Nothing to add — drop images in the watch folder or upload."
+            return wq.status_html(note)
+
+        def handle_img_batch_processing(
+            mode, model_version, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap,
+            unload_dit, dtype_str, seed, device, fps_override, quality, attention_mode,
+            sparse_ratio, kv_ratio, local_range, create_comparison, batch_resize_preset, watch_folder,
+        ):
+            if watch_folder and str(watch_folder).strip():
+                cfg = load_config()
+                cfg["batch_watch_folder"] = str(watch_folder).strip()
+                save_config(cfg)
+            last, html = run_flashvsr_image_work_queue(
+                mode, model_version, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap,
                 unload_dit, dtype_str, seed, device, fps_override, quality, attention_mode,
-                sparse_ratio, kv_ratio, local_range, create_comparison, batch_resize_preset
+                sparse_ratio, kv_ratio, local_range, create_comparison, batch_resize_preset,
             )
-        
-        # Batch image run button click
+            return last, html, html, html
+
+        img_add_queue_btn.click(
+            fn=handle_img_queue_add,
+            inputs=[img_batch_input_files, img_batch_folder_path],
+            outputs=[img_queue_status],
+        )
+        def _img_q_stop():
+            wq = get_flashvsr_image_queue()
+            return wq.status_html(wq.request_stop())
+
+        def _img_q_clear_done():
+            wq = get_flashvsr_image_queue()
+            return wq.status_html(f"Cleared {wq.clear_done()} done.")
+
+        def _img_q_clear_all():
+            wq = get_flashvsr_image_queue()
+            return wq.status_html(f"Cleared {wq.clear_all()} items.")
+
+        def _img_q_requeue():
+            wq = get_flashvsr_image_queue()
+            return wq.status_html(f"Re-queued {wq.requeue_failed()} failed.")
+
+        img_stop_queue_btn.click(fn=_img_q_stop, inputs=[], outputs=[img_queue_status], queue=False)
+        img_clear_done_btn.click(fn=_img_q_clear_done, outputs=[img_queue_status])
+        img_clear_all_btn.click(fn=_img_q_clear_all, outputs=[img_queue_status])
+        img_requeue_failed_btn.click(fn=_img_q_requeue, outputs=[img_queue_status])
+
         img_batch_run_button.click(
             fn=check_model_status,
             inputs=[img_model_version],
@@ -5288,13 +6475,14 @@ def create_ui():
         ).then(
             fn=handle_img_batch_processing,
             inputs=[
-                img_batch_input_files, img_batch_folder_path, img_mode, img_model_version, img_scale, img_color_fix,
+                img_mode, img_model_version, img_scale, img_color_fix,
                 img_tiled_vae, img_tiled_dit, img_tile_size, img_tile_overlap,
                 img_unload_dit, img_dtype, img_seed, img_device, img_fps,
                 img_quality, img_attention_mode, img_sparse_ratio, img_kv_ratio,
-                img_local_range, img_create_comparison, img_batch_resize_preset
+                img_local_range, img_create_comparison, img_batch_resize_preset,
+                img_batch_folder_path,
             ],
-            outputs=[img_output, img_batch_status, completion_status]
+            outputs=[img_output, img_batch_status, img_queue_status, completion_status]
         ).then(
             fn=lambda status_msg: status_msg,
             inputs=[completion_status],
@@ -5578,6 +6766,59 @@ def create_ui():
                 export_two_pass
             ],
             outputs=[processed_video, tb_status_message, tb_output_analysis_html]
+        )
+
+        # Toolbox post-upscale work queue (Ready for Toolbox → Ready for CIV)
+        def handle_tb_queue_scan(inbox):
+            wq = get_toolbox_work_queue()
+            if inbox and str(inbox).strip():
+                cfg = load_config()
+                cfg["tb_inbox_folder"] = str(inbox).strip()
+                save_config(cfg)
+                inbox = str(inbox).strip()
+            a, s = wq.add_folder(inbox) if inbox and os.path.isdir(inbox) else (0, 0)
+            note = f"Scanned inbox: +{a}" + (f", {s} already queued" if s else "")
+            if a == 0 and s == 0:
+                note = f"No new videos in inbox: {inbox}"
+            return wq.status_html(note)
+
+        def handle_tb_queue_run(inbox):
+            if inbox and str(inbox).strip():
+                cfg = load_config()
+                cfg["tb_inbox_folder"] = str(inbox).strip()
+                save_config(cfg)
+            last, html = run_toolbox_work_queue()
+            return last, html, html
+
+        tb_queue_add_btn.click(
+            fn=handle_tb_queue_scan,
+            inputs=[tb_inbox_path],
+            outputs=[tb_queue_status],
+        )
+        def _tb_q_stop():
+            wq = get_toolbox_work_queue()
+            return wq.status_html(wq.request_stop())
+
+        def _tb_q_clear_done():
+            wq = get_toolbox_work_queue()
+            return wq.status_html(f"Cleared {wq.clear_done()} done.")
+
+        def _tb_q_clear_all():
+            wq = get_toolbox_work_queue()
+            return wq.status_html(f"Cleared {wq.clear_all()} items.")
+
+        def _tb_q_requeue():
+            wq = get_toolbox_work_queue()
+            return wq.status_html(f"Re-queued {wq.requeue_failed()} failed.")
+
+        tb_queue_stop_btn.click(fn=_tb_q_stop, inputs=[], outputs=[tb_queue_status], queue=False)
+        tb_queue_clear_done_btn.click(fn=_tb_q_clear_done, outputs=[tb_queue_status])
+        tb_queue_clear_all_btn.click(fn=_tb_q_clear_all, outputs=[tb_queue_status])
+        tb_queue_requeue_btn.click(fn=_tb_q_requeue, outputs=[tb_queue_status])
+        tb_queue_run_btn.click(
+            fn=handle_tb_queue_run,
+            inputs=[tb_inbox_path],
+            outputs=[processed_video, tb_status_message, tb_queue_status],
         )
 
         # Use as Input button - sends processed video back to input

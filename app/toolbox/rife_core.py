@@ -76,6 +76,7 @@ class RIFEHandler:
             return None
 
         try:
+            # Contiguous RGB uint8 → float tensor (avoid extra PIL copies)
             img0_tensor = to_tensor(frame1_np).unsqueeze(0)
             img1_tensor = to_tensor(frame2_np).unsqueeze(0)
 
@@ -91,14 +92,27 @@ class RIFEHandler:
                 img0 = torch.nn.functional.pad(img0, (0, pad_w, 0, pad_h), mode='replicate')
                 img1 = torch.nn.functional.pad(img1, (0, pad_w, 0, pad_h), mode='replicate')
 
-            with torch.no_grad():
-                middle_frame_tensor = self.rife_model.inference(img0, img1, scale=1.0)
+            # inference_mode is faster than no_grad; autocast on CUDA is typically ~1.5–2×
+            # faster on 40-series with no visible quality loss for RIFE HD at scale=1.0
+            use_cuda = bool(img0.is_cuda)
+            with torch.inference_mode():
+                if use_cuda:
+                    try:
+                        with torch.autocast(device_type='cuda', dtype=torch.float16):
+                            middle_frame_tensor = self.rife_model.inference(img0, img1, scale=1.0)
+                    except Exception:
+                        # Rare op incompat — fall back to full precision once
+                        middle_frame_tensor = self.rife_model.inference(img0, img1, scale=1.0)
+                else:
+                    middle_frame_tensor = self.rife_model.inference(img0, img1, scale=1.0)
 
             if pad_h > 0 or pad_w > 0:
                 middle_frame_tensor = middle_frame_tensor[:, :, :h_orig, :w_orig]
 
-            middle_frame_pil = to_pil_image(middle_frame_tensor.squeeze(0).cpu())
-            return np.array(middle_frame_pil)
+            # Direct tensor → uint8 HWC (skip PIL round-trip)
+            mid = middle_frame_tensor.squeeze(0).float().clamp(0.0, 1.0)
+            mid = (mid * 255.0).round().to(torch.uint8).permute(1, 2, 0).contiguous()
+            return mid.cpu().numpy()
 
         except Exception as e:
             print(f"ERROR: Error during RIFE frame interpolation: {e}")

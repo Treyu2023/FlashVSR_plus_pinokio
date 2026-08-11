@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-08-11 | **Preserve stack:** `scripts/env_guard.py` (snapshot / stop holders / safetensors verify+repair); hardened `update.js` (stop Start, snapshot, post-update verify); `start.js` preflight; Update/Reset confirms in `pinokio.js`; offline backups under `C:\pinokio\backups\FlashVSR_plus_pinokio\`; see root `PRESERVE.md`. |
 | 2026-07-31 | Toolbox **Batch Queue maxed**: 20-file packs, token-safe stem match, import crashed `batch_*` folders, requeue failed, rebuild chunks, hardlink/symlink/copy work packs, atomic manifests + CSV/PENDING/FAILED/DONE, ETA, push path → FlashVSR Batch. Live `INPUTS.txt` + `BATCH_PROGRESS` + `REMAINING.txt` on every FlashVSR batch. |
 | 2026-07-31 | Pipeline stage tags on filenames: `_1` upscale, `_2` RIFE interpolation, `_3` export/posted (always last before extension). |
 | 2026-07-31 | RTX 4090 profile defaults (tile 320/40, chunks 12s, resize 768px, quality 7). Machine-aware hover tooltips on all options (`TIPS` + floating tip JS). Desktop launcher `Launch-FlashVSR-Plus.bat`. |

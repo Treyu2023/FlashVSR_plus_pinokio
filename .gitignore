@@ -15,6 +15,9 @@ Thumbs.db
 # Local user config (machine-specific paths) — keep tracked example optional
 # app/webui_config is machine-specific; still useful — track it if present
 
+# Local recovery snapshots (machine-specific; also mirrored under C:\pinokio\backups\)
+local-preserve/
+
 # Logs / caches at repo root
 cache/
 logs/

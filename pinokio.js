@@ -73,6 +73,7 @@ module.exports = {
           icon: "fa-solid fa-plug",
           text: "Update",
           href: "update.js",
+          confirm: "Stop the app first if it is running outside Pinokio (desktop launcher). Update will stop Pinokio Start, snapshot custom files, pull, reinstall requirements, and verify safetensors. Continue?"
         }, {
           icon: "fa-solid fa-plug",
           text: "Install",
@@ -83,10 +84,9 @@ module.exports = {
           href: "link.js",
         }, {
           icon: "fa-regular fa-circle-xmark",
-          text: "<div><strong>Reset</strong><div>Revert to pre-install state</div></div>",
+          text: "<div><strong>Reset</strong><div>Deletes app/ — use only if you can restore from mine remote or C:\\pinokio\\backups</div></div>",
           href: "reset.js",
-          confirm: "Are you sure you wish to reset the app?"
-
+          confirm: "Reset deletes the entire app/ folder (code, env, models link). Offline backups live under C:\\pinokio\\backups\\FlashVSR_plus_pinokio. Are you sure?"
         }]
       }
     } else {

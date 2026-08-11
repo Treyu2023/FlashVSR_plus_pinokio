@@ -1,6 +1,17 @@
 module.exports = {
   daemon: true,
   run: [
+    // Auto-repair broken safetensors (Windows file-lock corruption) before webui import
+    {
+      method: "shell.run",
+      params: {
+        venv: "env",
+        path: "app",
+        message: [
+          "python ../scripts/env_guard.py preflight"
+        ]
+      }
+    },
     {
       method: "shell.run",
       params: {
@@ -16,7 +27,7 @@ module.exports = {
           // The regular expression pattern to monitor.
           // When this pattern occurs in the shell terminal, the shell will return,
           // and the script will go onto the next step.
-          "event": "/http:\/\/\\S+/",   
+          "event": "/http:\\/\\/\\S+/",
 
           // "done": true will move to the next step while keeping the shell alive.
           // "kill": true will move to the next step after killing the shell.

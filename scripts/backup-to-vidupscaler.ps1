@@ -146,9 +146,17 @@ if (-not $WhatIf) {
 }
 
 if ($Commit -and -not $WhatIf) {
+    # Nested app/.git makes outer git treat app as a submodule gitlink — remove it.
+    $nestedGit = Join-Path $dstApp '.git'
+    if (Test-Path -LiteralPath $nestedGit) {
+        Remove-Item -LiteralPath $nestedGit -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "  removed nested app/.git so source files can be tracked"
+    }
     Push-Location $Dest
     try {
         git add -A
+        # never keep bulk path gitlinks
+        git rm -r --cached --ignore-unmatch app/Models app/models app/env app/outputs app/inputs app/_temp 2>$null | Out-Null
         $status = git status --porcelain
         if (-not $status) {
             Write-Host "  git: nothing new to commit"

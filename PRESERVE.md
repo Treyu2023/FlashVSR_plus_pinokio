@@ -35,9 +35,23 @@ git push mine main
 
 | Location | Survives |
 |----------|----------|
+| **`C:\pinokio\api\VIDUpscaler`** | **Code milestone mirror** of this install (same product family; FlashVSR is newer/live) |
 | `local-preserve/latest/` (in repo, gitignored) | Reset deletes `app/` only — this folder stays |
 | `C:\pinokio\backups\FlashVSR_plus_pinokio\<timestamp>\` | Full project delete / reinstall |
 | Git remote `mine` | Machine loss (after you push) |
+
+### VIDUpscaler = working milestone backup (not a second live app)
+
+**FlashVSR+ is the only install you should edit and run day-to-day.**  
+VIDUpscaler is the same product line kept as a **known-good source snapshot** so you can recover code after a bad update.
+
+```powershell
+cd C:\pinokio\api\FlashVSR_plus_pinokio.git
+# copy live code → VIDUpscaler (no env/models/outputs)
+powershell -ExecutionPolicy Bypass -File .\scripts\backup-to-vidupscaler.ps1 -Commit
+```
+
+Restores code only; re-use FlashVSR `app\env` (or reinstall) after recovery.
 
 Critical files in each snapshot: `webui.py`, `flashvsr_work_queue.py`, toolbox modules, `webui_config`, launcher `*.js`, `requirements.txt`, etc.
 

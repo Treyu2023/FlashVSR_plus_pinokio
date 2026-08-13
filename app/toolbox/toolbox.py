@@ -25,6 +25,8 @@ from naming_utils import (
     strip_stage,
     with_stage,
     promote_stage,
+    step2_filename,
+    move_to_bin,
 )
 
 device_name_str = devicetorch.get(torch)
@@ -1167,14 +1169,32 @@ class ToolboxProcessor:
             }
             ext = ext_map.get(export_format, ".mp4")
             
-            base_name = output_name if output_name and output_name.strip() else Path(video_path).stem
-            suffix = f"exported_{max_width}w_{quality}q"
-            # GIFs are always saved permanently, others respect autosave setting.
+            # Prefer clean Step-2 name: <step1>_30fps.ext (approx FPS from source)
             is_temp_save = export_format != "GIF" and not self.autosave_enabled
-            # Stage 3 = exported / ready-to-post (at end of filename)
-            output_path = self._generate_output_path(
-                base_name, suffix, ext=ext, is_temp=is_temp_save, stage=STAGE_POSTED
-            )
+            if output_name and str(output_name).strip():
+                base_name = str(output_name).strip()
+                output_path = self._generate_output_path(
+                    base_name, "", ext=ext, is_temp=is_temp_save, stage=None
+                )
+            else:
+                fps_est = 30
+                try:
+                    # imageio may already be imported at module level
+                    import imageio as _iio
+                    fps_est = float(_iio.get_reader(video_path).get_meta_data().get("fps") or 30)
+                except Exception:
+                    fps_est = 30
+                nice = step2_filename(Path(video_path).stem, fps_est, ext=ext)
+                if is_temp_save:
+                    os.makedirs(self.temp_dir, exist_ok=True)
+                    output_path = self.temp_dir / nice
+                else:
+                    os.makedirs(self.output_dir, exist_ok=True)
+                    output_path = self.output_dir / nice
+                    # avoid overwrite
+                    if Path(output_path).exists():
+                        stem = Path(nice).stem
+                        output_path = self.output_dir / f"{stem}_{datetime.now().strftime('%H%M%S')}{ext}"
             if export_format == "GIF": print(f"INFO: GIF format selected. Output will be saved to permanent folder: {output_path}")
 
             # Common video filter (may be None if already under max_width)

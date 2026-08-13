@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-08-11 | **Clarity defaults:** resize ≤**1024px** (was 768 — was crushing sources), tile **256/48**, quality **9**, sparse **1.2**, chunks **10s**, pre-resize CRF **14**/slow, toolbox export quality **96**/slow. Root cause of soft output: pre-downscale + encode 7; OOM at tile 320 on tall 4× (e.g. 3072×4608). |
 | 2026-08-11 | **Preserve stack:** `scripts/env_guard.py` (snapshot / stop holders / safetensors verify+repair); hardened `update.js` (stop Start, snapshot, post-update verify); `start.js` preflight; Update/Reset confirms in `pinokio.js`; offline backups under `C:\pinokio\backups\FlashVSR_plus_pinokio\`; see root `PRESERVE.md`. |
 | 2026-07-31 | Toolbox **Batch Queue maxed**: 20-file packs, token-safe stem match, import crashed `batch_*` folders, requeue failed, rebuild chunks, hardlink/symlink/copy work packs, atomic manifests + CSV/PENDING/FAILED/DONE, ETA, push path → FlashVSR Batch. Live `INPUTS.txt` + `BATCH_PROGRESS` + `REMAINING.txt` on every FlashVSR batch. |
 | 2026-07-31 | Pipeline stage tags on filenames: `_1` upscale, `_2` RIFE interpolation, `_3` export/posted (always last before extension). |
@@ -37,38 +38,28 @@
 ## `webui_config` (current values)
 
 ```ini
-clear_temp_on_start=True
-autosave=True
-tb_autosave=True
-theme=Interstellar
-toolbox_output_dir=D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV
-chunk_duration=12
+# Clarity profile — see Changelog 2026-08-11
+batch_resize_preset=1024px
+tile_size=256
+tile_overlap=48
+quality=9
+sparse_ratio=1.2
+chunk_duration=10
 enable_chunks=True
 tiled_dit=True
 tiled_vae=True
 unload_dit=True
-tile_size=320
-tile_overlap=40
-attention_mode=sage
-sparse_ratio=1.5
-local_range=11
-kv_ratio=3
-quality=7
-randomize_seed=False
 scale=4
 mode=tiny
-model_version=v1.1
-dtype=bf16
-color_fix=True
-fps_override=30
-device=cuda:0
-batch_resize_preset=768px
-naming_mode=both
+tb_frames_quality=98
+tb_export_quality=96
+tb_export_preset=slow
 ```
 
-**RTX 4090 notes:** tile 320 + 768px resize is a speed/quality step up from the ultra-safe 256/512 OOM profile. If you OOM, drop tile to 256 and resize to 512px (unload DiT + chunks stay on).
+**RTX 4090 clarity notes:** Prefer **1024px input + tile 256** over **768px + tile 320**. Soft “lost quality” was from pre-downscale discarding pixels the model never sees. If OOM: drop resize to 768px (keep tile 256) or Restart FlashVSR after a hard OOM (VRAM can stick at 0 free).
 
-**Note:** `output_dir` is intentionally **not** set — FlashVSR upscales go to the default app `outputs` folder. Only toolbox final saves use `toolbox_output_dir`.
+**Note:** Production files no longer land in `app\outputs`. That folder is only for queue STATUS / temp logs.
+Step 3 (upscaled videos) = **Ready for Toolbox**. Configure all steps under ⚙️ Settings → Pipeline folders.
 
 ---
 
@@ -78,18 +69,23 @@ naming_mode=both
 
 Stock FlashVSR only read theme/autosave/output from `webui_config`. Added `get_ui_defaults()` so processing sliders load from config on startup:
 
-- Upscale 4×, tiny, v1.1, chunks 12s, tiled DiT/VAE, unload DiT, tile 320/40, sage, bf16, cuda:0, quality 7, batch resize 768px, etc.
+- Upscale 4×, tiny, v1.1, chunks 10s, tiled DiT/VAE, unload DiT, tile 256/48, sage, bf16, cuda:0, quality 9, batch resize 1024px, etc.
 
 **Code:** `load_config()` + `_parse_config_value()`, `get_ui_defaults()`, `create_ui()` uses `ui[...]` for control `value=`.
 
-### 2. Split output directories
+### 2. Pipeline folders (readable steps)
 
-| Stage | Path |
-|-------|------|
-| FlashVSR upscaled (working) | `C:\pinokio\api\FlashVSR_plus_pinokio.git\app\outputs` (default) |
-| Toolbox complete / export | `D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV` |
+| Step | What | Default path |
+|------|------|----------------|
+| 1 | Intake / watch | `D:\OUTPUTS\__X_GROK\NEW DOWNLOADS` |
+| 2 | Originals archive | `D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos` |
+| 3 | After upscale (videos) | `D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox` |
+| 4 | After upscale (images) | `...\Ready for CIV\images` |
+| 5 | Toolbox inbox | same as step 3 |
+| 6 | Final / Ready for CIV | `D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV` |
 
-**Code:** `get_toolbox_output_dir()`, `_apply_toolbox_output_dir()`, Settings → separate **FlashVSR Upscale** vs **Toolbox Final Save** fields.
+**Name tags:** `_1` upscale · `_2` interpolate · `_3` export  
+**Code:** `WORKFLOW_DEFAULTS`, `get_workflow_paths()`, `workflow_paths_html()`, Settings → **Save all pipeline folders**.
 
 ### 3. Output naming (`naming_mode=both`)
 
@@ -149,9 +145,10 @@ Resize flow (video + image):
 
 ## Intended workflow
 
-1. Batch/single upscale → `app\outputs` (512px-wide center-crop input, 4×, chunks optional).
-2. **Send to Toolbox** (or load from outputs).
-3. Toolbox export → `D:\OUTPUTS\...\Ready for CIV`.
+1. Drop sources in **Step 1** (NEW DOWNLOADS).
+2. Video queue upscales → **Step 3 Ready for Toolbox** (`_1`); originals → Step 2.
+3. Toolbox reads Step 5/3 → export → **Step 6 Ready for CIV** (`_3`).
+4. Images → **Step 4** Ready for CIV\images (skip RIFE).
 
 ---
 

@@ -45,6 +45,9 @@ from flashvsr_work_queue import FlashVSRWorkQueue, ExclusiveQueueLock, VIDEO_EXT
 from naming_utils import (
     upscale_video_filename,
     upscale_image_filename,
+    move_to_bin,
+    rename_to_step2,
+    step2_filename,
     upscale_combine_stem,
     comparison_video_filename,
     comparison_image_filename,
@@ -126,8 +129,8 @@ TIPS = {
         "Randomize Seed — new seed every run. Off (default) keeps results consistent so you can judge setting changes on your 4090."
     ),
     "scale": (
-        "Upscale Factor — model was trained primarily for 4×. On a 4090, 4× at 512–768px input width is the sweet spot. "
-        "Use 2× if you need speed or the source is already near 1080p+. Output ≈ input × scale (grid-aligned)."
+        "Upscale Factor — model was trained primarily for 4×. On a 4090, 4× at ~1024px input width is the clarity sweet spot. "
+        "Use 2× if source is already ≥1080p and you want less VRAM. Output ≈ input × scale (grid-aligned)."
     ),
     "tiled_dit": (
         "Tiled DiT — ON (default for this PC). Splits the diffusion transformer work into tiles to avoid VRAM spikes. "
@@ -135,24 +138,25 @@ TIPS = {
         "turning off is only for short tiny-mode tests."
     ),
     "tile_size": (
-        "Tile Size — default 320 for RTX 4090: larger than 256 = fewer tiles / faster, still safe with unload DiT + chunks. "
-        "Drop to 256 or 192 if you see CUDA OOM. Raise toward 384–512 only for short clips with free VRAM ≥12GB before run."
+        "Tile Size — default 256 for RTX 4090 clarity profile: pairs with 1024px input so VAE decode stays under 24GB. "
+        "320 caused OOM on tall 4× outputs (e.g. 3072×4608). Raise to 320 only for short landscape clips with free VRAM ≥14GB."
     ),
     "tile_overlap": (
-        "Tile Overlap — default 40. Higher reduces visible tile seams; costs a little speed. "
-        "Must stay < half of tile size (e.g. tile 320 → overlap ≤160). 32–48 is ideal on 4090."
+        "Tile Overlap — default 48 (was 40). Higher reduces visible tile seams that look like 'soft' quality loss. "
+        "Must stay < half of tile size (e.g. tile 256 → overlap ≤128). 48 is the clarity default on 4090."
     ),
     "enable_chunks": (
         "Process as Chunks — ON (default). Splits long videos into segments so 64GB system RAM and 24GB VRAM stay healthy. "
         "Keep on for anything longer than ~10–15s at 4×. Disable only for short tests."
     ),
     "chunk_duration": (
-        "Max Chunk Duration — default 12s on this machine. Longer chunks = fewer seams but more peak RAM/VRAM. "
-        "If free VRAM drops under ~4GB mid-run, lower to 8–10s. Raise to 15–20s only when VRAM headroom is large."
+        "Max Chunk Duration — default 10s with 1024px inputs (was 12s @ 768). Longer = fewer seams but more peak VRAM. "
+        "If free VRAM drops under ~4GB mid-run, lower to 8s. Raise to 12–15s only when VRAM headroom is large."
     ),
     "batch_resize": (
-        "Resize Width Preset — default 768px for your 4090 (was 512px ultra-safe). Only shrinks if source is wider. "
-        "4× of 768 ≈ 3072px wide output. Use 512px if OOM; 1024px only for short clips with chunks + tile ≤256."
+        "Resize Width Preset — default 1024px (clarity). Only shrinks if source is wider — never upsizes. "
+        "4× of 1024 ≈ 4096px wide. Pre-downscale to 768 was discarding detail before the model (soft outputs). "
+        "Use 768/512 only if OOM; use No Resize only for short ≤720p sources with chunks + tile 256."
     ),
     "autosave": (
         "Autosave Output — ON saves finished upscales automatically to the FlashVSR output folder. "
@@ -167,15 +171,16 @@ TIPS = {
         "do not eat disk space or confuse the pipeline. Safe to leave on with 64GB RAM."
     ),
     "sparse_ratio": (
-        "Sparse Ratio — attention sparsity. 1.5 (default) = faster on 4090. "
-        "Raise toward 2.0 if output looks unstable/flickery; lower toward 1.0 for max speed on clean AI video."
+        "Sparse Ratio — attention sparsity. 1.2 (clarity default) keeps more detail than 1.5. "
+        "Lower (1.0) = denser attention / more detail (slower). Higher (1.5–2.0) = faster batch throughput. "
+        "If output flickers, try 1.3–1.5; for hero stills/short clips use 1.0–1.2."
     ),
     "local_range": (
         "Local Range — temporal attention window (odd values). 11 (default) = smoother temporal stability. "
         "9 = slightly sharper / more temporal risk. Leave 11 for most upscales."
     ),
     "quality": (
-        "Output Video Quality — encode quality slider (1–10). Default 7 balances size vs fidelity for CIV/export. "
+        "Output Video Quality — encode quality slider (1–10). Default 9 keeps more fine detail for CIV/export (7 looked soft). "
         "8–10 = near-lossless but very large files on 4K-class outputs. 5 = smaller previews."
     ),
     "kv_ratio": (
@@ -213,7 +218,7 @@ TIPS = {
     "trim_end": "Trim End — end time in seconds (0 = through end of file). Keep clips short when testing full mode.",
     "resize_width": (
         "Target Width — pre-scale input width before FlashVSR (aspect preserved, then grid-aligned). "
-        "On this PC, 512–768px is the practical range for 4×. Higher width ⇒ much more VRAM at 4×."
+        "On this PC, 768–1024px is the practical range for 4× clarity. Higher width ⇒ much more VRAM at 4×."
     ),
     "img_scale": (
         "Image Upscale Factor — model trained for 4×. Single images are lighter than video; 4× is fine on 4090. "
@@ -255,16 +260,17 @@ TIPS = {
     "theme": "UI theme — cosmetic only. Interstellar is saved as your preference; restart page after Apply.",
     "custom_theme": "Custom Gradio theme from Hugging Face Spaces (username/theme). Only used when Theme = Custom.",
     "naming_mode": (
-        "Filename convention — 'both' keeps original stem + upscale tags (works with Toolbox and VSR pipeline). "
-        "Examples: both → UpScale4K_clip_upscaled_x4_S_I_1.mp4\n"
-        "Pipeline stage tags (always at the END of the name):\n"
-        "  _1 = upscaled  ·  _2 = interpolated (RIFE)  ·  _3 = exported / ready to post"
+        "Legacy setting (kept for compatibility). Real names are now 2-step:\n"
+        "  Step 1 Upscale → name_4K_9x16_Upscaled.mp4\n"
+        "  Step 2 Interp+Export → name_4K_9x16_Upscaled_30fps.mp4 (+ step-1 moved to Bin\\)"
     ),
-    "output_dir": "FlashVSR working upscale folder (before Toolbox). Empty = app\\outputs under the Pinokio install.",
-    "toolbox_output_dir": (
-        "Toolbox final save folder — currently D:\\OUTPUTS\\__X_GROK\\Upscaled Videos\\Current\\Ready for CIV. "
-        "This is your 'done' directory for CIV-ready files."
-    ),
+    "output_dir": "Legacy alias — use Step 3 (After upscale / Ready for Toolbox). Same as batch_upscale_handoff_dir.",
+    "toolbox_output_dir": "Step 6 — final Ready for CIV folder after Toolbox export.",
+    "batch_watch_folder": "Step 1 — intake. New downloads drop here; queues scan on Start / Resume.",
+    "batch_source_archive_dir": "Step 2 — originals archive after upscale (for pairing).",
+    "batch_upscale_handoff_dir": "Step 3 — where upscaled VIDEOS are saved (Ready for Toolbox).",
+    "img_upscale_handoff_dir": "Step 4 — where upscaled IMAGES are saved (skip Toolbox → Ready for CIV\\images).",
+    "tb_inbox_folder": "Step 5 — Toolbox watches / picks from here (usually same as Step 3).",
     "folder_path": "Folder of videos/images for batch. Use absolute Windows paths (e.g. D:\\clips\\batch).",
     "img_quality": "Still image encode quality. Higher = larger files. 7 default matches video profile.",
     "img_fps": "Unused for still images (placeholder control shared with video advanced block).",
@@ -276,29 +282,145 @@ os.environ['GRADIO_TEMP_DIR'] = TEMP_DIR
 os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+# ── Clear pipeline steps (readable + configurable) ─────────────────────────
+# Away from the old "app\\outputs only" archetype: every production step lives
+# under D:\OUTPUTS\__X_GROK\... with a plain-English name.
+WORKFLOW_DEFAULTS = {
+    "batch_watch_folder": r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS",
+    "batch_source_archive_dir": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
+    "batch_upscale_handoff_dir": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox",
+    "img_upscale_handoff_dir": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV\images",
+    "tb_inbox_folder": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox",
+    "toolbox_output_dir": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV",
+}
+
+# (step#, short title, config key, what lands here)
+WORKFLOW_STEPS = (
+    (1, "Intake / watch", "batch_watch_folder", "New downloads · queue picks up from here"),
+    (2, "Originals archive", "batch_source_archive_dir", "Pre-upscale sources moved here for pairing"),
+    (3, "After upscale (videos)", "batch_upscale_handoff_dir", "FIRST save · upscaled videos · Ready for Toolbox"),
+    (4, "After upscale (images)", "img_upscale_handoff_dir", "Upscaled images (skip RIFE) · Ready for CIV\\images"),
+    (5, "Toolbox inbox", "tb_inbox_folder", "Toolbox reads from here (usually = step 3)"),
+    (6, "Final / Ready for CIV", "toolbox_output_dir", "After Toolbox export · done for CIV"),
+)
+
+STAGE_NAME_LEGEND = (
+    "<b>Step 1 (Upscale):</b> <code>name_4K_9x16_Upscaled.mp4</code> &nbsp;·&nbsp; "
+    "<b>Step 2 (Interp+Export):</b> <code>name_4K_9x16_Upscaled_30fps.mp4</code> "
+    "(step-1 file moves to <code>Bin\\</code>)"
+)
+
+
+def _abs_path_or_default(raw: str, fallback: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        text = fallback
+    text = os.path.normpath(text)
+    if os.path.isabs(text):
+        try:
+            os.makedirs(text, exist_ok=True)
+        except OSError:
+            pass
+        return text
+    # Non-absolute → fall back to known good default
+    fb = os.path.normpath(fallback)
+    try:
+        os.makedirs(fb, exist_ok=True)
+    except OSError:
+        pass
+    return fb
+
+
+def get_workflow_paths(config: Optional[dict] = None) -> dict:
+    """Resolved absolute paths for every pipeline step (config + defaults)."""
+    cfg = load_config() if config is None else dict(config)
+    out = {}
+    for key, default in WORKFLOW_DEFAULTS.items():
+        raw = cfg.get(key, default)
+        if raw is None or str(raw).strip() == "":
+            raw = default
+        out[key] = _abs_path_or_default(raw, default)
+    # output_dir is an alias of step 3 (upscale videos) — never default to app\\outputs
+    legacy = str(cfg.get("output_dir", "") or "").strip()
+    if legacy and os.path.isabs(legacy) and os.path.normpath(legacy) != os.path.normpath(DEFAULT_OUTPUT_DIR):
+        out["output_dir"] = _abs_path_or_default(legacy, out["batch_upscale_handoff_dir"])
+    else:
+        out["output_dir"] = out["batch_upscale_handoff_dir"]
+    return out
+
+
 def get_output_dir():
-    """FlashVSR upscale autosave directory (working outputs before toolbox)."""
-    config = load_config()
-    custom_dir = str(config.get("output_dir", "")).strip()
-    if custom_dir:
-        custom_dir = os.path.normpath(custom_dir)
-        if os.path.isabs(custom_dir):
-            os.makedirs(custom_dir, exist_ok=True)
-            return custom_dir
-    return DEFAULT_OUTPUT_DIR
+    """
+    Step 3 — where upscaled VIDEOS are saved (Ready for Toolbox).
+    No longer defaults to app\\outputs; that folder is only for queue logs/temp.
+    """
+    paths = get_workflow_paths()
+    return paths["output_dir"] or paths["batch_upscale_handoff_dir"]
+
+
+def get_image_output_dir():
+    """Step 4 — where upscaled IMAGES are saved."""
+    return get_workflow_paths()["img_upscale_handoff_dir"]
+
 
 def get_toolbox_output_dir():
-    """Toolbox final-save directory (complete files ready for export)."""
-    config = load_config()
-    toolbox_dir = str(config.get("toolbox_output_dir", "")).strip()
-    if toolbox_dir:
-        toolbox_dir = os.path.normpath(toolbox_dir)
-        if os.path.isabs(toolbox_dir):
-            os.makedirs(toolbox_dir, exist_ok=True)
-            return toolbox_dir
-    fallback = os.path.join(DEFAULT_OUTPUT_DIR, "toolbox")
-    os.makedirs(fallback, exist_ok=True)
-    return fallback
+    """Step 6 — Toolbox final save (Ready for CIV)."""
+    return get_workflow_paths()["toolbox_output_dir"]
+
+
+def get_queue_log_dir():
+    """Internal status/logs only (not production deliverables)."""
+    log_root = os.path.join(DEFAULT_OUTPUT_DIR, "queue_logs")
+    os.makedirs(log_root, exist_ok=True)
+    return log_root
+
+
+def workflow_paths_html(config: Optional[dict] = None) -> str:
+    """Dark readable map of every step → folder (shown in UI + Settings)."""
+    paths = get_workflow_paths(config)
+    rows = []
+    for num, title, key, blurb in WORKFLOW_STEPS:
+        p = paths.get(key, "")
+        rows.append(
+            f"<tr>"
+            f"<td style='padding:6px 10px;color:#7dd3fc;font-weight:700;white-space:nowrap;'>Step {num}</td>"
+            f"<td style='padding:6px 10px;color:#e2e8f0;font-weight:600;'>{title}</td>"
+            f"<td style='padding:6px 10px;color:#94a3b8;font-size:0.88em;'>{blurb}</td>"
+            f"<td style='padding:6px 10px;'><code style='color:#cbd5e1;background:#0b1220;"
+            f"padding:2px 6px;border-radius:4px;font-size:0.82em;'>{p}</code></td>"
+            f"</tr>"
+        )
+    name_row = (
+        f"<div style='margin-top:8px;font-size:0.85em;color:#94a3b8;'>"
+        f"Name tags: {STAGE_NAME_LEGEND}</div>"
+    )
+    process_blurb = (
+        "<div style='margin-top:10px;padding:8px 10px;background:#0b1220;border-radius:6px;"
+        "border:1px solid #334155;font-size:0.88em;line-height:1.45;'>"
+        "<b style='color:#7dd3fc;'>Process steps (only 2):</b><br>"
+        "① <b>Upscale</b> → name like <code style='color:#86efac;'>clip_4K_9x16_Upscaled.mp4</code> "
+        "into Ready for Toolbox<br>"
+        "② <b>Interp + Export</b> → <code style='color:#fbbf24;'>clip_4K_9x16_Upscaled_30fps.mp4</code> "
+        "into Ready for CIV · Step‑1 file moves to <code>Ready for Toolbox\\Bin\\</code>"
+        "</div>"
+    )
+    return (
+        "<div class='fvsr-workflow-map' style='margin:0 0 12px 0;padding:12px 14px;"
+        "border-radius:8px;border:1px solid #2d3748;background:linear-gradient(135deg,#0f1419,#1a2332);"
+        "color:#e2e8f0;'>"
+        "<div style='font-weight:700;color:#7dd3fc;margin-bottom:8px;'>"
+        "📁 Folders + 2-step naming (what actually saves where)</div>"
+        "<table style='width:100%;border-collapse:collapse;font-size:0.9em;'>"
+        + "".join(rows)
+        + "</table>"
+        + process_blurb
+        + name_row
+        + "<div style='margin-top:6px;font-size:0.78em;color:#64748b;'>"
+        "Edit any path in ⚙️ Settings → folders are selectable. "
+        "Queue STATUS logs stay under app\\outputs\\work_queue_* (not deliverables).</div>"
+        "</div>"
+    )
+
 
 def _apply_toolbox_output_dir():
     """Sync live toolbox processor with config."""
@@ -467,20 +589,21 @@ def get_ui_defaults(config=None):
     """Load UI control defaults from webui_config."""
     if config is None:
         config = load_config()
-    # Fallbacks match RTX 4090 profile (also written to webui_config).
+    # Fallbacks: RTX 4090 clarity profile (higher input res + safer tiles).
+    # Quality loss was mostly from pre-downscale 768 + encode 7; OOM was tile 320 on tall 4×.
     specs = {
-        "chunk_duration": (12.0, float),
+        "chunk_duration": (10.0, float),
         "enable_chunks": (True, bool),
         "tiled_dit": (True, bool),
         "tiled_vae": (True, bool),
         "unload_dit": (True, bool),
-        "tile_size": (320, int),
-        "tile_overlap": (40, int),
+        "tile_size": (256, int),
+        "tile_overlap": (48, int),
         "attention_mode": ("sage", str),
-        "sparse_ratio": (1.5, float),
+        "sparse_ratio": (1.2, float),
         "local_range": (11, int),
         "kv_ratio": (3, int),
-        "quality": (7, int),
+        "quality": (9, int),
         "randomize_seed": (False, bool),
         "scale": (4, int),
         "mode": ("tiny", str),
@@ -489,7 +612,8 @@ def get_ui_defaults(config=None):
         "color_fix": (True, bool),
         "fps_override": (30, int),
         "device": ("cuda:0", str),
-        "batch_resize_preset": ("768px", str),
+        # 1024×4 ≈ 4096 wide — keeps more source detail than 768 (was crushing Grok clips)
+        "batch_resize_preset": ("1024px", str),
         "batch_watch_folder": (r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS", str),
         "batch_source_archive_dir": (
             r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
@@ -511,11 +635,11 @@ def get_ui_defaults(config=None):
         ),
         "tb_fps_mode": ("4x Frames", str),
         "tb_pipeline_ops": ("Frame Adjust,Export", str),
-        "tb_frames_quality": (95, int),
-        "tb_export_quality": (92, int),
+        "tb_frames_quality": (98, int),
+        "tb_export_quality": (96, int),
         "tb_export_max_width": (3840, int),
-        # Quality-preserving speed (medium≈slow visually at same CRF; NVENC CQ matched)
-        "tb_export_preset": ("medium", str),
+        # Quality-first toolbox export (slower encode, sharper finals)
+        "tb_export_preset": ("slow", str),
         "tb_prefer_nvenc": (True, bool),
     }
     defaults = {}
@@ -677,12 +801,12 @@ def check_model_status(model_version="v1.0"):
     ]
     
     if not os.path.exists(model_dir):
-        return f'<div style="padding: 8px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 6px; color: #856404; font-size: 0.95em;">⏳ First-time setup: Downloading {model_version} models (~6-7GB) from HuggingFace. This may take several minutes depending on your connection. Please be patient and check the terminal for progress...</div>'
+        return f'<div style="padding: 8px; background: #3d2e0a; border: 1px solid #854d0e; border-radius: 6px; color: #fbbf24; font-size: 0.95em;">⏳ First-time setup: Downloading {model_version} models (~6-7GB) from HuggingFace. This may take several minutes depending on your connection. Please be patient and check the terminal for progress...</div>'
     
     # Check if all required files exist
     missing_files = [f for f in required_files if not os.path.exists(os.path.join(model_dir, f))]
     if missing_files:
-        return f'<div style="padding: 8px; background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 6px; color: #721c24; font-size: 0.95em;">⚠️ Incomplete model files detected: Re-downloading missing {model_version} model(s). Previous download may have been interrupted. Please be patient and check the terminal for progress...</div>'
+        return f'<div style="padding: 8px; background: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 6px; color: #fca5a5; font-size: 0.95em;">⚠️ Incomplete model files detected: Re-downloading missing {model_version} model(s). Previous download may have been interrupted. Please be patient and check the terminal for progress...</div>'
     
     return gr.update()  # Return no update if models exist and are complete
 
@@ -1107,7 +1231,7 @@ def merge_video_with_audio(video_only_path, audio_source_path, output_path):
 def save_file_manually(temp_path):
     if not temp_path or not os.path.exists(temp_path):
         log("Error: No file to save.", message_type="error")
-        return '<div style="padding: 1px; background-color: #f8d7da; border: 1px solid #f5c6cb; border-radius: 1px; color: #721c24;">❌ No file to save.</div>'
+        return '<div style="padding: 1px; background-color: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 4px; color: #fca5a5;">❌ No file to save.</div>'
     
     filename = os.path.basename(temp_path)
     output_dir = get_output_dir()
@@ -1118,7 +1242,7 @@ def save_file_manually(temp_path):
     
     # Save to appropriate subfolder
     if is_image:
-        images_output_dir = os.path.join(output_dir, "images")
+        images_output_dir = get_image_output_dir()
         os.makedirs(images_output_dir, exist_ok=True)
         final_path = os.path.join(images_output_dir, filename)
     else:
@@ -1127,10 +1251,10 @@ def save_file_manually(temp_path):
     try:
         shutil.copy(temp_path, final_path)
         log(f"File saved to: {final_path}", message_type="finish")
-        return f'<div style="padding: 1px; background-color: #d4edda; border: 1px solid #c3e6cb; border-radius: 1px; color: #155724;">✅ File saved to: {final_path}</div>'
+        return f'<div style="padding: 1px; background-color: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac;">✅ File saved to: {final_path}</div>'
     except Exception as e:
         log(f"Error saving file: {e}", message_type="error")
-        return f'<div style="padding: 1px; background-color: #f8d7da; border: 1px solid #f5c6cb; border-radius: 1px; color: #721c24;">❌ Error saving file: {e}</div>'
+        return f'<div style="padding: 1px; background-color: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 4px; color: #fca5a5;">❌ Error saving file: {e}</div>'
 
 def clear_temp_files():
     try:
@@ -1138,13 +1262,13 @@ def clear_temp_files():
             shutil.rmtree(TEMP_DIR)
             os.makedirs(TEMP_DIR, exist_ok=True)
             log("Temp files cleared.", message_type="finish")
-            return '<div style="padding: 1px; background-color: #d4edda; border: 1px solid #c3e6cb; border-radius: 1px; color: #155724;">✅ Temp files cleared.</div>'
+            return '<div style="padding: 1px; background-color: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac;">✅ Temp files cleared.</div>'
         else:
             log("Temp directory doesn't exist.", message_type="info")
-            return '<div style="padding: 1px; background-color: #d1ecf1; border: 1px solid #bee5eb; border-radius: 1px; color: #0c5460;">ℹ️ Temp directory doesn\'t exist.</div>'
+            return '<div style="padding: 1px; background-color: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc;">ℹ️ Temp directory doesn\'t exist.</div>'
     except Exception as e:
         log(f"Error clearing temp files: {e}", message_type="error")
-        return f'<div style="padding: 1px; background-color: #f8d7da; border: 1px solid #f5c6cb; border-radius: 1px; color: #721c24;">❌ Error clearing temp files: {e}</div>'
+        return f'<div style="padding: 1px; background-color: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 4px; color: #fca5a5;">❌ Error clearing temp files: {e}</div>'
     
 
 def init_pipeline(mode, device, dtype, model_version="v1.0"):
@@ -1276,7 +1400,8 @@ def oom_fallback_profiles(tiled_vae, tiled_dit, tile_size, tile_overlap, unload_
         })
 
     add(tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, "user")
-    add(True, True, min(int(tile_size), 256), min(int(tile_overlap), 32), True, "safe")
+    # Mid step keeps clarity longer than jumping straight to 128
+    add(True, True, min(int(tile_size), 192), min(int(tile_overlap), 32), True, "safe")
     add(True, True, 128, 16, True, "max_save")
     return profiles
 
@@ -1372,8 +1497,13 @@ def run_flashvsr_single(
     # --- Output Path ---
     input_basename = os.path.splitext(os.path.basename(input_path))[0]
     input_basename = clean_video_filename(input_basename)  # Clean filename to prevent length issues
-    _, input_h = get_video_dimensions(input_path)
-    output_filename = upscale_video_filename(input_basename, scale, output_height=input_h * scale)
+    input_w, input_h = get_video_dimensions(input_path)
+    output_filename = upscale_video_filename(
+        input_basename,
+        scale,
+        output_height=int(input_h or 0) * scale,
+        output_width=int(input_w or 0) * scale,
+    )
     output_dir = get_output_dir()
     output_path = os.path.join(output_dir, output_filename)
     temp_video_path = os.path.join(TEMP_DIR, f"video_only_{output_filename}")
@@ -1617,10 +1747,10 @@ def run_flashvsr_single(
         final_save_path = os.path.join(output_dir, output_filename)
         shutil.copy(temp_output_path, final_save_path)
         log(f"Processing complete! Auto-saved to: {final_save_path}", message_type="finish")
-        status_msg = f'<div style="padding: 1px; background-color: #d4edda; border: 1px solid #c3e6cb; border-radius: 1px; color: #155724;">✅ Processing complete! Auto-saved to: {final_save_path}</div>'
+        status_msg = f'<div style="padding: 1px; background-color: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac;">✅ Processing complete! Auto-saved to: {final_save_path}</div>'
     else:
         log(f"Processing complete! Use 'Save Output' to save to outputs folder.", message_type="finish")
-        status_msg = '<div style="padding: 1px; background-color: #d4edda; border: 1px solid #c3e6cb; border-radius: 1px; color: #155724;">✅ Processing complete! Use \'Save Output\' to save to outputs folder.</div>'
+        status_msg = '<div style="padding: 1px; background-color: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac;">✅ Processing complete! Use \'Save Output\' to save to outputs folder.</div>'
     
     progress(1, desc="Done!")
     
@@ -1678,19 +1808,19 @@ def analyze_output_video(video_path):
         html = f'''
         <div style="padding: 16px; background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%); border: 1px solid #667eea40; border-radius: 8px; font-family: 'Segoe UI', sans-serif;">
             <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 8px;">
-                <div style="background: linear-gradient(135deg, #d1ecf1 0%, rgba(209, 236, 241, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
+                <div style="background: linear-gradient(135deg, #1a2838 0%, rgba(26, 40, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">RESOLUTION</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #415e78;">{width}×{height}</div>
                 </div>
-                <div style="background: linear-gradient(135deg, #bbc1f2 0%, rgba(187, 193, 242, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
+                <div style="background: linear-gradient(135deg, #1e1a38 0%, rgba(30, 26, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">FRAMES</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #362e54;">{frame_count}</div>
                 </div>
-                <div style="background: linear-gradient(135deg, #d1ecf1 0%, rgba(209, 236, 241, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
+                <div style="background: linear-gradient(135deg, #1a2838 0%, rgba(26, 40, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">DURATION</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #415e78;">{duration:.2f}s @ {fps:.1f} FPS</div>
                 </div>
-                <div style="background: linear-gradient(135deg, #bbc1f2 0%, rgba(187, 193, 242, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
+                <div style="background: linear-gradient(135deg, #1e1a38 0%, rgba(30, 26, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">FILE SIZE</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #362e54;">{file_size_display}</div>
                 </div>
@@ -1700,7 +1830,7 @@ def analyze_output_video(video_path):
         return gr.update(value=html, visible=True)
         
     except Exception as e:
-        error_html = f'<div style="padding: 12px; background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 6px; color: #721c24;">❌ Error analyzing output: {str(e)}</div>'
+        error_html = f'<div style="padding: 12px; background: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 6px; color: #fca5a5;">❌ Error analyzing output: {str(e)}</div>'
         return gr.update(value=error_html, visible=True)
 
 
@@ -1734,19 +1864,19 @@ def analyze_output_image(image_path):
         html = f'''
         <div style="padding: 16px; background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%); border: 1px solid #667eea40; border-radius: 8px; font-family: 'Segoe UI', sans-serif;">
             <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 8px;">
-                <div style="background: linear-gradient(135deg, #d1ecf1 0%, rgba(209, 236, 241, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
+                <div style="background: linear-gradient(135deg, #1a2838 0%, rgba(26, 40, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">RESOLUTION</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #415e78;">{width}×{height}</div>
                 </div>
-                <div style="background: linear-gradient(135deg, #bbc1f2 0%, rgba(187, 193, 242, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
+                <div style="background: linear-gradient(135deg, #1e1a38 0%, rgba(30, 26, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">MEGAPIXELS</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #362e54;">{megapixels:.2f} MP</div>
                 </div>
-                <div style="background: linear-gradient(135deg, #d1ecf1 0%, rgba(209, 236, 241, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
+                <div style="background: linear-gradient(135deg, #1a2838 0%, rgba(26, 40, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">FILE SIZE</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #415e78;">{file_size_display}</div>
                 </div>
-                <div style="background: linear-gradient(135deg, #bbc1f2 0%, rgba(187, 193, 242, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
+                <div style="background: linear-gradient(135deg, #1e1a38 0%, rgba(30, 26, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">FORMAT</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #362e54;">{img.format or 'Unknown'}</div>
                 </div>
@@ -1756,14 +1886,14 @@ def analyze_output_image(image_path):
         return gr.update(value=html, visible=True)
         
     except Exception as e:
-        error_html = f'<div style="padding: 12px; background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 6px; color: #721c24;">❌ Error analyzing output: {str(e)}</div>'
+        error_html = f'<div style="padding: 12px; background: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 6px; color: #fca5a5;">❌ Error analyzing output: {str(e)}</div>'
         return gr.update(value=error_html, visible=True)
 
 
 def analyze_input_image(image_path):
     """Analyzes image and returns compact HTML display for Image Upscaling tab."""
     if not image_path:
-        return '<div style="padding: 12px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 6px; color: #856404;">⚠️ No image provided</div>', 0, 0
+        return '<div style="padding: 12px; background: #3d2e0a; border: 1px solid #854d0e; border-radius: 6px; color: #fbbf24;">⚠️ No image provided</div>', 0, 0
     
     try:
         resolved_path = str(Path(image_path).resolve())
@@ -1790,19 +1920,19 @@ def analyze_input_image(image_path):
         html = f'''
         <div style="padding: 16px; background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%); border: 1px solid #667eea40; border-radius: 8px; font-family: 'Segoe UI', sans-serif;">
             <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 8px;">
-                <div style="background: linear-gradient(135deg, #d1ecf1 0%, rgba(209, 236, 241, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
+                <div style="background: linear-gradient(135deg, #1a2838 0%, rgba(26, 40, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">RESOLUTION</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #415e78;">{width}×{height}</div>
                 </div>
-                <div style="background: linear-gradient(135deg, #bbc1f2 0%, rgba(187, 193, 242, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
+                <div style="background: linear-gradient(135deg, #1e1a38 0%, rgba(30, 26, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">MEGAPIXELS</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #362e54;">{megapixels:.2f} MP</div>
                 </div>
-                <div style="background: linear-gradient(135deg, #d1ecf1 0%, rgba(209, 236, 241, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
+                <div style="background: linear-gradient(135deg, #1a2838 0%, rgba(26, 40, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">FILE SIZE</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #415e78;">{file_size_display}</div>
                 </div>
-                <div style="background: linear-gradient(135deg, #bbc1f2 0%, rgba(187, 193, 242, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
+                <div style="background: linear-gradient(135deg, #1e1a38 0%, rgba(30, 26, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">FORMAT</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #362e54;">{img.format or 'Unknown'}</div>
                 </div>
@@ -1815,7 +1945,7 @@ def analyze_input_image(image_path):
         return html, width, height
         
     except Exception as e:
-        return f'<div style="padding: 12px; background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 6px; color: #721c24;">❌ Error analyzing image: {str(e)}</div>', 0, 0
+        return f'<div style="padding: 12px; background: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 6px; color: #fca5a5;">❌ Error analyzing image: {str(e)}</div>', 0, 0
 
 
 def get_image_dimensions(image_path):
@@ -1832,11 +1962,11 @@ def get_image_dimensions(image_path):
 def preview_image_resize(image_path, max_width):
     """Generate preview text showing what resize will do for images."""
     if not image_path:
-        return '<div style="padding: 8px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; color: #6c757d; font-size: 0.9em; text-align: center;">No image loaded</div>'
+        return '<div style="padding: 8px; background: #0f1419; border: 1px solid #2d3748; border-radius: 4px; color: #94a3b8; font-size: 0.9em; text-align: center;">No image loaded</div>'
     
     current_width, current_height = get_image_dimensions(image_path)
     if current_width == 0:
-        return '<div style="padding: 8px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; color: #856404; font-size: 0.9em; text-align: center;">⚠️ Could not read image dimensions</div>'
+        return '<div style="padding: 8px; background: #3d2e0a; border: 1px solid #854d0e; border-radius: 4px; color: #fbbf24; font-size: 0.9em; text-align: center;">⚠️ Could not read image dimensions</div>'
     
     # Use even dimensions (aspect ratio preserved, padding to 128 handled during upscaling)
     new_width, new_height, will_resize = calculate_resize_dimensions(current_width, current_height, max_width)
@@ -1847,12 +1977,12 @@ def preview_image_resize(image_path, max_width):
     
     if will_resize:
         reduction = ((current_width * current_height - new_width * new_height) / (current_width * current_height)) * 100
-        return f'<div style="padding: 8px; background: #d4edda; border: 1px solid #c3e6cb; border-radius: 4px; color: #155724; font-size: 0.9em; text-align: center;">{current_width}×{current_height} → {new_width}×{new_height} ({reduction:.0f}% reduction) ✓</div>'
+        return f'<div style="padding: 8px; background: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac; font-size: 0.9em; text-align: center;">{current_width}×{current_height} → {new_width}×{new_height} ({reduction:.0f}% reduction) ✓</div>'
     else:
         if pixels <= small_image_threshold:
-            return f'<div style="padding: 8px; background: #d1ecf1; border: 1px solid #bee5eb; border-radius: 4px; color: #0c5460; font-size: 0.9em; text-align: center;">{current_width}×{current_height} (no resize needed) ✓<br><span style="color: #0c5460; font-size: 0.9em;">💡 Small resolution - consider disabling Tiled DiT for better speed and quality</span></div>'
+            return f'<div style="padding: 8px; background: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc; font-size: 0.9em; text-align: center;">{current_width}×{current_height} (no resize needed) ✓<br><span style="color: #0c5460; font-size: 0.9em;">💡 Small resolution - consider disabling Tiled DiT for better speed and quality</span></div>'
         else:
-            return f'<div style="padding: 8px; background: #d1ecf1; border: 1px solid #bee5eb; border-radius: 4px; color: #0c5460; font-size: 0.9em; text-align: center;">{current_width}×{current_height} (no resize needed) ✓</div>'
+            return f'<div style="padding: 8px; background: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc; font-size: 0.9em; text-align: center;">{current_width}×{current_height} (no resize needed) ✓</div>'
 
 
 def center_crop_cover_pil(img, target_w, target_h):
@@ -1957,8 +2087,7 @@ def run_flashvsr_batch_image(
     
     # Create batch subfolder with timestamp in images folder
     batch_folder_name = f"batch_{time.strftime('%Y%m%d_%H%M%S')}"
-    output_dir = get_output_dir()
-    images_output_dir = os.path.join(output_dir, "images")
+    images_output_dir = get_image_output_dir()
     batch_output_dir = os.path.join(images_output_dir, batch_folder_name)
     os.makedirs(batch_output_dir, exist_ok=True)
     
@@ -2052,7 +2181,7 @@ def run_flashvsr_batch_image(
     
     # Return the last processed image and status messages
     status_message = "\n".join(batch_messages)
-    status_html = f'<div style="padding: 1px; background-color: #d4edda; border: 1px solid #c3e6cb; border-radius: 1px; color: #155724;">✅ Batch processing complete! All results saved to: {batch_output_dir}</div>'
+    status_html = f'<div style="padding: 1px; background-color: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac;">✅ Batch processing complete! All results saved to: {batch_output_dir}</div>'
     return last_output_path, status_message, status_html
 
 
@@ -2160,7 +2289,12 @@ def run_flashvsr_image(
         input_basename = os.path.splitext(os.path.basename(image_path))[0]
         clean_basename = clean_image_filename(input_basename, max_length=20)
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        output_filename = upscale_image_filename(clean_basename, scale, output_height=orig_h * scale)
+        output_filename = upscale_image_filename(
+            clean_basename,
+            scale,
+            output_height=orig_h * scale,
+            output_width=orig_w * scale,
+        )
         temp_image_path = os.path.join(TEMP_DIR, output_filename)
         
         output_img.save(temp_image_path)
@@ -2168,15 +2302,19 @@ def run_flashvsr_image(
         # Autosave if enabled (to images subfolder)
         output_dir = get_output_dir()
         if autosave:
-            images_output_dir = os.path.join(output_dir, "images")
+            images_output_dir = get_image_output_dir()
             os.makedirs(images_output_dir, exist_ok=True)
             final_save_path = os.path.join(images_output_dir, output_filename)
             shutil.copy(temp_image_path, final_save_path)
             log(f"Image processing complete! Auto-saved to: {final_save_path}", message_type="finish")
-            status_msg = f'<div style="padding: 1px; background-color: #d4edda; border: 1px solid #c3e6cb; border-radius: 1px; color: #155724;">✅ Image processing complete! Auto-saved to: {final_save_path}</div>'
+            status_msg = f'<div style="padding: 1px; background-color: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac;">✅ Image processing complete! Auto-saved to: {final_save_path}</div>'
         else:
-            log(f"Image processing complete! Use 'Save Output' to save to outputs/images folder.", message_type="finish")
-            status_msg = '<div style="padding: 1px; background-color: #d4edda; border: 1px solid #c3e6cb; border-radius: 1px; color: #155724;">✅ Image processing complete! Use \'Save Output\' to save to outputs/images folder.</div>'
+            log("Image processing complete! Use 'Save Output' to save (Step 4 image folder).", message_type="finish")
+            status_msg = (
+                '<div style="padding: 1px; background-color: #14352a; border: 1px solid #166534; '
+                'border-radius: 4px; color: #86efac;">✅ Image processing complete! '
+                'Use \'Save Output\' to write to Step 4 (Ready for CIV\\images).</div>'
+            )
         
         progress(1, desc="Done!")
         
@@ -2202,8 +2340,8 @@ def run_flashvsr_image(
                 comparison_img.paste(input_upscaled, (0, 0))
                 comparison_img.paste(output_img, (input_upscaled.width, 0))
                 
-                # Save stitched comparison (always saved to images subfolder) with cleaned filename
-                images_output_dir = os.path.join(output_dir, "images")
+                # Save stitched comparison into image step folder
+                images_output_dir = get_image_output_dir()
                 os.makedirs(images_output_dir, exist_ok=True)
                 comparison_filename = comparison_image_filename(clean_basename)
                 comparison_save_path = os.path.join(images_output_dir, comparison_filename)
@@ -2491,38 +2629,30 @@ def _queue_busy_html(wq: FlashVSRWorkQueue, message: str) -> str:
 
 
 def ensure_workflow_dirs(ui: Optional[dict] = None) -> dict:
-    """Create standard D: workflow folders (4090 pipeline)."""
-    ui = ui or get_ui_defaults()
+    """Create standard D: workflow folders and return a short alias map."""
+    resolved = get_workflow_paths()
+    # Optional UI overrides (when Gradio fields differ mid-session)
+    if ui:
+        for ui_key, res_key in (
+            ("batch_watch_folder", "batch_watch_folder"),
+            ("batch_source_archive_dir", "batch_source_archive_dir"),
+            ("batch_upscale_handoff_dir", "batch_upscale_handoff_dir"),
+            ("img_upscale_handoff_dir", "img_upscale_handoff_dir"),
+            ("tb_inbox_folder", "tb_inbox_folder"),
+            ("toolbox_output_dir", "toolbox_output_dir"),
+        ):
+            val = str(ui.get(ui_key, "") or "").strip()
+            if val and os.path.isabs(val):
+                resolved[res_key] = _abs_path_or_default(val, resolved[res_key])
     paths = {
-        "watch": ui.get("batch_watch_folder", r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS"),
-        "pre_scaled": ui.get(
-            "batch_source_archive_dir",
-            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
-        ),
-        "ready_toolbox": ui.get(
-            "batch_upscale_handoff_dir",
-            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox",
-        ),
-        "ready_civ": str(
-            ui.get("toolbox_output_dir")
-            or r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV"
-        ),
-        "img_handoff": ui.get(
-            "img_upscale_handoff_dir",
-            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV\images",
-        ),
-        "tb_inbox": ui.get(
-            "tb_inbox_folder",
-            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox",
-        ),
+        "watch": resolved["batch_watch_folder"],
+        "pre_scaled": resolved["batch_source_archive_dir"],
+        "ready_toolbox": resolved["batch_upscale_handoff_dir"],
+        "ready_civ": resolved["toolbox_output_dir"],
+        "img_handoff": resolved["img_upscale_handoff_dir"],
+        "tb_inbox": resolved["tb_inbox_folder"],
+        "output_dir": resolved["output_dir"],
     }
-    # Prefer config toolbox_output_dir when set
-    try:
-        cfg = load_config()
-        if cfg.get("toolbox_output_dir"):
-            paths["ready_civ"] = str(cfg["toolbox_output_dir"]).strip()
-    except Exception:
-        pass
     for p in paths.values():
         if p:
             try:
@@ -3591,9 +3721,34 @@ def _run_toolbox_work_queue_body(wq, progress):
             if result_path and os.path.exists(result_path):
                 # Single final only — autosave may already have written into Ready for CIV
                 final = finalize_output_once(result_path, ready_civ)
+                # Step 2 name: keep step-1 tags + approximate FPS
+                try:
+                    fps_est = None
+                    try:
+                        meta = imageio.get_reader(final).get_meta_data()
+                        fps_est = meta.get("fps")
+                    except Exception:
+                        fps_est = None
+                    if not fps_est:
+                        # 4x Frames ≈ 4× source fps; 2x ≈ 2×
+                        try:
+                            src_meta = imageio.get_reader(video_path).get_meta_data()
+                            base_fps = float(src_meta.get("fps") or 30)
+                        except Exception:
+                            base_fps = 30.0
+                        mult = 4.0 if "4x" in str(fps_mode) else (2.0 if "2x" in str(fps_mode) else 1.0)
+                        fps_est = base_fps * mult
+                    final = rename_to_step2(
+                        final,
+                        source_stem=Path(video_path).stem,
+                        fps=fps_est,
+                        ext=Path(final).suffix or ".mp4",
+                    )
+                except Exception as e:
+                    log(f"Step-2 rename skipped: {e}", message_type="warning")
                 last_out = final
                 processed += 1
-                # Drop leftover RIFE stage-2 temps for this job (space)
+                # Drop leftover RIFE temps for this job (space)
                 try:
                     stem_hint = Path(video_path).stem[:40]
                     for folder in (
@@ -3614,17 +3769,14 @@ def _run_toolbox_work_queue_body(wq, progress):
                                     pass
                 except Exception:
                     pass
-                inbox_done = (
-                    os.path.join(inbox, "done")
-                    if inbox
-                    else os.path.join(source_archive, "toolbox_done")
-                )
-                # Mark done BEFORE moving the inbox file — prevents "file not found"
-                # false failures after crash/restart between archive and status write.
+                # Mark done BEFORE moving step-1 source into Bin
                 wq.set_item_status(video_path, "done", output=final)
-                archive_original_source(video_path, inbox_done)
+                # Step-1 upscale file → same folder\Bin\ (user can delete after checking finals)
+                binned = move_to_bin(video_path)
+                if binned:
+                    log(f"🗑 Step-1 moved to Bin → {binned}", message_type="info")
                 log(
-                    f"✅ Ready for CIV → {final} ({int(time.time() - t0)}s)",
+                    f"✅ Step 2 final → {final} ({int(time.time() - t0)}s)",
                     message_type="finish",
                 )
             else:
@@ -3687,7 +3839,7 @@ def get_video_dimensions(video_path):
 def analyze_input_video(video_path):
     """Analyzes video and returns compact HTML display for FlashVSR tab."""
     if not video_path:
-        return '<div style="padding: 12px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 6px; color: #856404;">⚠️ No video provided</div>', 0, 0
+        return '<div style="padding: 12px; background: #3d2e0a; border: 1px solid #854d0e; border-radius: 6px; color: #fbbf24;">⚠️ No video provided</div>', 0, 0
     
     try:
         resolved_path = str(Path(video_path).resolve())
@@ -3728,19 +3880,19 @@ def analyze_input_video(video_path):
         html = f'''
         <div style="padding: 16px; background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%); border: 1px solid #667eea40; border-radius: 8px; font-family: 'Segoe UI', sans-serif;">
             <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 8px;">
-                <div style="background: linear-gradient(135deg, #d1ecf1 0%, rgba(209, 236, 241, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
+                <div style="background: linear-gradient(135deg, #1a2838 0%, rgba(26, 40, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">RESOLUTION</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #415e78;">{width}×{height}</div>
                 </div>
-                <div style="background: linear-gradient(135deg, #bbc1f2 0%, rgba(187, 193, 242, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
+                <div style="background: linear-gradient(135deg, #1e1a38 0%, rgba(30, 26, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">FRAMES</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #362e54;">{frame_count}</div>
                 </div>
-                <div style="background: linear-gradient(135deg, #d1ecf1 0%, rgba(209, 236, 241, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
+                <div style="background: linear-gradient(135deg, #1a2838 0%, rgba(26, 40, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #667eea;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">DURATION</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #415e78;">{duration:.2f}s @ {fps:.1f} FPS</div>
                 </div>
-                <div style="background: linear-gradient(135deg, #bbc1f2 0%, rgba(187, 193, 242, 0.3) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
+                <div style="background: linear-gradient(135deg, #1e1a38 0%, rgba(30, 26, 56, 0.85) 100%); padding: 10px; border-radius: 6px; border-left: 3px solid #764ba2;">
                     <div style="font-size: 0.8em; color: #292626; margin-bottom: 4px;">FILE SIZE</div>
                     <div style="font-size: 1.1em; font-weight: 600; color: #362e54;">{file_size_display}</div>
                 </div>
@@ -3753,7 +3905,7 @@ def analyze_input_video(video_path):
         return html, width, height
         
     except Exception as e:
-        return f'<div style="padding: 12px; background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 6px; color: #721c24;">❌ Error analyzing video: {str(e)}</div>', 0, 0
+        return f'<div style="padding: 12px; background: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 6px; color: #fca5a5;">❌ Error analyzing video: {str(e)}</div>', 0, 0
 
 def calculate_resize_dimensions(current_width, current_height, max_width, align_to=2, scale=None):
     """
@@ -3785,11 +3937,11 @@ def calculate_resize_dimensions(current_width, current_height, max_width, align_
 def preview_resize(video_path, max_width, scale=None):
     """Generate preview text showing what resize will do."""
     if not video_path:
-        return '<div style="padding: 8px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; color: #6c757d; font-size: 0.9em; text-align: center;">No video loaded</div>'
+        return '<div style="padding: 8px; background: #0f1419; border: 1px solid #2d3748; border-radius: 4px; color: #94a3b8; font-size: 0.9em; text-align: center;">No video loaded</div>'
     
     current_width, current_height = get_video_dimensions(video_path)
     if current_width == 0:
-        return '<div style="padding: 8px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; color: #856404; font-size: 0.9em; text-align: center;">⚠️ Could not read video dimensions</div>'
+        return '<div style="padding: 8px; background: #3d2e0a; border: 1px solid #854d0e; border-radius: 4px; color: #fbbf24; font-size: 0.9em; text-align: center;">⚠️ Could not read video dimensions</div>'
 
     if scale is None:
         scale = get_ui_defaults()["scale"]
@@ -3806,15 +3958,15 @@ def preview_resize(video_path, max_width, scale=None):
     if will_resize:
         reduction = ((current_width * current_height - new_width * new_height) / (current_width * current_height)) * 100
         return (
-            f'<div style="padding: 8px; background: #d4edda; border: 1px solid #c3e6cb; border-radius: 4px; color: #155724; font-size: 0.9em; text-align: center;">'
+            f'<div style="padding: 8px; background: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac; font-size: 0.9em; text-align: center;">'
             f'{current_width}×{current_height} → {new_width}×{new_height} ({reduction:.0f}% reduction) ✓<br>'
             f'<span style="font-size: 0.85em;">Center crop to {align}px grid for {scale}× (aspect preserved, no output padding)</span></div>'
         )
     else:
         if pixels <= small_video_threshold:
-            return f'<div style="padding: 8px; background: #d1ecf1; border: 1px solid #bee5eb; border-radius: 4px; color: #0c5460; font-size: 0.9em; text-align: center;">{current_width}×{current_height} (no resize needed) ✓<br><span style=" color: #0c5460; font-size: 0.9em;">💡 Small resolution - consider disabling Tiled DiT for better speed and quality</span></div>'
+            return f'<div style="padding: 8px; background: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc; font-size: 0.9em; text-align: center;">{current_width}×{current_height} (no resize needed) ✓<br><span style=" color: #0c5460; font-size: 0.9em;">💡 Small resolution - consider disabling Tiled DiT for better speed and quality</span></div>'
         else:
-            return f'<div style="padding: 8px; background: #d1ecf1; border: 1px solid #bee5eb; border-radius: 4px; color: #0c5460; font-size: 0.9em; text-align: center;">{current_width}×{current_height} (no resize needed) ✓</div>'
+            return f'<div style="padding: 8px; background: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc; font-size: 0.9em; text-align: center;">{current_width}×{current_height} (no resize needed) ✓</div>'
 
 def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress()):
     """
@@ -3862,17 +4014,18 @@ def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress()):
         )
         
         # Build FFmpeg command - use map to handle audio gracefully
+        # High-quality intermediate: soft pre-encode was compounding "lost detail" before FlashVSR.
         ffmpeg_cmd = [
             'ffmpeg', '-y', '-i', video_path,
             '-vf', vf,
             '-c:v', 'libx264',
-            '-preset', 'medium',
-            '-crf', '18',
+            '-preset', 'slow',
+            '-crf', '14',
             '-pix_fmt', 'yuv420p',
             '-map', '0:v:0',  # Map video stream
             '-map', '0:a:0?',  # Map audio stream if it exists (? makes it optional)
             '-c:a', 'aac',
-            '-b:a', '192k',
+            '-b:a', '256k',
             output_path
         ]
         
@@ -3948,11 +4101,11 @@ def format_time_mmss(seconds):
 def preview_trim(video_path, start_time, end_time):
     """Generate preview text showing what trim operation will do."""
     if not video_path:
-        return '<div style="padding: 8px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; color: #6c757d; font-size: 0.9em; text-align: center;">No video loaded</div>'
+        return '<div style="padding: 8px; background: #0f1419; border: 1px solid #2d3748; border-radius: 4px; color: #94a3b8; font-size: 0.9em; text-align: center;">No video loaded</div>'
     
     total_duration = get_video_duration(video_path)
     if total_duration == 0:
-        return '<div style="padding: 8px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; color: #856404; font-size: 0.9em; text-align: center;">⚠️ Could not read video duration</div>'
+        return '<div style="padding: 8px; background: #3d2e0a; border: 1px solid #854d0e; border-radius: 4px; color: #fbbf24; font-size: 0.9em; text-align: center;">⚠️ Could not read video duration</div>'
     
     min_duration = get_minimum_duration(video_path)
     
@@ -3967,43 +4120,43 @@ def preview_trim(video_path, start_time, end_time):
     
     # Validate range
     if end_time <= start_time:
-        return '<div style="padding: 8px; background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 4px; color: #721c24; font-size: 0.9em; text-align: center;">❌ End time must be after start time</div>'
+        return '<div style="padding: 8px; background: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 4px; color: #fca5a5; font-size: 0.9em; text-align: center;">❌ End time must be after start time</div>'
     
     trim_duration = end_time - start_time
     
     # Check minimum duration (21 frames required by FlashVSR)
     if trim_duration < min_duration:
         fps = get_video_fps(video_path)
-        return f'<div style="padding: 8px; background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 4px; color: #721c24; font-size: 0.9em; text-align: center;">❌ Trimmed video too short! Need at least {min_duration:.2f}s (21 frames @ {fps:.1f} FPS)</div>'
+        return f'<div style="padding: 8px; background: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 4px; color: #fca5a5; font-size: 0.9em; text-align: center;">❌ Trimmed video too short! Need at least {min_duration:.2f}s (21 frames @ {fps:.1f} FPS)</div>'
     
     # Simple trim mode
     if start_time == 0 and end_time >= total_duration:
-        return f'<div style="padding: 8px; background: #d1ecf1; border: 1px solid #bee5eb; border-radius: 4px; color: #0c5460; font-size: 0.9em; text-align: center;">Processing full video ({total_duration:.1f}s) ✓</div>'
+        return f'<div style="padding: 8px; background: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc; font-size: 0.9em; text-align: center;">Processing full video ({total_duration:.1f}s) ✓</div>'
     else:
-        return f'<div style="padding: 8px; background: #d4edda; border: 1px solid #c3e6cb; border-radius: 4px; color: #155724; font-size: 0.9em; text-align: center;">Will trim: {start_time:.1f}s → {end_time:.1f}s ({trim_duration:.1f}s) ✓</div>'
+        return f'<div style="padding: 8px; background: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac; font-size: 0.9em; text-align: center;">Will trim: {start_time:.1f}s → {end_time:.1f}s ({trim_duration:.1f}s) ✓</div>'
 
 def preview_chunk_processing(video_path, chunk_duration):
     """Generate preview showing how many chunks will be created."""
     if not video_path:
-        return '<div style="padding: 6px; background: #d1ecf1; border: 1px solid #bee5eb; border-radius: 4px; color: #0c5460; font-size: 0.85em; text-align: center;">💡 Enable chunk processing for videos that exceed your available VRAM</div>'
+        return '<div style="padding: 6px; background: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc; font-size: 0.85em; text-align: center;">💡 Enable chunk processing for videos that exceed your available VRAM</div>'
     
     duration = get_video_duration(video_path)
     if duration == 0:
-        return '<div style="padding: 6px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; color: #856404; font-size: 0.85em; text-align: center;">⚠️ Could not read video duration</div>'
+        return '<div style="padding: 6px; background: #3d2e0a; border: 1px solid #854d0e; border-radius: 4px; color: #fbbf24; font-size: 0.85em; text-align: center;">⚠️ Could not read video duration</div>'
     
     min_duration = get_minimum_duration(video_path)
     
     # Check if chunk duration is too short
     if chunk_duration < min_duration:
         fps = get_video_fps(video_path)
-        return f'<div style="padding: 6px; background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 4px; color: #721c24; font-size: 0.85em; text-align: center;">❌ Chunk duration too short! Need at least {min_duration:.2f}s (21 frames @ {fps:.1f} FPS)</div>'
+        return f'<div style="padding: 6px; background: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 4px; color: #fca5a5; font-size: 0.85em; text-align: center;">❌ Chunk duration too short! Need at least {min_duration:.2f}s (21 frames @ {fps:.1f} FPS)</div>'
     
     # Simple chunk calculation - exact boundaries, no redistribution
     fps = get_video_fps(video_path)
     
     # If video fits in one chunk (duration <= chunk_duration), just use single chunk
     if duration <= chunk_duration:
-        return f'''<div style="padding: 8px; background: #d1ecf1; border: 1px solid #bee5eb; border-radius: 4px; color: #0c5460; font-size: 0.85em; text-align: center;">
+        return f'''<div style="padding: 8px; background: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc; font-size: 0.85em; text-align: center;">
             📊 Will process as 1 chunk ({duration:.2f}s, {round(duration * fps)} frames)<br>
             Video: {format_time_mmss(duration)} ({duration:.2f}s)
         </div>'''
@@ -4014,14 +4167,14 @@ def preview_chunk_processing(video_path, chunk_duration):
     
     warning_note = ""
     if last_chunk_frames < 21:
-        warning_note = f'<br><span style="color: #856404;">⚠️ Last chunk only {last_chunk_frames} frames - adjust slider to avoid failure</span>'
-        bg_color = "#fff3cd"
-        border_color = "#ffc107"
-        text_color = "#856404"
+        warning_note = f'<br><span style="color: #fbbf24;">⚠️ Last chunk only {last_chunk_frames} frames - adjust slider to avoid failure</span>'
+        bg_color = "#3d2e0a"
+        border_color = "#854d0e"
+        text_color = "#fbbf24"
     else:
-        bg_color = "#d1ecf1"
-        border_color = "#bee5eb"
-        text_color = "#0c5460"
+        bg_color = "#0c2d48"
+        border_color = "#1e4a6e"
+        text_color = "#7dd3fc"
     
     # Format chunk sizes for display - use .2f for short durations
     last_dur_str = f"{last_chunk_duration:.2f}s" if last_chunk_duration < 1 else f"{last_chunk_duration:.1f}s"
@@ -4491,8 +4644,17 @@ def process_video_with_chunks(
             pass
     
     # Step 4: Handle audio and final output
+    chunk_w = 0
+    try:
+        chunk_w, _ = get_video_dimensions(input_path)
+    except Exception:
+        chunk_w = 0
     output_filename = upscale_video_filename(
-        input_basename, scale, chunked=True, output_height=chunk_input_h * scale
+        input_basename,
+        scale,
+        chunked=True,
+        output_height=int(chunk_input_h or 0) * scale,
+        output_width=int(chunk_w or 0) * scale,
     )
     temp_output_path = os.path.join(TEMP_DIR, output_filename)
     
@@ -4532,9 +4694,9 @@ def open_folder(folder_path):
             subprocess.Popen(["open", folder_path])
         else:
             subprocess.Popen(["xdg-open", folder_path])
-        return f'<div style="padding: 1px; background-color: #d4edda; border: 1px solid #c3e6cb; border-radius: 1px; color: #155724;">✅ Opened folder: {folder_path}</div>'
+        return f'<div style="padding: 1px; background-color: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac;">✅ Opened folder: {folder_path}</div>'
     except Exception as e:
-        return f'<div style="padding: 1px; background-color: #f8d7da; border: 1px solid #f5c6cb; border-radius: 4px; color: #721c24;">❌ Error opening folder: {e}</div>'
+        return f'<div style="padding: 1px; background-color: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 4px; color: #fca5a5;">❌ Error opening folder: {e}</div>'
 
 def save_file(file_path):
     if file_path and os.path.exists(file_path):
@@ -4565,14 +4727,14 @@ def handle_start_pipeline(
             input_paths = [file.name for file in batch_video_paths]
         
         if not input_paths:
-            return None, "⚠️ Batch Input tab is active, but no files were provided. Please upload files or specify a valid folder path.", '<div style="padding: 12px; background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 6px; color: #721c24;">❌ No input files</div>'
+            return None, "⚠️ Batch Input tab is active, but no files were provided. Please upload files or specify a valid folder path.", '<div style="padding: 12px; background: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 6px; color: #fca5a5;">❌ No input files</div>'
     elif active_tab_index == 0 and single_video_path:
         input_paths = [single_video_path]
     else:
-        return None, "⚠️ No input video found in the active tab. Please upload a video.", '<div style="padding: 12px; background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 6px; color: #721c24;">❌ No input video</div>'
+        return None, "⚠️ No input video found in the active tab. Please upload a video.", '<div style="padding: 12px; background: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 6px; color: #fca5a5;">❌ No input video</div>'
 
     if not selected_ops:
-        return None, "⚠️ No operations selected. Please check at least one box in 'Pipeline Steps'.", '<div style="padding: 12px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 6px; color: #856404;">⚠️ No operations selected</div>'
+        return None, "⚠️ No operations selected. Please check at least one box in 'Pipeline Steps'.", '<div style="padding: 12px; background: #3d2e0a; border: 1px solid #854d0e; border-radius: 6px; color: #fbbf24;">⚠️ No operations selected</div>'
 
     # Pack parameters for the processor
     params = {
@@ -4608,7 +4770,7 @@ def handle_start_pipeline(
             # Analyze output video
             output_analysis = toolbox_processor.analyze_video_html(final_video)
         else:
-            output_analysis = '<div style="padding: 12px; background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 6px; color: #721c24;">❌ Pipeline failed</div>'
+            output_analysis = '<div style="padding: 12px; background: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 6px; color: #fca5a5;">❌ Pipeline failed</div>'
 
     return final_video, message, output_analysis
     
@@ -4692,7 +4854,7 @@ css = """
     display: none !important;
 }
 
-/* Enhanced Monitor Textboxes - No flashing, better styling */
+/* Monitor / queue text boxes — always dark to match Interstellar / rest of app */
 .monitor-box {
     min-width: 0 !important;
 }
@@ -4703,44 +4865,45 @@ css = """
     line-height: 1.6 !important;
     padding: 12px !important;
     border-radius: 8px !important;
-    border: 1px solid #e2e8f0 !important;
-    background: linear-gradient(135deg, #f8f9fa 0%, #ffffff 100%) !important;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06) !important;
+    border: 1px solid #2d3748 !important;
+    background: linear-gradient(135deg, #0f1419 0%, #1a202c 100%) !important;
+    color: #e2e8f0 !important;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35) !important;
     resize: none !important;
     font-weight: 500 !important;
+    caret-color: #7dd3fc !important;
 }
 
 .gpu-monitor textarea {
     border-left: 3px solid #667eea !important;
-    background: linear-gradient(135deg, #667eea08 0%, #ffffff 100%) !important;
+    background: linear-gradient(135deg, #12182a 0%, #1a202c 100%) !important;
+    color: #e2e8f0 !important;
 }
 
 .cpu-monitor textarea {
     border-left: 3px solid #f5576c !important;
-    background: linear-gradient(135deg, #f5576c08 0%, #ffffff 100%) !important;
+    background: linear-gradient(135deg, #1a1218 0%, #1a202c 100%) !important;
+    color: #e2e8f0 !important;
 }
 
 .monitor-box textarea:focus {
     outline: none !important;
     border-color: #667eea !important;
-    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1) !important;
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.25) !important;
 }
 
-/* Dark mode support */
-@media (prefers-color-scheme: dark) {
-    .monitor-box textarea {
-        background: linear-gradient(135deg, #1a202c 0%, #2d3748 100%) !important;
-        border-color: #4a5568 !important;
-        color: #e2e8f0 !important;
-    }
-    
-    .gpu-monitor textarea {
-        background: linear-gradient(135deg, #667eea15 0%, #2d3748 100%) !important;
-    }
-    
-    .cpu-monitor textarea {
-        background: linear-gradient(135deg, #f5576c15 0%, #2d3748 100%) !important;
-    }
+/* Queue / status HTML panels (override any leftover light inline styles) */
+.prose, .gradio-html, .html-container {
+    color: #e2e8f0;
+}
+/* Gradio textboxes used for paths / notes — dark fill when theme leaves them light */
+textarea, input[type="text"], input[type="number"], input[type="search"] {
+    background-color: #0f1419 !important;
+    color: #e2e8f0 !important;
+    border-color: #2d3748 !important;
+}
+textarea::placeholder, input::placeholder {
+    color: #64748b !important;
 }
 
 /* Machine profile banner */
@@ -4863,11 +5026,13 @@ def create_ui():
                     value=(
                         f'<div class="fvsr-machine-banner">'
                         f'<strong>Profile loaded:</strong> {MACHINE["profile_name"]}<br>'
-                        f'Defaults: tiny · v1.1 · 4× · tiled DiT 320/40 · chunks 12s · bf16 · sage · unload DiT · resize ≤768px · models on O:\\MODELS<br>'
-                        f'<em>Hover any option info text for full guidance tuned to this machine.</em>'
+                        f'Defaults (clarity): tiny · v1.1 · 4× · tiled DiT 256/48 · chunks 10s · quality 9 · sparse 1.2 · bf16 · sage · unload DiT · resize ≤1024px · models on O:\\MODELS<br>'
+                        f'<em>Pre-resize only shrinks wide sources — 1024 keeps more detail than 768. Hover options for guidance. Restart after hard OOM.</em>'
                         f'</div>'
                     )
                 )
+                # Live map of where each step actually saves (not the old app\\outputs archetype)
+                workflow_map = gr.HTML(value=workflow_paths_html())
                 with gr.Row():
                     # --- Left-side Column ---                       
                     with gr.Column(scale=1):
@@ -4895,9 +5060,8 @@ def create_ui():
                                     label="Watch / folder path",
                                     show_label=True,
                                     info=(
-                                        "Default: NEW DOWNLOADS. Start / Resume also scans this folder. "
-                                        "After upscale, originals move to Pre Scaled videos (for pairing); "
-                                        "upscaled files stay in the batch completed folder."
+                                        "Step 1 — intake. Start / Resume scans here. "
+                                        "Originals → Step 2 (Pre Scaled). Upscaled videos → Step 3 (Ready for Toolbox)."
                                     ),
                                 )
                                 
@@ -4933,7 +5097,7 @@ def create_ui():
                         # Video Pre-Processing Accordion
                         with gr.Accordion("📊 Video Pre-Processing", open=False):
                             video_analysis_html = gr.HTML(
-                                value='<div style="padding: 12px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; color: #6c757d; text-align: center;">Upload video to see analysis</div>'
+                                value='<div style="padding: 12px; background: #0f1419; border: 1px solid #2d3748; border-radius: 6px; color: #94a3b8; text-align: center;">Upload video to see analysis</div>'
                             )
                             
                             gr.Markdown("---")
@@ -4961,7 +5125,7 @@ def create_ui():
                                         info=TIPS["trim_end"]
                                     )
                                 trim_preview_html = gr.HTML(
-                                    value='<div style="padding: 8px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; color: #6c757d; font-size: 0.9em; text-align: center;">Upload video to see trim preview</div>'
+                                    value='<div style="padding: 8px; background: #0f1419; border: 1px solid #2d3748; border-radius: 4px; color: #94a3b8; font-size: 0.9em; text-align: center;">Upload video to see trim preview</div>'
                                 )
                                 
                                 trim_button = gr.Button("✂️ Apply Trim", size="sm", variant="primary")
@@ -4981,7 +5145,7 @@ def create_ui():
                                 )
                                 
                                 resize_preview_html = gr.HTML(
-                                    value='<div style="padding: 8px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; color: #6c757d; font-size: 0.9em; text-align: center;">Upload and analyze video to enable resize</div>'
+                                    value='<div style="padding: 8px; background: #0f1419; border: 1px solid #2d3748; border-radius: 4px; color: #94a3b8; font-size: 0.9em; text-align: center;">Upload and analyze video to enable resize</div>'
                                 )
                                 
                                 resize_button = gr.Button("📐 Apply Resize", size="sm", variant="primary")
@@ -5040,7 +5204,7 @@ def create_ui():
                                     info=TIPS["chunk_duration"]
                                 )
                             chunk_preview_display = gr.HTML(
-                                value='<div style="padding: 6px; background: #d1ecf1; border: 1px solid #bee5eb; border-radius: 4px; color: #0c5460; font-size: 0.85em; text-align: center;">💡 Enable chunk processing for videos that exceed your available VRAM</div>',
+                                value='<div style="padding: 6px; background: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc; font-size: 0.85em; text-align: center;">💡 Enable chunk processing for videos that exceed your available VRAM</div>',
                                 visible=ui["enable_chunks"]
                             )
                                     
@@ -5215,7 +5379,7 @@ def create_ui():
                         # Image Pre-Processing Accordion
                         with gr.Accordion("📊 Image Pre-Processing", open=False):
                             img_analysis_html = gr.HTML(
-                                value='<div style="padding: 12px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; color: #6c757d; text-align: center;">Upload image to see analysis</div>'
+                                value='<div style="padding: 12px; background: #0f1419; border: 1px solid #2d3748; border-radius: 6px; color: #94a3b8; text-align: center;">Upload image to see analysis</div>'
                             )
                             
                             gr.Markdown("---")
@@ -5235,7 +5399,7 @@ def create_ui():
                                 )
                                 
                                 img_resize_preview_html = gr.HTML(
-                                    value='<div style="padding: 8px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; color: #6c757d; font-size: 0.9em; text-align: center;">Upload and analyze image to enable resize</div>'
+                                    value='<div style="padding: 8px; background: #0f1419; border: 1px solid #2d3748; border-radius: 4px; color: #94a3b8; font-size: 0.9em; text-align: center;">Upload and analyze image to enable resize</div>'
                                 )
                                 
                                 img_resize_button = gr.Button("📐 Apply Resize", size="sm", variant="primary")
@@ -5452,7 +5616,7 @@ def create_ui():
                                     r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox",
                                 )
                                 gr.Markdown(
-                                    "<span style='font-size:0.9em;color:#555;'>"
+                                    "<span style='font-size:0.9em;color:#94a3b8;'>"
                                     "Drop upscaled videos in <b>Ready for Toolbox</b>, then Start. "
                                     "Default: <b>4× frames</b> + <b>Export</b> → "
                                     f"<code>{_tb_inbox_default}</code> "
@@ -5488,7 +5652,7 @@ def create_ui():
                             tb_analyze_button = gr.Button("📊 Analyze Input Video", size="sm", variant="secondary", visible=False)
                             with gr.Accordion("📊 Input Video Analysis", open=False) as tb_analysis_accordion:
                                 tb_input_analysis_html = gr.HTML(
-                                    value='<div style="padding: 12px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; color: #6c757d; text-align: center;">Upload video to see analysis</div>'
+                                    value='<div style="padding: 12px; background: #0f1419; border: 1px solid #2d3748; border-radius: 6px; color: #94a3b8; text-align: center;">Upload video to see analysis</div>'
                                 )
 
 
@@ -5515,7 +5679,7 @@ def create_ui():
                         with gr.Row():   
                             with gr.Accordion("📊 Output Video Analysis", open=False) as tb_output_analysis_accordion:                     
                                 tb_output_analysis_html = gr.HTML(
-                                    value='<div style="padding: 12px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; color: #6c757d; text-align: center;">Process video to see output analysis</div>'
+                                    value='<div style="padding: 12px; background: #0f1419; border: 1px solid #2d3748; border-radius: 6px; color: #94a3b8; text-align: center;">Process video to see output analysis</div>'
                                 )
 
                         with gr.Row():
@@ -5756,14 +5920,14 @@ def create_ui():
             config["clear_temp_on_start"] = value
             save_config(config)
             status = "enabled" if value else "disabled"
-            return f'<div style="padding: 1px; background-color: #d1ecf1; border: 1px solid #bee5eb; border-radius: 1px; color: #0c5460;">ℹ️ Clear temp on start: {status}</div>'
+            return f'<div style="padding: 1px; background-color: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc;">ℹ️ Clear temp on start: {status}</div>'
         
         def update_autosave_config(value):
             config = load_config()
             config["autosave"] = value
             save_config(config)
             status = "enabled" if value else "disabled"
-            return f'<div style="padding: 1px; background-color: #d1ecf1; border: 1px solid #bee5eb; border-radius: 1px; color: #0c5460;">ℹ️ Autosave: {status}</div>'
+            return f'<div style="padding: 1px; background-color: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc;">ℹ️ Autosave: {status}</div>'
 
         tiled_dit_checkbox.change(fn=toggle_tiled_dit_options, inputs=[tiled_dit_checkbox], outputs=[tiled_dit_options])
         
@@ -5898,18 +6062,18 @@ def create_ui():
         def handle_video_change(video_path, chunk_duration):
             if not video_path:
                 return (
-                    '<div style="padding: 8px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; color: #6c757d; font-size: 0.9em; text-align: center;">Upload video to see analysis</div>',
+                    '<div style="padding: 8px; background: #0f1419; border: 1px solid #2d3748; border-radius: 4px; color: #94a3b8; font-size: 0.9em; text-align: center;">Upload video to see analysis</div>',
                     0,
                     0,
                     0,
                     gr.update(minimum=256, maximum=2048, value=512, interactive=False),
-                    '<div style="padding: 8px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; color: #6c757d; font-size: 0.9em; text-align: center;">Upload video to enable resize</div>',
+                    '<div style="padding: 8px; background: #0f1419; border: 1px solid #2d3748; border-radius: 4px; color: #94a3b8; font-size: 0.9em; text-align: center;">Upload video to enable resize</div>',
                     gr.update(maximum=60, value=0, interactive=False),
                     gr.update(maximum=60, value=0, interactive=False),
                     # gr.update(maximum=60, value=0, interactive=False),
                     # gr.update(maximum=60, value=0, interactive=False),
-                    '<div style="padding: 8px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; color: #6c757d; font-size: 0.9em; text-align: center;">Upload video to enable trim</div>',
-                    '<div style="padding: 6px; background: #d1ecf1; border: 1px solid #bee5eb; border-radius: 4px; color: #0c5460; font-size: 0.85em; text-align: center;">💡 Enable chunk processing for videos that exceed your available VRAM</div>',
+                    '<div style="padding: 8px; background: #0f1419; border: 1px solid #2d3748; border-radius: 4px; color: #94a3b8; font-size: 0.9em; text-align: center;">Upload video to enable trim</div>',
+                    '<div style="padding: 6px; background: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc; font-size: 0.85em; text-align: center;">💡 Enable chunk processing for videos that exceed your available VRAM</div>',
                     gr.update(visible=False)  # Hide output analysis when input changes
                 )
                 
@@ -6273,9 +6437,9 @@ def create_ui():
         
         def send_to_toolbox(video_path):
             if not video_path:
-                return gr.update(), gr.update(), '<div style="padding: 1px; background-color: #fff3cd; border: 1px solid #ffeaa7; border-radius: 1px; color: #856404;">⚠️ No video to send!</div>'
+                return gr.update(), gr.update(), '<div style="padding: 1px; background-color: #3d2e0a; border: 1px solid #854d0e; border-radius: 1px; color: #856404;">⚠️ No video to send!</div>'
             # Switches to tab 2 (Toolbox) and sets the input video value
-            return gr.update(selected=2), gr.update(value=video_path), '<div style="padding: 1px; background-color: #d4edda; border: 1px solid #c3e6cb; border-radius: 1px; color: #155724;">✅ Video sent to Toolbox!</div>'
+            return gr.update(selected=2), gr.update(value=video_path), '<div style="padding: 1px; background-color: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac;">✅ Video sent to Toolbox!</div>'
 
         send_to_toolbox_btn.click(
             fn=send_to_toolbox,
@@ -6309,11 +6473,11 @@ def create_ui():
         def handle_image_change(image_path):
             if not image_path:
                 return (
-                    '<div style="padding: 12px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; color: #6c757d; text-align: center;">Upload image to see analysis</div>',
+                    '<div style="padding: 12px; background: #0f1419; border: 1px solid #2d3748; border-radius: 6px; color: #94a3b8; text-align: center;">Upload image to see analysis</div>',
                     0,
                     0,
                     gr.update(minimum=256, maximum=2048, value=512, interactive=False),
-                    '<div style="padding: 8px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 4px; color: #6c757d; font-size: 0.9em; text-align: center;">Upload image to enable resize</div>',
+                    '<div style="padding: 8px; background: #0f1419; border: 1px solid #2d3748; border-radius: 4px; color: #94a3b8; font-size: 0.9em; text-align: center;">Upload image to enable resize</div>',
                     gr.update(visible=False)  # Hide output analysis when input changes
                 )
             
@@ -6528,9 +6692,9 @@ def create_ui():
                     subprocess.Popen(["open", images_folder])
                 else:
                     subprocess.Popen(["xdg-open", images_folder])
-                return f'<div style="padding: 1px; background-color: #d4edda; border: 1px solid #c3e6cb; border-radius: 1px; color: #155724;">✅ Opened folder: {images_folder}</div>'
+                return f'<div style="padding: 1px; background-color: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac;">✅ Opened folder: {images_folder}</div>'
             except Exception as e:
-                return f'<div style="padding: 1px; background-color: #f8d7da; border: 1px solid #f5c6cb; border-radius: 4px; color: #721c24;">❌ Error opening folder: {e}</div>'
+                return f'<div style="padding: 1px; background-color: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 4px; color: #fca5a5;">❌ Error opening folder: {e}</div>'
 
 
         img_open_folder_button.click(
@@ -6629,12 +6793,12 @@ def create_ui():
     
         def handle_single_operation(operation_func, video_path, status_message, **kwargs):
             if not video_path:
-                return None, "⚠️ No input video found.", '<div style="padding: 12px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; color: #6c757d; text-align: center;">Process video to see output analysis</div>'
+                return None, "⚠️ No input video found.", '<div style="padding: 12px; background: #0f1419; border: 1px solid #2d3748; border-radius: 6px; color: #94a3b8; text-align: center;">Process video to see output analysis</div>'
 
             temp_video = operation_func(video_path, progress=gr.Progress(), **kwargs)
 
             if not temp_video or temp_video == video_path:
-                return video_path, f"❌ {status_message} failed. Check console.", '<div style="padding: 12px; background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 6px; color: #721c24;">❌ Operation failed</div>'
+                return video_path, f"❌ {status_message} failed. Check console.", '<div style="padding: 12px; background: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 6px; color: #fca5a5;">❌ Operation failed</div>'
 
             final_video_path = temp_video
             message = f"✅ {status_message} complete."
@@ -6660,7 +6824,7 @@ def create_ui():
         
         def handle_create_loop(video_path, loop_type, num_loops, quality, progress=gr.Progress()):
             if not video_path:
-                return None, "⚠️ No video provided for loop creation.", '<div style="padding: 12px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; color: #6c757d; text-align: center;">Process video to see output analysis</div>'
+                return None, "⚠️ No video provided for loop creation.", '<div style="padding: 12px; background: #0f1419; border: 1px solid #2d3748; border-radius: 6px; color: #94a3b8; text-align: center;">Process video to see output analysis</div>'
             
             output_video = toolbox_processor.create_loop(video_path, loop_type, num_loops, quality, progress)
             
@@ -6679,7 +6843,7 @@ def create_ui():
                 output_analysis = toolbox_processor.analyze_video_html(final_video)
                 return final_video, message, output_analysis
             else:
-                return None, "❌ Loop creation failed. Check console for details.", '<div style="padding: 12px; background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 6px; color: #721c24;">❌ Operation failed</div>'
+                return None, "❌ Loop creation failed. Check console for details.", '<div style="padding: 12px; background: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 6px; color: #fca5a5;">❌ Operation failed</div>'
     
     
         create_loop_btn.click(
@@ -6824,7 +6988,7 @@ def create_ui():
         # Use as Input button - sends processed video back to input
         def use_as_input(video_path):
             if not video_path:
-                return None, "⚠️ No processed video to use as input.", '<div style="padding: 12px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; color: #6c757d; text-align: center;">Upload video to see analysis</div>'
+                return None, "⚠️ No processed video to use as input.", '<div style="padding: 12px; background: #0f1419; border: 1px solid #2d3748; border-radius: 6px; color: #94a3b8; text-align: center;">Upload video to see analysis</div>'
             # Analyze the video being moved to input
             input_analysis = toolbox_processor.analyze_video_html(video_path)
             return video_path, "✅ Processed video loaded as input.", input_analysis
@@ -7164,48 +7328,79 @@ def create_ui():
             
             apply_theme_btn = gr.Button("Apply Theme", size="sm", variant="primary")
 
-            gr.Markdown("### Output Naming")
+            gr.Markdown("### Process naming (2 steps only)")
+            gr.HTML(
+                value=(
+                    "<div style='padding:10px;background:#0f1419;border:1px solid #2d3748;border-radius:8px;"
+                    "color:#e2e8f0;font-size:0.9em;line-height:1.55;'>"
+                    "<b style='color:#7dd3fc;'>Step 1 — Upscale</b><br>"
+                    "Name: <code style='color:#86efac;'>&lt;original&gt;_&lt;1080p|2K|4K&gt;_&lt;9x16&gt;_Upscaled.mp4</code><br>"
+                    "Example: <code>myclip_4K_9x16_Upscaled.mp4</code><br><br>"
+                    "<b style='color:#7dd3fc;'>Step 2 — Interp + Export (same Toolbox pass)</b><br>"
+                    "Name: <code style='color:#fbbf24;'>&lt;step1&gt;_&lt;30fps&gt;.mp4</code><br>"
+                    "Example: <code>myclip_4K_9x16_Upscaled_30fps.mp4</code><br>"
+                    "After success, the Step‑1 file is moved to <code>…\\Ready for Toolbox\\Bin\\</code> "
+                    "so you can delete intermediates when done."
+                    "</div>"
+                )
+            )
             naming_mode_dropdown = gr.Dropdown(
-                label="Filename convention",
+                label="Legacy name style (optional)",
                 choices=[
-                    ("Both (Toolbox + VSR Pipeline)", "both"),
-                    ("Toolbox only ({orig}_upscaled_x4)", "toolbox"),
-                    ("VSR Pipeline only (UpScale4K_{orig}_S_I)", "vsr"),
+                    ("Readable 2-step names (default)", "both"),
+                    ("Toolbox legacy", "toolbox"),
+                    ("VSR legacy", "vsr"),
                 ],
                 value=str(config.get("naming_mode", "both")),
                 info=TIPS["naming_mode"],
             )
             naming_mode_status = gr.Textbox(label="Naming status", interactive=False, show_label=False)
-            apply_naming_mode_btn = gr.Button("Apply Naming Mode", size="sm", variant="primary")
-            
-            gr.Markdown("### Output Directories")
+            apply_naming_mode_btn = gr.Button("Apply name style", size="sm", variant="primary")
+
+            gr.Markdown("### Folders (selectable — your current D: paths are fine)")
+            gr.HTML(value=workflow_paths_html(config))
+            _wp = get_workflow_paths(config)
+            step1_watch = gr.Textbox(
+                label="Intake / watch (new downloads)",
+                value=_wp["batch_watch_folder"],
+                info="Where new files land · queues scan on Start / Resume",
+            )
+            step2_archive = gr.Textbox(
+                label="Originals archive (pre-upscale sources for pairing)",
+                value=_wp["batch_source_archive_dir"],
+                info="Original sources moved here after upscale",
+            )
+            step3_upscale = gr.Textbox(
+                label="Step 1 output — upscaled VIDEOS (Ready for Toolbox)",
+                value=_wp["batch_upscale_handoff_dir"],
+                info="Upscaled videos land here. After Step 2 they go into Bin\\ under this folder.",
+            )
+            step4_images = gr.Textbox(
+                label="Step 1 output — upscaled IMAGES",
+                value=_wp["img_upscale_handoff_dir"],
+                info="Images skip toolbox interp · usually Ready for CIV\\images",
+            )
+            step5_inbox = gr.Textbox(
+                label="Step 2 input — Toolbox inbox (usually = Ready for Toolbox)",
+                value=_wp["tb_inbox_folder"],
+                info="Toolbox reads Step‑1 videos from here",
+            )
+            step6_final = gr.Textbox(
+                label="Step 2 output — Final / Ready for CIV",
+                value=_wp["toolbox_output_dir"],
+                info="Interp+export finals with _##fps in the name",
+            )
+            workflow_status = gr.Textbox(label="Pipeline status", interactive=False, show_label=True)
             with gr.Row():
-                current_output = str(config.get("output_dir", "")).strip() or DEFAULT_OUTPUT_DIR
-                output_dir_input = gr.Textbox(
-                    label="FlashVSR Upscale Save Location",
-                    value=current_output,
-                    placeholder=DEFAULT_OUTPUT_DIR,
-                    info=TIPS["output_dir"],
-                    scale=4
-                )
-                output_dir_status = gr.Textbox(label="Status", scale=2, interactive=False, show_label=False)
-            with gr.Row():
-                default_toolbox_output = os.path.join(DEFAULT_OUTPUT_DIR, "toolbox")
-                current_toolbox_output = str(config.get("toolbox_output_dir", "")).strip() or get_toolbox_output_dir()
-                toolbox_output_dir_input = gr.Textbox(
-                    label="Toolbox Final Save Location",
-                    value=current_toolbox_output,
-                    placeholder=default_toolbox_output,
-                    info=TIPS["toolbox_output_dir"],
-                    scale=4
-                )
-                toolbox_output_dir_status = gr.Textbox(label="Status", scale=2, interactive=False, show_label=False)
-            
-            with gr.Row():
-                apply_output_dir_btn = gr.Button("Apply FlashVSR Output", size="sm", variant="primary")
-                reset_output_dir_btn = gr.Button("Reset FlashVSR to Default", size="sm", variant="secondary")
-                apply_toolbox_output_dir_btn = gr.Button("Apply Toolbox Output", size="sm", variant="primary")
-                reset_toolbox_output_dir_btn = gr.Button("Reset Toolbox to Default", size="sm", variant="secondary")
+                apply_workflow_btn = gr.Button("💾 Save all pipeline folders", size="sm", variant="primary")
+                reset_workflow_btn = gr.Button("Reset steps to defaults", size="sm", variant="secondary")
+                refresh_workflow_map_btn = gr.Button("🔄 Refresh map", size="sm")
+
+            # Back-compat aliases used by older event wiring (map to step fields)
+            output_dir_input = step3_upscale
+            toolbox_output_dir_input = step6_final
+            output_dir_status = workflow_status
+            toolbox_output_dir_status = workflow_status
         
         def toggle_custom_input(theme_name):
             return gr.update(visible=(theme_name == "Custom"))
@@ -7256,87 +7451,95 @@ def create_ui():
             outputs=[naming_mode_status],
         )
         
-        def apply_output_dir(new_dir):
-            new_dir = new_dir.strip()
-            cfg = load_config()
-
-            if not new_dir or os.path.normpath(new_dir) == os.path.normpath(DEFAULT_OUTPUT_DIR):
-                cfg["output_dir"] = ""
-                save_config(cfg)
-                return f"✅ FlashVSR output reset to default: {DEFAULT_OUTPUT_DIR}"
-
-            new_dir = os.path.normpath(new_dir)
-            if not os.path.isabs(new_dir):
-                return "⚠️ Please enter an absolute path (e.g., D:/OUTPUTS/MyFolder)"
-
+        def _require_abs(path: str, label: str):
+            p = str(path or "").strip()
+            if not p:
+                return None, f"⚠️ {label}: empty path"
+            p = os.path.normpath(p)
+            if not os.path.isabs(p):
+                return None, f"⚠️ {label}: use an absolute path (e.g. D:\\OUTPUTS\\...)"
             try:
-                os.makedirs(new_dir, exist_ok=True)
-                cfg["output_dir"] = new_dir
-                save_config(cfg)
-                return f"✅ FlashVSR output set to: {new_dir}"
-            except Exception as e:
-                return f"❌ Error creating directory: {e}"
+                os.makedirs(p, exist_ok=True)
+            except OSError as e:
+                return None, f"❌ {label}: cannot create folder — {e}"
+            return p, None
 
-        def reset_output_dir():
+        def apply_workflow_folders(s1, s2, s3, s4, s5, s6):
+            """Save all six pipeline steps. Step 3 is also output_dir (no app\\outputs archetype)."""
             cfg = load_config()
-            cfg["output_dir"] = ""
-            save_config(cfg)
-            return DEFAULT_OUTPUT_DIR, f"✅ FlashVSR output reset to default: {DEFAULT_OUTPUT_DIR}"
-
-        def apply_toolbox_output_dir(new_dir):
-            new_dir = new_dir.strip()
-            cfg = load_config()
-            default_toolbox = os.path.join(DEFAULT_OUTPUT_DIR, "toolbox")
-
-            if not new_dir or os.path.normpath(new_dir) == os.path.normpath(default_toolbox):
-                cfg["toolbox_output_dir"] = ""
-                save_config(cfg)
-                _apply_toolbox_output_dir()
-                return f"✅ Toolbox output reset to default: {default_toolbox}"
-
-            new_dir = os.path.normpath(new_dir)
-            if not os.path.isabs(new_dir):
-                return "⚠️ Please enter an absolute path (e.g., D:/OUTPUTS/MyFolder/Ready for CIV)"
-
-            try:
-                os.makedirs(new_dir, exist_ok=True)
-                cfg["toolbox_output_dir"] = new_dir
-                save_config(cfg)
-                _apply_toolbox_output_dir()
-                return f"✅ Toolbox output set to: {new_dir}"
-            except Exception as e:
-                return f"❌ Error creating directory: {e}"
-
-        def reset_toolbox_output_dir():
-            cfg = load_config()
-            cfg["toolbox_output_dir"] = ""
+            mapping = [
+                ("batch_watch_folder", s1, "Step 1"),
+                ("batch_source_archive_dir", s2, "Step 2"),
+                ("batch_upscale_handoff_dir", s3, "Step 3"),
+                ("img_upscale_handoff_dir", s4, "Step 4"),
+                ("tb_inbox_folder", s5, "Step 5"),
+                ("toolbox_output_dir", s6, "Step 6"),
+            ]
+            saved = []
+            for key, raw, label in mapping:
+                path, err = _require_abs(raw, label)
+                if err:
+                    return workflow_paths_html(cfg), err
+                cfg[key] = path
+                saved.append(f"{label}→{path}")
+            # Step 3 is THE upscale save location (single + queue + autosave)
+            cfg["output_dir"] = cfg["batch_upscale_handoff_dir"]
             save_config(cfg)
             _apply_toolbox_output_dir()
-            default_toolbox = os.path.join(DEFAULT_OUTPUT_DIR, "toolbox")
-            return default_toolbox, f"✅ Toolbox output reset to default: {default_toolbox}"
-        
-        apply_output_dir_btn.click(
-            fn=apply_output_dir,
-            inputs=[output_dir_input],
-            outputs=[output_dir_status]
-        )
-        
-        reset_output_dir_btn.click(
-            fn=reset_output_dir,
-            inputs=[],
-            outputs=[output_dir_input, output_dir_status]
-        )
+            ensure_workflow_dirs()
+            msg = (
+                "✅ Pipeline folders saved. Step 3 (videos) = Ready for Toolbox path. "
+                "Restart / refresh if a queue was already mid-run.\n"
+                + "\n".join(saved)
+            )
+            return workflow_paths_html(cfg), msg
 
-        apply_toolbox_output_dir_btn.click(
-            fn=apply_toolbox_output_dir,
-            inputs=[toolbox_output_dir_input],
-            outputs=[toolbox_output_dir_status],
-        )
+        def reset_workflow_folders():
+            cfg = load_config()
+            for key, default in WORKFLOW_DEFAULTS.items():
+                cfg[key] = default
+            cfg["output_dir"] = WORKFLOW_DEFAULTS["batch_upscale_handoff_dir"]
+            save_config(cfg)
+            _apply_toolbox_output_dir()
+            ensure_workflow_dirs()
+            wp = get_workflow_paths(cfg)
+            return (
+                wp["batch_watch_folder"],
+                wp["batch_source_archive_dir"],
+                wp["batch_upscale_handoff_dir"],
+                wp["img_upscale_handoff_dir"],
+                wp["tb_inbox_folder"],
+                wp["toolbox_output_dir"],
+                workflow_paths_html(cfg),
+                "✅ Reset all steps to FAFO defaults (Step 3 = Ready for Toolbox).",
+            )
 
-        reset_toolbox_output_dir_btn.click(
-            fn=reset_toolbox_output_dir,
+        def refresh_workflow_map():
+            return workflow_paths_html()
+
+        apply_workflow_btn.click(
+            fn=apply_workflow_folders,
+            inputs=[step1_watch, step2_archive, step3_upscale, step4_images, step5_inbox, step6_final],
+            outputs=[workflow_map, workflow_status],
+        )
+        reset_workflow_btn.click(
+            fn=reset_workflow_folders,
             inputs=[],
-            outputs=[toolbox_output_dir_input, toolbox_output_dir_status],
+            outputs=[
+                step1_watch,
+                step2_archive,
+                step3_upscale,
+                step4_images,
+                step5_inbox,
+                step6_final,
+                workflow_map,
+                workflow_status,
+            ],
+        )
+        refresh_workflow_map_btn.click(
+            fn=refresh_workflow_map,
+            inputs=[],
+            outputs=[workflow_map],
         )
 
         # Footer with author credits

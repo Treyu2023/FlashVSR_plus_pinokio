@@ -132,13 +132,14 @@ class ExclusiveQueueLock:
         st = self.status()
         if not st:
             return (
-                "<div style='margin-top:6px;font-size:0.85em;color:#155724;'>"
+                "<div style='margin-top:6px;font-size:0.85em;color:#86efac;"
+                "background:#14352a;border:1px solid #166534;padding:6px;border-radius:6px;'>"
                 "No queue running — you can start video, image, or toolbox.</div>"
             )
         label = st.get("label") or st.get("queue") or "queue"
         return (
-            f"<div style='margin-top:6px;font-size:0.85em;color:#856404;background:#fff3cd;"
-            f"padding:6px;border-radius:4px;'>"
+            f"<div style='margin-top:6px;font-size:0.85em;color:#fbbf24;background:#3d2e0a;"
+            f"border:1px solid #854d0e;padding:6px;border-radius:6px;'>"
             f"🔒 Active now: <b>{label}</b> (started {st.get('started', '?')}). "
             f"Only one queue at a time.</div>"
         )
@@ -663,7 +664,7 @@ class FlashVSRWorkQueue:
         if running:
             idx, total = self.index_of(running.get("path", ""))
             current_line = (
-                f"<div style='margin-top:6px;font-weight:600;'>"
+                f"<div style='margin-top:6px;font-weight:600;color:#7dd3fc;'>"
                 f"▶ Now: <b>{idx}/{total}</b> — {Path(running.get('path','')).name}"
                 f"</div>"
             )
@@ -678,38 +679,41 @@ class FlashVSRWorkQueue:
         preview = ""
         if pending_preview:
             preview = (
-                "<div style='margin-top:8px;font-size:0.85em;color:#555;'>"
-                "<b>Next up:</b> "
+                "<div style='margin-top:8px;font-size:0.85em;color:#94a3b8;'>"
+                "<b style='color:#7dd3fc;'>Next up:</b> "
                 + ", ".join(pending_preview)
                 + (f" … +{more} more" if more else "")
                 + "</div>"
             )
 
         note_html = (
-            f"<div style='margin-top:8px;padding:6px;background:#fff3cd;border-radius:4px;'>{note}</div>"
+            f"<div style='margin-top:8px;padding:6px;background:#3d2e0a;border:1px solid #854d0e;"
+            f"border-radius:6px;color:#fbbf24;'>{note}</div>"
             if note
             else ""
         )
         stop_badge = (
-            "<span style='background:#f8d7da;color:#721c24;padding:2px 8px;border-radius:4px;font-size:0.85em;'>"
+            "<span style='background:#3f1d1d;color:#fca5a5;border:1px solid #7f1d1d;"
+            "padding:2px 8px;border-radius:4px;font-size:0.85em;'>"
             "⏹ stop after current</span>"
             if stop
             else ""
         )
 
+        # Dark panel — matches Interstellar / dark Gradio (readable light text on dark bg)
         return f"""
-<div style="padding:10px;background:#f8f9fa;border:1px solid #dee2e6;border-radius:8px;font-size:0.9em;">
-  <div style="font-weight:600;margin-bottom:6px;">{self.label}</div>
-  <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
-    <span><b>{c['done']}</b> done</span>
-    <span><b>{c['failed']}</b> failed</span>
-    <span><b>{c['pending']}</b> pending</span>
-    <span><b>{c['total']}</b> total</span>
+<div style="padding:10px;background:#0f1419;border:1px solid #2d3748;border-radius:8px;font-size:0.9em;color:#e2e8f0;">
+  <div style="font-weight:600;margin-bottom:6px;color:#7dd3fc;">{self.label}</div>
+  <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;color:#e2e8f0;">
+    <span><b style="color:#86efac;">{c['done']}</b> done</span>
+    <span><b style="color:#fca5a5;">{c['failed']}</b> failed</span>
+    <span><b style="color:#fbbf24;">{c['pending']}</b> pending</span>
+    <span><b style="color:#7dd3fc;">{c['total']}</b> total</span>
     {stop_badge}
   </div>
   {current_line}
-  <div style="margin-top:6px;font-size:0.85em;color:#666;">Output / handoff: <code>{completed}</code></div>
-  <div style="margin-top:4px;font-size:0.8em;color:#888;">Status: <code>{self.status_path}</code></div>
+  <div style="margin-top:6px;font-size:0.85em;color:#94a3b8;">Output / handoff: <code style="color:#cbd5e1;background:#1a202c;padding:1px 4px;border-radius:3px;">{completed}</code></div>
+  <div style="margin-top:4px;font-size:0.8em;color:#64748b;">Status: <code style="color:#94a3b8;background:#1a202c;padding:1px 4px;border-radius:3px;">{self.status_path}</code></div>
   {preview}
   {note_html}
 </div>

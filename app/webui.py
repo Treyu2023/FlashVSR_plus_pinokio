@@ -154,9 +154,10 @@ TIPS = {
         "If free VRAM drops under ~4GB mid-run, lower to 8s. Raise to 12–15s only when VRAM headroom is large."
     ),
     "batch_resize": (
-        "Resize Width Preset — default 1024px (clarity). Only shrinks if source is wider — never upsizes. "
-        "4× of 1024 ≈ 4096px wide. Pre-downscale to 768 was discarding detail before the model (soft outputs). "
-        "Use 768/512 only if OOM; use No Resize only for short ≤720p sources with chunks + tile 256."
+        "Pre-downscale before FlashVSR. Default 4K-safe (auto): math so (input × scale) never exceeds "
+        "UHD 4K — 3840×2160 for 16:9 landscape, or 2160×3840 for 9:16 portrait (at 4× → max 960×540 or 540×960). "
+        "Only shrinks, never upsizes. Fixed px presets also clamp so 4× stays inside that 4K box. "
+        "No Resize = leave source as-is (may exceed 4K after upscale)."
     ),
     "autosave": (
         "Autosave Output — ON saves finished upscales automatically to the FlashVSR output folder. "
@@ -613,7 +614,7 @@ def get_ui_defaults(config=None):
         "fps_override": (30, int),
         "device": ("cuda:0", str),
         # 1024×4 ≈ 4096 wide — keeps more source detail than 768 (was crushing Grok clips)
-        "batch_resize_preset": ("1024px", str),
+        "batch_resize_preset": ("4K-safe (auto)", str),
         "batch_watch_folder": (r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS", str),
         "batch_source_archive_dir": (
             r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
@@ -691,24 +692,71 @@ def crop_to_scaled_dimensions(tensor, src_h, src_w, scale):
     )
     return cropped
 
+def is_no_resize_preset(preset) -> bool:
+    s = str(preset or "").strip().lower()
+    return s in ("", "no resize", "none", "off")
+
+
+def is_4k_safe_preset(preset) -> bool:
+    s = str(preset or "").strip().lower().replace("_", "-")
+    return s in (
+        "4k-safe (auto)",
+        "4k-safe",
+        "4k safe",
+        "auto 4k",
+        "auto-4k",
+        "uhd-safe",
+        "4k_safe",
+    )
+
+
+def parse_batch_resize_preset(preset, scale=None):
+    """
+    Returns (mode, max_width) where mode is 'none' | '4k_safe' | 'width'.
+    Width presets still get a 4K post-scale clamp inside calculate_resize_dimensions.
+    """
+    if is_no_resize_preset(preset):
+        return "none", None
+    if is_4k_safe_preset(preset):
+        return "4k_safe", None
+    raw = str(preset).strip().lower().replace("px", "")
+    try:
+        return "width", int(float(raw))
+    except (TypeError, ValueError):
+        # Unknown label → safe default
+        return "4k_safe", None
+
+
 def apply_batch_resize_preset(video_path, batch_resize_preset, scale=None, progress=None):
-    """Resize video to batch preset width and align dims for zero padding at upscale."""
-    if not video_path or batch_resize_preset == "No Resize":
+    """Resize video so upscale×scale stays within UHD 4K (or legacy width cap + 4K clamp)."""
+    if not video_path or is_no_resize_preset(batch_resize_preset):
         return video_path
     if scale is None:
         scale = get_ui_defaults()["scale"]
-    max_width = int(str(batch_resize_preset).replace("px", ""))
+    mode, max_width = parse_batch_resize_preset(batch_resize_preset, scale=scale)
+    if mode == "none":
+        return video_path
     current_width, current_height = get_video_dimensions(video_path)
     new_width, new_height, will_resize = calculate_resize_dimensions(
-        current_width, current_height, max_width, scale=scale
+        current_width,
+        current_height,
+        max_width=max_width,
+        scale=scale,
+        mode=mode,
     )
     if not will_resize:
-        log(f"Video {current_width}×{current_height} already fits preset and {scale}× grid — no resize", message_type="info")
+        out_w, out_h = int(current_width) * int(scale), int(current_height) * int(scale)
+        log(
+            f"Video {current_width}×{current_height} already 4K-safe at {scale}× "
+            f"(→ {out_w}×{out_h}) — no resize",
+            message_type="info",
+        )
         return video_path
     align = resize_align_step(scale)
+    out_w, out_h = new_width * int(scale), new_height * int(scale)
     log(
         f"Resizing video {current_width}×{current_height} → {new_width}×{new_height} "
-        f"(center crop, {align}px grid for {scale}× → codec-safe output)",
+        f"(align {align}px, {scale}× → {out_w}×{out_h} within UHD 4K)",
         message_type="info",
     )
     if progress is None:
@@ -716,7 +764,9 @@ def apply_batch_resize_preset(video_path, batch_resize_preset, scale=None, progr
             def __call__(self, *args, **kwargs):
                 pass
         progress = _NoProgress()
-    return resize_input_video(video_path, max_width, scale=scale, progress=progress)
+    return resize_input_video(
+        video_path, max_width, scale=scale, progress=progress, mode=mode
+    )
 
 def save_config(config):
     """Save user preferences to config file."""
@@ -1997,10 +2047,11 @@ def center_crop_cover_pil(img, target_w, target_h):
     return resized.crop((left, top, left + target_w, top + target_h))
 
 
-def resize_input_image(image_path, max_width, scale=4, progress=gr.Progress()):
+def resize_input_image(image_path, max_width, scale=4, progress=gr.Progress(), mode=None):
     """
     Resizes image for FlashVSR preprocessing using PIL.
     Never upsizes - only downsizes if needed.
+    mode="4k_safe" fits so (size × scale) stays within UHD 4K 16:9 / 9:16.
     Center-crops to the upscale grid (no stretch).
     Returns path to resized image (or original if no resize needed).
     """
@@ -2009,8 +2060,11 @@ def resize_input_image(image_path, max_width, scale=4, progress=gr.Progress()):
         return image_path
     
     current_width, current_height = get_image_dimensions(image_path)
+    if mode is None and isinstance(max_width, str) and is_4k_safe_preset(max_width):
+        mode = "4k_safe"
+        max_width = None
     new_width, new_height, will_resize = calculate_resize_dimensions(
-        current_width, current_height, max_width, scale=scale
+        current_width, current_height, max_width, scale=scale, mode=mode
     )
     
     if not will_resize:
@@ -2102,26 +2156,39 @@ def run_flashvsr_batch_image(
             log(f"\n--- Processing image {i+1}/{total_images}: {os.path.basename(image_path)} ---", message_type='info')
             batch_messages.append(f"\n--- Image {i+1}/{total_images}: {os.path.basename(image_path)} ---")
             
-            # Apply batch resize if preset is selected
+            # Apply batch resize if preset is selected (4K-safe or width cap)
             processed_image_path = image_path
-            if batch_resize_preset != "No Resize":
-                # Extract width from preset (e.g., "512px" -> 512)
-                max_width = int(batch_resize_preset.replace("px", ""))
+            mode, max_width = parse_batch_resize_preset(batch_resize_preset, scale=get_ui_defaults().get("scale", 4))
+            if mode != "none":
                 current_width, current_height = get_image_dimensions(image_path)
-                
-                # Only resize if image is wider than preset
-                if current_width > max_width:
-                    log(f"Resizing image from {current_width}px to {max_width}px width...", message_type='info')
-                    batch_messages.append(f"  Resizing: {current_width}px → {max_width}px")
-                    
+                sc = int(get_ui_defaults().get("scale", 4) or 4)
+                nw, nh, will = calculate_resize_dimensions(
+                    current_width, current_height, max_width=max_width, scale=sc, mode=mode
+                )
+                if will:
+                    log(
+                        f"Resizing image {current_width}×{current_height} → {nw}×{nh} "
+                        f"({sc}× → {nw * sc}×{nh * sc} within UHD 4K)...",
+                        message_type="info",
+                    )
+                    batch_messages.append(
+                        f"  Resizing: {current_width}×{current_height} → {nw}×{nh} "
+                        f"(at {sc}× → {nw * sc}×{nh * sc})"
+                    )
+
                     class DummyProgress:
                         def __call__(self, *args, **kwargs):
                             pass
-                    
-                    processed_image_path = resize_input_image(image_path, max_width, progress=DummyProgress())
+
+                    processed_image_path = resize_input_image(
+                        image_path, max_width, scale=sc, progress=DummyProgress(), mode=mode
+                    )
                 else:
-                    log(f"Image width ({current_width}px) ≤ preset ({max_width}px), skipping resize", message_type='info')
-                    batch_messages.append(f"  No resize needed ({current_width}px)")
+                    log(
+                        f"Image {current_width}×{current_height} already 4K-safe at {sc}× — no resize",
+                        message_type="info",
+                    )
+                    batch_messages.append(f"  No resize needed ({current_width}×{current_height})")
             
             image_path = processed_image_path
             
@@ -2456,16 +2523,21 @@ def run_flashvsr_batch(
                 def __call__(self, *args, **kwargs):
                     pass
 
+            before_w, before_h = get_video_dimensions(video_path)
             resized_path = apply_batch_resize_preset(
                 video_path, batch_resize_preset, scale=scale, progress=DummyProgress()
             )
             if resized_path != video_path:
-                current_width, _ = get_video_dimensions(video_path)
-                max_width = int(str(batch_resize_preset).replace("px", ""))
-                batch_messages.append(f"  Resizing: {current_width}px → {max_width}px")
-            elif batch_resize_preset != "No Resize":
-                current_width, _ = get_video_dimensions(video_path)
-                batch_messages.append(f"  No resize needed ({current_width}px)")
+                after_w, after_h = get_video_dimensions(resized_path)
+                batch_messages.append(
+                    f"  Resizing: {before_w}×{before_h} → {after_w}×{after_h} "
+                    f"(at {scale}× → {after_w * int(scale)}×{after_h * int(scale)}, UHD-safe)"
+                )
+            elif not is_no_resize_preset(batch_resize_preset):
+                batch_messages.append(
+                    f"  No resize needed ({before_w}×{before_h}; "
+                    f"{scale}× → {before_w * int(scale)}×{before_h * int(scale)} already 4K-safe)"
+                )
             video_path = resized_path
             
             class BatchProgress(DummyProgress):
@@ -3035,10 +3107,39 @@ def _run_flashvsr_work_queue_body(
         label="Video queue",
     )
 
+    # Step 1 preflight: dedupe queue, drop already-complete outputs, refresh list
+    out_dirs = [
+        handoff,
+        paths.get("ready_toolbox", ""),
+        get_output_dir(),
+        wq.get_completed_dir() or "",
+    ]
+
+    def _find_complete(path: str):
+        return find_matching_deliverable(
+            path, *out_dirs, prefer_exported=False
+        )
+
+    pf = wq.preflight_before_start(
+        find_output=_find_complete,
+        remove_completed=True,
+        requeue_failed=True,
+        remove_missing=False,
+    )
+    if pf.get("dupes") or pf.get("completed_removed") or pf.get("failed_requeued"):
+        log(
+            "🧹 Step 1 preflight: "
+            f"{pf.get('dupes', 0)} duplicate(s) removed (kept 1), "
+            f"{pf.get('completed_removed', 0)} already-complete removed from queue, "
+            f"{pf.get('failed_requeued', 0)} failed re-queued · "
+            f"{pf.get('pending', 0)} pending left",
+            message_type="info",
+        )
+
     pending = wq.pending_items()
     if not pending:
         note = (
-            "Queue is empty — drop videos in the watch folder "
+            "Queue is empty after preflight (dupes/completed cleared) — drop videos in the watch folder "
             f"({watch_folder or 'set batch_watch_folder'}), then Start / Resume."
         )
         log(note, message_type="warning")
@@ -3363,9 +3464,30 @@ def _run_flashvsr_image_work_queue_body(
         label="Image queue",
     )
 
+    def _find_img_complete(path: str):
+        return find_matching_deliverable(
+            path, handoff, paths.get("img_handoff", ""), prefer_exported=False
+        )
+
+    pf = wq.preflight_before_start(
+        find_output=_find_img_complete,
+        remove_completed=True,
+        requeue_failed=True,
+        remove_missing=False,
+    )
+    if pf.get("dupes") or pf.get("completed_removed") or pf.get("failed_requeued"):
+        log(
+            "🧹 Image queue preflight: "
+            f"{pf.get('dupes', 0)} duplicate(s) removed, "
+            f"{pf.get('completed_removed', 0)} already-complete removed, "
+            f"{pf.get('failed_requeued', 0)} failed re-queued · "
+            f"{pf.get('pending', 0)} pending left",
+            message_type="info",
+        )
+
     pending = wq.pending_items()
     if not pending:
-        note = f"Image queue empty — drop images in {watch_folder or 'watch folder'}."
+        note = f"Image queue empty after preflight — drop images in {watch_folder or 'watch folder'}."
         return None, wq.status_html(note)
 
     completed_dir = wq.set_fixed_completed_dir(handoff)
@@ -3410,11 +3532,25 @@ def _run_flashvsr_image_work_queue_body(
                     return iterable
 
             proc = image_path
-            if batch_resize_preset and batch_resize_preset != "No Resize":
-                max_width = int(str(batch_resize_preset).replace("px", ""))
-                cw, _ = get_image_dimensions(image_path)
-                if cw > max_width:
-                    proc = resize_input_image(image_path, max_width, progress=DummyProgress())
+            mode, max_width = parse_batch_resize_preset(batch_resize_preset, scale=scale)
+            if mode != "none":
+                cw, ch = get_image_dimensions(image_path)
+                nw, nh, will = calculate_resize_dimensions(
+                    cw, ch, max_width=max_width, scale=scale, mode=mode
+                )
+                if will:
+                    proc = resize_input_image(
+                        image_path,
+                        max_width,
+                        scale=scale,
+                        progress=DummyProgress(),
+                        mode=mode,
+                    )
+                    log(
+                        f"Image resize {cw}×{ch} → {nw}×{nh} "
+                        f"(at {scale}× → {nw * int(scale)}×{nh * int(scale)} UHD-safe)",
+                        message_type="info",
+                    )
 
             out_path, _, _, _ = run_flashvsr_image(
                 image_path=proc,
@@ -3907,34 +4043,123 @@ def analyze_input_video(video_path):
     except Exception as e:
         return f'<div style="padding: 12px; background: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 6px; color: #fca5a5;">❌ Error analyzing video: {str(e)}</div>', 0, 0
 
-def calculate_resize_dimensions(current_width, current_height, max_width, align_to=2, scale=None):
+# UHD 4K frame limits (long edge / short edge)
+UHD_4K_LONG = 3840
+UHD_4K_SHORT = 2160
+
+
+def uhd_4k_output_limits(width, height):
+    """
+    Max *output* size for UHD 4K by orientation:
+      landscape / square → 3840×2160 (16:9 class)
+      portrait           → 2160×3840 (9:16 class)
+    """
+    w, h = int(width or 0), int(height or 0)
+    if w >= h:
+        return UHD_4K_LONG, UHD_4K_SHORT
+    return UHD_4K_SHORT, UHD_4K_LONG
+
+
+def uhd_4k_input_limits(width, height, scale=4):
+    """Max *input* size so (input × scale) stays within UHD 4K for that orientation."""
+    s = max(1, int(scale or 4))
+    out_w, out_h = uhd_4k_output_limits(width, height)
+    return out_w / s, out_h / s
+
+
+def calculate_resize_dimensions(
+    current_width,
+    current_height,
+    max_width=None,
+    align_to=2,
+    scale=None,
+    max_height=None,
+    mode=None,
+):
     """
     Calculate new dimensions for resize, maintaining aspect ratio.
-    Never upsizes - only downsizes if needed.
+    Never upsizes — only downsizes if needed.
     Returns (new_width, new_height, will_resize)
 
-    When scale is set (e.g. 4), targets input dims where (w×scale) and (h×scale)
-    are multiples of 128. Resize uses center crop (no stretch) to hit that grid.
+    mode:
+      - "4k_safe": fit inside the box where (w×scale, h×scale) ≤ UHD 4K
+        (3840×2160 landscape or 2160×3840 portrait).
+      - "width" / None: legacy max_width; when scale is set, also clamps to 4K-safe box.
+      - optional max_height for an explicit box.
+
+    When scale is set, dims are snapped so (dim×scale) lands on model/codec grids.
     """
-    if current_width <= 0 or current_height <= 0:
+    cw = int(current_width or 0)
+    ch = int(current_height or 0)
+    if cw <= 0 or ch <= 0:
         return current_width, current_height, False
 
     if scale is not None:
-        align_to = resize_align_step(scale)
+        align_to = max(1, int(resize_align_step(scale)))
+    else:
+        align_to = max(1, int(align_to or 2))
 
-    aspect_ratio = current_height / current_width
+    mode_l = (str(mode).lower() if mode is not None else "") or ""
+    if mode_l in ("4k_safe", "4k-safe", "auto_4k") or (
+        isinstance(max_width, str) and is_4k_safe_preset(max_width)
+    ):
+        box_w, box_h = uhd_4k_input_limits(cw, ch, scale=scale or 4)
+    else:
+        # Legacy width cap; when scale known, also never exceed 4K after upscale
+        if max_width is None or max_width == "" or max_width == 0:
+            box_w = float(cw)
+        else:
+            try:
+                box_w = float(max_width)
+            except (TypeError, ValueError):
+                box_w = float(cw)
+        if max_height is not None:
+            try:
+                box_h = float(max_height)
+            except (TypeError, ValueError):
+                box_h = float(ch)
+        elif scale is not None:
+            k_w, k_h = uhd_4k_input_limits(cw, ch, scale=scale)
+            box_w = min(box_w, k_w)
+            box_h = k_h
+        else:
+            # width-only, no scale: height free (old behavior)
+            box_h = float(ch) * (box_w / float(cw)) if cw else float(ch)
 
-    if current_width <= max_width:
-        new_width = max(align_to, (current_width // align_to) * align_to)
-        new_height = max(align_to, (int(new_width * aspect_ratio) // align_to) * align_to)
-        will_resize = new_width != current_width or new_height != current_height
-        return new_width, new_height, will_resize
+    # Fit entire frame inside box (downscale only)
+    factor = min(1.0, box_w / float(cw), box_h / float(ch))
+    tw = cw * factor
+    th = ch * factor
 
-    new_width = max(align_to, (max_width // align_to) * align_to)
-    new_height = max(align_to, (int(new_width * aspect_ratio) // align_to) * align_to)
-    return new_width, new_height, True
+    # Snap down to alignment grid
+    new_width = max(align_to, (int(tw) // align_to) * align_to)
+    new_height = max(align_to, (int(th) // align_to) * align_to)
 
-def preview_resize(video_path, max_width, scale=None):
+    # Keep aspect as close as possible after grid snap (prefer width-driven height)
+    if cw > 0:
+        aspect = ch / float(cw)
+        alt_h = max(align_to, (int(round(new_width * aspect)) // align_to) * align_to)
+        # Prefer alt_h if it still fits the box
+        if alt_h <= box_h + 0.5:
+            new_height = alt_h
+        else:
+            # height-limited: recompute width from height
+            if ch > 0:
+                inv = cw / float(ch)
+                alt_w = max(align_to, (int(round(new_height * inv)) // align_to) * align_to)
+                if alt_w <= box_w + 0.5:
+                    new_width = alt_w
+
+    # Final safety: step down if still over box after rounding
+    while new_width > box_w + 0.5 and new_width > align_to:
+        new_width -= align_to
+    while new_height > box_h + 0.5 and new_height > align_to:
+        new_height -= align_to
+
+    will_resize = new_width != cw or new_height != ch
+    return int(new_width), int(new_height), will_resize
+
+def preview_resize(video_path, max_width, scale=None, mode=None):
     """Generate preview text showing what resize will do."""
     if not video_path:
         return '<div style="padding: 8px; background: #0f1419; border: 1px solid #2d3748; border-radius: 4px; color: #94a3b8; font-size: 0.9em; text-align: center;">No video loaded</div>'
@@ -3945,10 +4170,15 @@ def preview_resize(video_path, max_width, scale=None):
 
     if scale is None:
         scale = get_ui_defaults()["scale"]
+    if mode is None and isinstance(max_width, str) and is_4k_safe_preset(max_width):
+        mode = "4k_safe"
+        max_width = None
     new_width, new_height, will_resize = calculate_resize_dimensions(
-        current_width, current_height, max_width, scale=scale
+        current_width, current_height, max_width, scale=scale, mode=mode
     )
     align = resize_align_step(scale)
+    out_w, out_h = new_width * int(scale), new_height * int(scale)
+    lim_w, lim_h = uhd_4k_output_limits(current_width, current_height)
     
     # Check if video is small enough to not need tiled DiT (rough threshold)
     # Tiled DiT is mainly beneficial for larger videos that exceed VRAM
@@ -3960,18 +4190,19 @@ def preview_resize(video_path, max_width, scale=None):
         return (
             f'<div style="padding: 8px; background: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac; font-size: 0.9em; text-align: center;">'
             f'{current_width}×{current_height} → {new_width}×{new_height} ({reduction:.0f}% reduction) ✓<br>'
-            f'<span style="font-size: 0.85em;">Center crop to {align}px grid for {scale}× (aspect preserved, no output padding)</span></div>'
+            f'<span style="font-size: 0.85em;">At {scale}× → {out_w}×{out_h} (UHD cap {lim_w}×{lim_h}, {align}px grid)</span></div>'
         )
     else:
         if pixels <= small_video_threshold:
-            return f'<div style="padding: 8px; background: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc; font-size: 0.9em; text-align: center;">{current_width}×{current_height} (no resize needed) ✓<br><span style=" color: #0c5460; font-size: 0.9em;">💡 Small resolution - consider disabling Tiled DiT for better speed and quality</span></div>'
+            return f'<div style="padding: 8px; background: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc; font-size: 0.9em; text-align: center;">{current_width}×{current_height} (no resize needed) ✓ · {scale}× → {out_w}×{out_h}<br><span style=" color: #0c5460; font-size: 0.9em;">💡 Small resolution - consider disabling Tiled DiT for better speed and quality</span></div>'
         else:
-            return f'<div style="padding: 8px; background: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc; font-size: 0.9em; text-align: center;">{current_width}×{current_height} (no resize needed) ✓</div>'
+            return f'<div style="padding: 8px; background: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc; font-size: 0.9em; text-align: center;">{current_width}×{current_height} (no resize / already 4K-safe) ✓ · {scale}× → {out_w}×{out_h}</div>'
 
-def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress()):
+def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress(), mode=None):
     """
     Resizes video for FlashVSR preprocessing using FFmpeg.
     Never upsizes - only downsizes if needed.
+    mode="4k_safe" fits so (size × scale) stays within UHD 4K 16:9 / 9:16.
     Returns path to resized video (or original if no resize needed).
     """
     if not video_path or not os.path.exists(video_path):
@@ -3979,8 +4210,11 @@ def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress()):
         return video_path
     
     current_width, current_height = get_video_dimensions(video_path)
+    if mode is None and isinstance(max_width, str) and is_4k_safe_preset(max_width):
+        mode = "4k_safe"
+        max_width = None
     new_width, new_height, will_resize = calculate_resize_dimensions(
-        current_width, current_height, max_width, scale=scale
+        current_width, current_height, max_width, scale=scale, mode=mode
     )
     
     if not will_resize:
@@ -5069,9 +5303,28 @@ def create_ui():
                                 gr.Markdown("---")
                                 gr.Markdown('<span style="font-size: 0.9em; color: #666;">📐 **Batch Resize Preset** - Automatically resize videos wider than selected width</span>')
                                 batch_resize_preset = gr.Dropdown(
-                                    choices=["No Resize", "512px", "768px", "1024px", "1280px", "1920px"],
-                                    value=ui["batch_resize_preset"],
-                                    label="Resize Width Preset",
+                                    choices=[
+                                        "4K-safe (auto)",
+                                        "No Resize",
+                                        "512px",
+                                        "768px",
+                                        "1024px",
+                                        "1280px",
+                                        "1920px",
+                                    ],
+                                    value=ui["batch_resize_preset"]
+                                    if ui.get("batch_resize_preset")
+                                    in (
+                                        "4K-safe (auto)",
+                                        "No Resize",
+                                        "512px",
+                                        "768px",
+                                        "1024px",
+                                        "1280px",
+                                        "1920px",
+                                    )
+                                    else "4K-safe (auto)",
+                                    label="Pre-downscale (4K-safe)",
                                     info=TIPS["batch_resize"],
                                     interactive=True
                                 )
@@ -5360,9 +5613,28 @@ def create_ui():
                                 gr.Markdown("---")
                                 gr.Markdown('<span style="font-size: 0.9em; color: #666;">📐 **Batch Resize Preset**</span>')
                                 img_batch_resize_preset = gr.Dropdown(
-                                    choices=["No Resize", "512px", "768px", "1024px", "1280px", "1920px"],
-                                    value=ui["batch_resize_preset"],
-                                    label="Resize Width Preset",
+                                    choices=[
+                                        "4K-safe (auto)",
+                                        "No Resize",
+                                        "512px",
+                                        "768px",
+                                        "1024px",
+                                        "1280px",
+                                        "1920px",
+                                    ],
+                                    value=ui["batch_resize_preset"]
+                                    if ui.get("batch_resize_preset")
+                                    in (
+                                        "4K-safe (auto)",
+                                        "No Resize",
+                                        "512px",
+                                        "768px",
+                                        "1024px",
+                                        "1280px",
+                                        "1920px",
+                                    )
+                                    else "4K-safe (auto)",
+                                    label="Pre-downscale (4K-safe)",
                                     info=TIPS["batch_resize"],
                                     interactive=True
                                 )

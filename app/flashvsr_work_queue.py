@@ -358,6 +358,125 @@ class FlashVSRWorkQueue:
         self.save(data)
         return removed
 
+    def preflight_before_start(
+        self,
+        *,
+        find_output=None,
+        remove_completed: bool = True,
+        requeue_failed: bool = True,
+        remove_missing: bool = False,
+    ) -> Dict[str, int]:
+        """
+        Clean the queue right before Start / Resume (Step 1 style):
+
+        1. Drop already-done rows (and optional skip-complete via find_output)
+        2. Dedupe by absolute path — keep one copy only (prefer running → pending)
+        3. Re-queue failed for retry
+        4. Refresh STATUS.txt
+
+        find_output(path) -> optional existing deliverable path in the output/handoff folder.
+
+        Returns stats: {dupes, completed_removed, failed_requeued, pending, total}
+        """
+        data = self.load()
+        items: List[Dict[str, Any]] = list(data.get("items") or [])
+        stats = {
+            "dupes": 0,
+            "completed_removed": 0,
+            "failed_requeued": 0,
+            "missing_removed": 0,
+            "pending": 0,
+            "total": 0,
+        }
+
+        # Prefer status order when collapsing duplicates
+        priority = {
+            ST_RUNNING: 0,
+            ST_PENDING: 1,
+            ST_FAILED: 2,
+            ST_DONE: 3,
+        }
+
+        # --- requeue failed ---
+        if requeue_failed:
+            for it in items:
+                if it.get("status") == ST_FAILED:
+                    it["status"] = ST_PENDING
+                    it["error"] = None
+                    it["finished"] = None
+                    it["output"] = None
+                    stats["failed_requeued"] += 1
+
+        # --- mark complete if deliverable already in output folder ---
+        if find_output is not None:
+            for it in items:
+                st = it.get("status", ST_PENDING)
+                if st not in (ST_PENDING, ST_FAILED):
+                    continue
+                path = (it.get("path") or "").strip()
+                if not path:
+                    continue
+                try:
+                    out = find_output(path)
+                except Exception:
+                    out = None
+                if out and os.path.isfile(out):
+                    it["status"] = ST_DONE
+                    it["output"] = out
+                    it["error"] = None
+                    it["finished"] = _now_iso()
+                    it["preflight_complete"] = _now_iso()
+                    it["preflight_note"] = f"output already exists: {out}"
+
+        # --- drop completed rows from the queue ---
+        if remove_completed:
+            kept: List[Dict[str, Any]] = []
+            for it in items:
+                if it.get("status") == ST_DONE:
+                    stats["completed_removed"] += 1
+                    continue
+                kept.append(it)
+            items = kept
+
+        # --- optional: drop rows whose source file is gone and not relocated ---
+        if remove_missing:
+            kept = []
+            for it in items:
+                path = (it.get("path") or "").strip()
+                if path and not os.path.isfile(path) and it.get("status") != ST_RUNNING:
+                    stats["missing_removed"] += 1
+                    continue
+                kept.append(it)
+            items = kept
+
+        # --- dedupe by path (keep best status, first occurrence among ties) ---
+        best: Dict[str, Dict[str, Any]] = {}
+        order: List[str] = []
+        for it in items:
+            path = (it.get("path") or "").strip()
+            key = _norm(path) if path else f"__no_path_{id(it)}"
+            if key not in best:
+                best[key] = it
+                order.append(key)
+                continue
+            stats["dupes"] += 1
+            old = best[key]
+            old_p = priority.get(old.get("status"), 9)
+            new_p = priority.get(it.get("status"), 9)
+            if new_p < old_p:
+                best[key] = it
+            # else keep the earlier entry (stable)
+
+        items = [best[k] for k in order]
+
+        data["items"] = items
+        self.save(data)
+
+        c = self.counts(data)
+        stats["pending"] = c["pending"]
+        stats["total"] = c["total"]
+        return stats
+
     def clear_all(self) -> int:
         data = self.load()
         n = len(data.get("items") or [])

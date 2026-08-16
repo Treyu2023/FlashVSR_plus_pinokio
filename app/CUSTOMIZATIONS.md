@@ -11,6 +11,7 @@
 | Date | Summary |
 |------|---------|
 | 2026-08-13 | **4K-safe pre-downscale:** default `batch_resize_preset=4K-safe (auto)` — math so `(input × scale)` never exceeds UHD 4K: **3840×2160** (16:9) or **2160×3840** (9:16). At 4× that is max **960×540** / **540×960** (grid-aligned). Fixed px presets still clamp inside that box. |
+| 2026-08-14 | **User defaults:** tile **320** / overlap **32**, sparse **1.0**, local range **7**, output quality **9**. Queue order newest→oldest (mtime). |
 | 2026-08-11 | **Clarity defaults:** resize ≤**1024px** (was 768 — was crushing sources), tile **256/48**, quality **9**, sparse **1.2**, chunks **10s**, pre-resize CRF **14**/slow, toolbox export quality **96**/slow. Root cause of soft output: pre-downscale + encode 7; OOM at tile 320 on tall 4× (e.g. 3072×4608). |
 | 2026-08-11 | **Preserve stack:** `scripts/env_guard.py` (snapshot / stop holders / safetensors verify+repair); hardened `update.js` (stop Start, snapshot, post-update verify); `start.js` preflight; Update/Reset confirms in `pinokio.js`; offline backups under `C:\pinokio\backups\FlashVSR_plus_pinokio\`; see root `PRESERVE.md`. |
 | 2026-07-31 | Toolbox **Batch Queue maxed**: 20-file packs, token-safe stem match, import crashed `batch_*` folders, requeue failed, rebuild chunks, hardlink/symlink/copy work packs, atomic manifests + CSV/PENDING/FAILED/DONE, ETA, push path → FlashVSR Batch. Live `INPUTS.txt` + `BATCH_PROGRESS` + `REMAINING.txt` on every FlashVSR batch. |

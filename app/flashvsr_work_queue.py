@@ -152,6 +152,23 @@ def _norm(path: str) -> str:
         return os.path.normcase(os.path.normpath(str(path)))
 
 
+def _file_mtime(path: Any) -> float:
+    """Best-effort mtime for sort keys (missing files → 0)."""
+    try:
+        p = Path(path) if not isinstance(path, Path) else path
+        return float(p.stat().st_mtime) if p.is_file() else 0.0
+    except OSError:
+        return 0.0
+
+
+def _sort_paths_newest_first(paths: Sequence[Any]) -> List[Any]:
+    """Latest modified first, then name as stable tie-break."""
+    return sorted(
+        paths,
+        key=lambda p: (-_file_mtime(p), str(p).lower()),
+    )
+
+
 def _atomic_write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".queue_", suffix=".json", dir=str(path.parent))
@@ -333,22 +350,54 @@ class FlashVSRWorkQueue:
         return added, skipped
 
     def add_folder(self, folder: str, *, recursive: bool = False) -> Tuple[int, int]:
+        """Scan folder and enqueue files newest-first (mtime desc → oldest last)."""
         if not folder or not os.path.isdir(folder):
             return 0, 0
-        paths: List[str] = []
+        found: List[Path] = []
         root = Path(folder)
         if recursive:
-            for f in sorted(root.rglob("*"), key=lambda p: str(p).lower()):
+            for f in root.rglob("*"):
                 if f.is_file() and f.suffix.lower() in self.extensions:
                     # skip nested done/archive folders
                     if any(part.lower() in {"done", "archive", "failed", "completed"} for part in f.parts):
                         continue
-                    paths.append(str(f))
+                    found.append(f)
         else:
-            for f in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+            for f in root.iterdir():
                 if f.is_file() and f.suffix.lower() in self.extensions:
-                    paths.append(str(f))
+                    found.append(f)
+        # Latest video/image first so Start processes fresh work before older backlog
+        paths = [str(p) for p in _sort_paths_newest_first(found)]
         return self.add_paths(paths)
+
+    def reorder_pending_newest_first(self) -> int:
+        """
+        Reorder queue so pending items run newest→oldest by source file mtime.
+        Running / done / failed rows keep relative buckets (running first, then pending, …).
+        Returns number of pending items reordered.
+        """
+        data = self.load()
+        items: List[Dict[str, Any]] = list(data.get("items") or [])
+        if not items:
+            return 0
+        running = [it for it in items if it.get("status") == ST_RUNNING]
+        pending = [it for it in items if it.get("status") == ST_PENDING]
+        failed = [it for it in items if it.get("status") == ST_FAILED]
+        done = [it for it in items if it.get("status") == ST_DONE]
+        other = [
+            it
+            for it in items
+            if it.get("status") not in (ST_RUNNING, ST_PENDING, ST_FAILED, ST_DONE)
+        ]
+        pending_sorted = sorted(
+            pending,
+            key=lambda it: (-_file_mtime(it.get("path") or ""), str(it.get("path") or "").lower()),
+        )
+        data["items"] = running + pending_sorted + failed + done + other
+        data["sort_pending"] = "mtime_desc"
+        data["sorted_at"] = _now_iso()
+        self.save(data)
+        return len(pending_sorted)
 
     def clear_done(self) -> int:
         data = self.load()
@@ -387,6 +436,7 @@ class FlashVSRWorkQueue:
             "missing_removed": 0,
             "pending": 0,
             "total": 0,
+            "pending_sorted_newest_first": 0,
         }
 
         # Prefer status order when collapsing duplicates
@@ -469,7 +519,26 @@ class FlashVSRWorkQueue:
 
         items = [best[k] for k in order]
 
+        # Newest source files first (mtime desc) so Start works latest → oldest
+        running = [it for it in items if it.get("status") == ST_RUNNING]
+        pending = [it for it in items if it.get("status") == ST_PENDING]
+        failed = [it for it in items if it.get("status") == ST_FAILED]
+        done = [it for it in items if it.get("status") == ST_DONE]
+        other = [
+            it
+            for it in items
+            if it.get("status") not in (ST_RUNNING, ST_PENDING, ST_FAILED, ST_DONE)
+        ]
+        pending_sorted = sorted(
+            pending,
+            key=lambda it: (-_file_mtime(it.get("path") or ""), str(it.get("path") or "").lower()),
+        )
+        items = running + pending_sorted + failed + done + other
+        stats["pending_sorted_newest_first"] = len(pending_sorted)
+
         data["items"] = items
+        data["sort_pending"] = "mtime_desc"
+        data["sorted_at"] = _now_iso()
         self.save(data)
 
         c = self.counts(data)

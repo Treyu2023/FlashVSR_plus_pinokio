@@ -173,6 +173,15 @@ def _list_videos(
         files = [p for p in files if _file_size(str(p)) >= min_bytes]
 
     if sort_mode == "mtime":
+        # Newest first (latest → oldest) so batch chunks start with fresh work
+        files.sort(
+            key=lambda p: (
+                -(p.stat().st_mtime if p.exists() else 0),
+                p.name.lower(),
+            )
+        )
+    elif sort_mode == "mtime_asc":
+        # Oldest first (legacy)
         files.sort(key=lambda p: (p.stat().st_mtime if p.exists() else 0, p.name.lower()))
     elif sort_mode == "size":
         files.sort(key=lambda p: (_file_size(str(p)), p.name.lower()))
@@ -527,7 +536,7 @@ class BatchQueueManager:
         *,
         recursive: bool = False,
         min_bytes: int = 0,
-        sort_mode: str = "name",
+        sort_mode: str = "mtime",
         validate: bool = True,
     ) -> Dict[str, Any]:
         source_folder = os.path.normpath(str(source_folder).strip())
@@ -538,7 +547,7 @@ class BatchQueueManager:
         target_stage = int(target_stage or 1)
         if target_stage not in (1, 2, 3):
             target_stage = 1
-        sort_mode = sort_mode if sort_mode in ("name", "mtime", "size") else "name"
+        sort_mode = sort_mode if sort_mode in ("name", "mtime", "mtime_asc", "size") else "mtime"
 
         sources = _list_videos(
             source_folder,

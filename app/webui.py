@@ -138,12 +138,12 @@ TIPS = {
         "turning off is only for short tiny-mode tests."
     ),
     "tile_size": (
-        "Tile Size — default 256 for RTX 4090 clarity profile: pairs with 1024px input so VAE decode stays under 24GB. "
-        "320 caused OOM on tall 4× outputs (e.g. 3072×4608). Raise to 320 only for short landscape clips with free VRAM ≥14GB."
+        "Tile Size — default 320. Larger tiles = fewer seams / more detail per tile; uses more VRAM. "
+        "If OOM on tall 4× outputs, drop to 256 or lower. Must keep overlap < half of tile size."
     ),
     "tile_overlap": (
-        "Tile Overlap — default 48 (was 40). Higher reduces visible tile seams that look like 'soft' quality loss. "
-        "Must stay < half of tile size (e.g. tile 256 → overlap ≤128). 48 is the clarity default on 4090."
+        "Tile Overlap — default 32. Softens tile seams without eating too much of each tile. "
+        "Must stay < half of tile size (e.g. tile 320 → overlap ≤160). Raise to 48 if you see soft grid seams."
     ),
     "enable_chunks": (
         "Process as Chunks — ON (default). Splits long videos into segments so 64GB system RAM and 24GB VRAM stay healthy. "
@@ -172,17 +172,16 @@ TIPS = {
         "do not eat disk space or confuse the pipeline. Safe to leave on with 64GB RAM."
     ),
     "sparse_ratio": (
-        "Sparse Ratio — attention sparsity. 1.2 (clarity default) keeps more detail than 1.5. "
-        "Lower (1.0) = denser attention / more detail (slower). Higher (1.5–2.0) = faster batch throughput. "
-        "If output flickers, try 1.3–1.5; for hero stills/short clips use 1.0–1.2."
+        "Sparse Ratio — attention sparsity. Default 1.0 = densest attention / max detail (slower). "
+        "Higher (1.2–2.0) = faster batch throughput, slightly softer. If output flickers, try 1.2–1.5."
     ),
     "local_range": (
-        "Local Range — temporal attention window (odd values). 11 (default) = smoother temporal stability. "
-        "9 = slightly sharper / more temporal risk. Leave 11 for most upscales."
+        "Local Range — temporal attention window (odd values). Default 7 = sharper temporal response. "
+        "Raise to 9–11 for smoother temporal stability on motion-heavy clips."
     ),
     "quality": (
-        "Output Video Quality — encode quality slider (1–10). Default 9 keeps more fine detail for CIV/export (7 looked soft). "
-        "8–10 = near-lossless but very large files on 4K-class outputs. 5 = smaller previews."
+        "Output Video Quality — encode quality slider (1–10). Default 9 keeps fine detail for CIV/export. "
+        "8–10 = near-lossless but large files on 4K-class outputs. 5–7 = smaller previews / drafts."
     ),
     "kv_ratio": (
         "KV Cache Ratio — temporal consistency vs VRAM. 3 (default) is optimal on 24GB. "
@@ -590,19 +589,18 @@ def get_ui_defaults(config=None):
     """Load UI control defaults from webui_config."""
     if config is None:
         config = load_config()
-    # Fallbacks: RTX 4090 clarity profile (higher input res + safer tiles).
-    # Quality loss was mostly from pre-downscale 768 + encode 7; OOM was tile 320 on tall 4×.
+    # Fallbacks when webui_config key is missing (user profile defaults).
     specs = {
         "chunk_duration": (10.0, float),
         "enable_chunks": (True, bool),
         "tiled_dit": (True, bool),
         "tiled_vae": (True, bool),
         "unload_dit": (True, bool),
-        "tile_size": (256, int),
-        "tile_overlap": (48, int),
+        "tile_size": (320, int),
+        "tile_overlap": (32, int),
         "attention_mode": ("sage", str),
-        "sparse_ratio": (1.2, float),
-        "local_range": (11, int),
+        "sparse_ratio": (1.0, float),
+        "local_range": (7, int),
         "kv_ratio": (3, int),
         "quality": (9, int),
         "randomize_seed": (False, bool),
@@ -6083,10 +6081,10 @@ def create_ui():
                                 info="_1 upscale · _2 RIFE · _3 export",
                             )
                             bq_sort_mode = gr.Dropdown(
-                                choices=["name", "mtime", "size"],
-                                value="name",
+                                choices=["mtime", "mtime_asc", "name", "size"],
+                                value="mtime",
                                 label="Source sort",
-                                info="Order files enter chunks.",
+                                info="mtime = newest first (recommended). mtime_asc = oldest first. name / size = alphabetical or size.",
                             )
                             bq_link_mode = gr.Dropdown(
                                 choices=["auto", "hardlink", "symlink", "copy"],

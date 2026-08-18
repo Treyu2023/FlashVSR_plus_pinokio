@@ -42,6 +42,7 @@ from toolbox.batch_queue import (
     write_batch_inputs_list,
 )
 from flashvsr_work_queue import FlashVSRWorkQueue, ExclusiveQueueLock, VIDEO_EXTS, IMAGE_EXTS
+import group_therapy as gt
 from naming_utils import (
     upscale_video_filename,
     upscale_image_filename,
@@ -271,6 +272,12 @@ TIPS = {
     "batch_upscale_handoff_dir": "Step 3 — where upscaled VIDEOS are saved (Ready for Toolbox).",
     "img_upscale_handoff_dir": "Step 4 — where upscaled IMAGES are saved (skip Toolbox → Ready for CIV\\images).",
     "tb_inbox_folder": "Step 5 — Toolbox watches / picks from here (usually same as Step 3).",
+    "gt_group_size": (
+        "Group Therapy size — how many originals go through one full pipeline pass "
+        "before the next group starts. 10 = 10 upscale → 10 RIFE → 10 RIFE → 10 export."
+    ),
+    "gt_before_dir": "Before / pairing folder — originals land here after a Group Therapy file finishes.",
+    "gt_after_dir": "After / matching folder — finals land here (usually Ready for CIV).",
     "folder_path": "Folder of videos/images for batch. Use absolute Windows paths (e.g. D:\\clips\\batch).",
     "img_quality": "Still image encode quality. Higher = larger files. 7 default matches video profile.",
     "img_fps": "Unused for still images (placeholder control shared with video advanced block).",
@@ -640,6 +647,19 @@ def get_ui_defaults(config=None):
         # Quality-first toolbox export (slower encode, sharper finals)
         "tb_export_preset": ("slow", str),
         "tb_prefer_nvenc": (True, bool),
+        "gt_group_size": (10, int),
+        "gt_do_upscale": (True, bool),
+        "gt_do_rife1": (True, bool),
+        "gt_do_rife2": (True, bool),
+        "gt_do_export": (True, bool),
+        "gt_before_dir": (
+            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
+            str,
+        ),
+        "gt_after_dir": (
+            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV",
+            str,
+        ),
     }
     defaults = {}
     for key, (fallback, typ) in specs.items():
@@ -723,6 +743,21 @@ def parse_batch_resize_preset(preset, scale=None):
     except (TypeError, ValueError):
         # Unknown label → safe default
         return "4k_safe", None
+
+
+PIPELINE_MODES = ("tiny", "full", "tiny-long")
+
+
+def normalize_pipeline_mode(mode, default="tiny"):
+    """
+    FlashVSR inference mode only. Never reuse this name for batch-resize
+    presets (4k_safe / width) — those are a different 'mode' and will load
+    the tiny-long writer with output_path=None (imageio URI error).
+    """
+    m = str(mode or "").strip().lower()
+    if m in PIPELINE_MODES:
+        return m
+    return default
 
 
 def apply_batch_resize_preset(video_path, batch_resize_preset, scale=None, progress=None):
@@ -1321,6 +1356,14 @@ def clear_temp_files():
 
 def init_pipeline(mode, device, dtype, model_version="v1.0"):
     """Initialize FlashVSR pipeline with specified model version (v1.0 or v1.1)."""
+    resolved = normalize_pipeline_mode(mode)
+    if resolved != str(mode or "").strip().lower():
+        log(
+            f"[FlashVSR] Invalid pipeline mode {mode!r} — using {resolved!r} "
+            f"(resize presets like 4k_safe are not pipeline modes)",
+            message_type="warning",
+        )
+    mode = resolved
     model_download(model_version=model_version)
     
     # Select model path and projection class based on version
@@ -1532,6 +1575,7 @@ def run_flashvsr_single(
     if not input_path:
         log("No input video provided.", message_type='warning')
         return None, None, None
+    mode = normalize_pipeline_mode(mode)
 
     # --- Parameter Preparation ---
     dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16}; dtype = dtype_map.get(dtype_str, torch.bfloat16)
@@ -2154,14 +2198,16 @@ def run_flashvsr_batch_image(
             log(f"\n--- Processing image {i+1}/{total_images}: {os.path.basename(image_path)} ---", message_type='info')
             batch_messages.append(f"\n--- Image {i+1}/{total_images}: {os.path.basename(image_path)} ---")
             
-            # Apply batch resize if preset is selected (4K-safe or width cap)
+            # Apply batch resize if preset is selected (4K-safe or width cap).
+            # Do NOT reuse the pipeline `mode` name — that used to pass "4k_safe"
+            # into run_flashvsr_image and imageio died with "URI: None".
             processed_image_path = image_path
-            mode, max_width = parse_batch_resize_preset(batch_resize_preset, scale=get_ui_defaults().get("scale", 4))
-            if mode != "none":
+            resize_mode, max_width = parse_batch_resize_preset(batch_resize_preset, scale=get_ui_defaults().get("scale", 4))
+            if resize_mode != "none":
                 current_width, current_height = get_image_dimensions(image_path)
                 sc = int(get_ui_defaults().get("scale", 4) or 4)
                 nw, nh, will = calculate_resize_dimensions(
-                    current_width, current_height, max_width=max_width, scale=sc, mode=mode
+                    current_width, current_height, max_width=max_width, scale=sc, mode=resize_mode
                 )
                 if will:
                     log(
@@ -2179,7 +2225,7 @@ def run_flashvsr_batch_image(
                             pass
 
                     processed_image_path = resize_input_image(
-                        image_path, max_width, scale=sc, progress=DummyProgress(), mode=mode
+                        image_path, max_width, scale=sc, progress=DummyProgress(), mode=resize_mode
                     )
                 else:
                     log(
@@ -2278,6 +2324,7 @@ def run_flashvsr_image(
     if not image_path:
         log("No input image provided.", message_type='warning')
         return None, None, None, gr.update(visible=False)
+    mode = normalize_pipeline_mode(mode)
     
     temp_frames_dir = None
     try:
@@ -2689,6 +2736,10 @@ def get_toolbox_work_queue() -> FlashVSRWorkQueue:
     )
 
 
+def get_group_therapy_queue() -> FlashVSRWorkQueue:
+    return gt.get_queue(ROOT_DIR)
+
+
 def get_exclusive_queue_lock() -> ExclusiveQueueLock:
     return ExclusiveQueueLock(ROOT_DIR)
 
@@ -2696,6 +2747,520 @@ def get_exclusive_queue_lock() -> ExclusiveQueueLock:
 def _queue_busy_html(wq: FlashVSRWorkQueue, message: str) -> str:
     """Status panel when another queue owns the exclusive lock."""
     return wq.status_html(message) + get_exclusive_queue_lock().status_html_snippet()
+
+
+class _DummyProgress:
+    def __call__(self, *args, **kwargs):
+        pass
+
+    def tqdm(self, iterable, *args, **kwargs):
+        return iterable
+
+
+def _gt_upscale_one(video_path, *, mode, model_version, scale, color_fix, tiled_vae,
+                    tiled_dit, tile_size, tile_overlap, unload_dit, dtype_str, seed,
+                    device, fps_override, quality, attention_mode, sparse_ratio,
+                    kv_ratio, local_range, batch_resize_preset, enable_chunks,
+                    chunk_duration):
+    """Run FlashVSR on one file. Returns (output_path, resized_path_or_none)."""
+    resized_path = apply_batch_resize_preset(
+        video_path, batch_resize_preset, scale=scale, progress=_DummyProgress()
+    )
+    process_path = resized_path or video_path
+    extra_resized = resized_path if resized_path and os.path.normcase(
+        os.path.abspath(resized_path)
+    ) != os.path.normcase(os.path.abspath(video_path)) else None
+    if enable_chunks:
+        out, _, _, _ = process_video_with_chunks(
+            input_path=process_path,
+            chunk_duration=chunk_duration,
+            mode=mode,
+            model_version=model_version,
+            scale=scale,
+            color_fix=color_fix,
+            tiled_vae=tiled_vae,
+            tiled_dit=tiled_dit,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+            unload_dit=unload_dit,
+            dtype_str=dtype_str,
+            seed=seed,
+            device=device,
+            fps_override=fps_override,
+            quality=quality,
+            attention_mode=attention_mode,
+            sparse_ratio=sparse_ratio,
+            kv_ratio=kv_ratio,
+            local_range=local_range,
+            autosave=False,
+            progress=_DummyProgress(),
+        )
+    else:
+        out, _, _, _ = run_flashvsr_single(
+            input_path=process_path,
+            mode=mode,
+            model_version=model_version,
+            scale=scale,
+            color_fix=color_fix,
+            tiled_vae=tiled_vae,
+            tiled_dit=tiled_dit,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+            unload_dit=unload_dit,
+            dtype_str=dtype_str,
+            seed=seed,
+            device=device,
+            fps_override=fps_override,
+            quality=quality,
+            attention_mode=attention_mode,
+            sparse_ratio=sparse_ratio,
+            kv_ratio=kv_ratio,
+            local_range=local_range,
+            autosave=False,
+            progress=_DummyProgress(),
+        )
+    return out, extra_resized
+
+
+def _gt_rife_one(src_path, *, frames_q, use_streaming):
+    global toolbox_processor
+    if toolbox_processor is None:
+        toolbox_processor = ToolboxProcessor(True)
+    return toolbox_processor.adjust_frames(
+        src_path,
+        fps_mode="2x Frames",
+        speed_factor=1.0,
+        use_streaming=use_streaming,
+        output_quality=frames_q,
+        progress=_DummyProgress(),
+    )
+
+
+def _gt_export_one(src_path, *, export_q, export_w, after_dir, export_preset, prefer_nvenc):
+    global toolbox_processor
+    if toolbox_processor is None:
+        toolbox_processor = ToolboxProcessor(True)
+    toolbox_processor.output_dir = Path(after_dir)
+    toolbox_processor.autosave_enabled = True
+    toolbox_processor.export_preset = export_preset
+    toolbox_processor.prefer_nvenc = prefer_nvenc
+    return toolbox_processor.export_video(
+        src_path,
+        export_format="MP4 (H.264)",
+        quality=export_q,
+        max_width=export_w,
+        output_name="",
+        two_pass=False,
+        progress=_DummyProgress(),
+    )
+
+
+def _gt_copy_into(src_path, dest_dir):
+    if not src_path or not os.path.isfile(src_path):
+        return None
+    dest = unique_dest_path(dest_dir, os.path.basename(src_path))
+    if os.path.normcase(os.path.abspath(src_path)) != os.path.normcase(os.path.abspath(dest)):
+        shutil.copy2(src_path, dest)
+    return dest
+
+
+def run_group_therapy(
+    mode,
+    model_version,
+    scale,
+    color_fix,
+    tiled_vae,
+    tiled_dit,
+    tile_size,
+    tile_overlap,
+    unload_dit,
+    dtype_str,
+    seed,
+    device,
+    fps_override,
+    quality,
+    attention_mode,
+    sparse_ratio,
+    kv_ratio,
+    local_range,
+    batch_resize_preset,
+    enable_chunks,
+    chunk_duration,
+    group_size,
+    watch_folder,
+    before_dir,
+    after_dir,
+    do_upscale,
+    do_rife1,
+    do_rife2,
+    do_export,
+    progress=gr.Progress(track_tqdm=True),
+):
+    wq = get_group_therapy_queue()
+    lock = get_exclusive_queue_lock()
+    ok, lock_msg = lock.try_acquire("group")
+    if not ok:
+        log(lock_msg, message_type="warning")
+        return None, _queue_busy_html(wq, lock_msg)
+    try:
+        return _run_group_therapy_body(
+            wq,
+            mode=mode,
+            model_version=model_version,
+            scale=scale,
+            color_fix=color_fix,
+            tiled_vae=tiled_vae,
+            tiled_dit=tiled_dit,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+            unload_dit=unload_dit,
+            dtype_str=dtype_str,
+            seed=seed,
+            device=device,
+            fps_override=fps_override,
+            quality=quality,
+            attention_mode=attention_mode,
+            sparse_ratio=sparse_ratio,
+            kv_ratio=kv_ratio,
+            local_range=local_range,
+            batch_resize_preset=batch_resize_preset,
+            enable_chunks=enable_chunks,
+            chunk_duration=chunk_duration,
+            group_size=group_size,
+            watch_folder=watch_folder,
+            before_dir=before_dir,
+            after_dir=after_dir,
+            do_upscale=do_upscale,
+            do_rife1=do_rife1,
+            do_rife2=do_rife2,
+            do_export=do_export,
+            progress=progress,
+        )
+    finally:
+        lock.release("group")
+
+
+def _run_group_therapy_body(
+    wq,
+    *,
+    mode,
+    model_version,
+    scale,
+    color_fix,
+    tiled_vae,
+    tiled_dit,
+    tile_size,
+    tile_overlap,
+    unload_dit,
+    dtype_str,
+    seed,
+    device,
+    fps_override,
+    quality,
+    attention_mode,
+    sparse_ratio,
+    kv_ratio,
+    local_range,
+    batch_resize_preset,
+    enable_chunks,
+    chunk_duration,
+    group_size,
+    watch_folder,
+    before_dir,
+    after_dir,
+    do_upscale,
+    do_rife1,
+    do_rife2,
+    do_export,
+    progress,
+):
+    global toolbox_processor
+    wq.clear_stop()
+    ui = get_ui_defaults()
+    paths = ensure_workflow_dirs(ui)
+    watch_folder = (watch_folder or ui.get("batch_watch_folder") or paths.get("watch") or "").strip()
+    before_dir = (before_dir or ui.get("gt_before_dir") or ui.get("batch_source_archive_dir") or paths["pre_scaled"]).strip()
+    after_dir = (after_dir or ui.get("gt_after_dir") or get_toolbox_output_dir()).strip()
+    group_size = max(1, int(group_size or ui.get("gt_group_size") or 10))
+    stages = gt.selected_stages(
+        do_upscale=bool(do_upscale),
+        do_rife1=bool(do_rife1),
+        do_rife2=bool(do_rife2),
+        do_export=bool(do_export),
+    )
+    last_stage = stages[-1]
+    frames_q = int(ui.get("tb_frames_quality") or 98)
+    export_q = int(ui.get("tb_export_quality") or 96)
+    export_w = int(ui.get("tb_export_max_width") or 3840)
+    use_streaming = True if ui.get("tb_use_streaming") is None else bool(ui.get("tb_use_streaming"))
+    export_preset = (ui.get("tb_export_preset") or "slow").strip().lower()
+    prefer_nvenc = True if ui.get("tb_prefer_nvenc") is None else bool(ui.get("tb_prefer_nvenc"))
+
+    if toolbox_processor is None:
+        toolbox_processor = ToolboxProcessor(True)
+    toolbox_processor.output_dir = Path(after_dir)
+    toolbox_processor.autosave_enabled = True
+    toolbox_processor.export_preset = export_preset
+    toolbox_processor.prefer_nvenc = prefer_nvenc
+
+    cfg = load_config()
+    if watch_folder:
+        cfg["batch_watch_folder"] = watch_folder
+    cfg["gt_group_size"] = group_size
+    cfg["gt_before_dir"] = before_dir
+    cfg["gt_after_dir"] = after_dir
+    cfg["gt_do_upscale"] = bool(do_upscale)
+    cfg["gt_do_rife1"] = bool(do_rife1)
+    cfg["gt_do_rife2"] = bool(do_rife2)
+    cfg["gt_do_export"] = bool(do_export)
+    save_config(cfg)
+
+    os.makedirs(before_dir, exist_ok=True)
+    os.makedirs(after_dir, exist_ok=True)
+
+    if watch_folder and os.path.isdir(watch_folder):
+        added, skipped = wq.add_folder(watch_folder)
+        if added:
+            log(f"Group Therapy: added {added} from {watch_folder}", message_type="info")
+        elif not skipped:
+            log(f"Group Therapy: no new videos in {watch_folder}", message_type="info")
+
+    stuck = wq.reset_stuck_running()
+    if stuck:
+        log(f"Re-queued {stuck} stuck Group Therapy job(s)", message_type="info")
+    wq.requeue_failed()
+    gt.assign_groups(wq, group_size)
+    wq.set_fixed_completed_dir(after_dir)
+    wq.set_meta(
+        gt_group_size=group_size,
+        gt_before_dir=before_dir,
+        gt_after_dir=after_dir,
+        gt_stages=",".join(stages),
+    )
+
+    items = [it for it in wq.all_items() if it.get("status") != "done"]
+    groups = gt.ordered_groups(items)
+    if not groups:
+        note = f"Group Therapy empty — drop videos in {watch_folder or 'the original folder'}."
+        return None, wq.status_html(note)
+
+    log(
+        f"Group Therapy: {len(groups)} group(s) × {group_size}  "
+        f"stages={' → '.join(gt.STAGE_LABELS[s] for s in stages)}  "
+        f"before={before_dir}  after={after_dir}",
+        message_type="info",
+    )
+
+    last_output = None
+    finished = 0
+    failed = 0
+
+    def _settle_item(item):
+        nonlocal last_output, finished
+        path = item["path"]
+        fresh = next((x for x in wq.all_items() if os.path.normcase(x.get("path", "")) == os.path.normcase(path)), item)
+        stem = Path(path).stem
+        extras = gt.collect_temp_globs(
+            stem,
+            TEMP_DIR,
+            str(gt.work_root(ROOT_DIR)),
+            str(gt.stage_dir(ROOT_DIR, "upscale")),
+            str(gt.stage_dir(ROOT_DIR, "rife1")),
+            str(gt.stage_dir(ROOT_DIR, "rife2")),
+            os.path.join(TEMP_DIR, "toolbox"),
+        )
+        try:
+            before_p, after_p, deleted = gt.settle_pair(
+                fresh, before_dir=before_dir, after_dir=after_dir, extra_temps=extras
+            )
+        except Exception as e:
+            log(f"Settle skipped for {os.path.basename(path)}: {e}", message_type="warning")
+            return
+        wq.update_item(
+            path,
+            gt_original=before_p,
+            gt_export=after_p,
+            gt_before=before_p,
+            gt_after=after_p,
+        )
+        wq.set_item_status(path, "done", output=after_p)
+        last_output = after_p
+        finished += 1
+        log(
+            f"🧹 Kept original + final only ({deleted} temps deleted)\n"
+            f"   before: {before_p}\n   after:  {after_p}",
+            message_type="finish",
+        )
+
+    for g_i, gid in enumerate(groups):
+        members = [m for m in gt.group_members(wq.all_items(), gid) if m.get("status") != "done"]
+        if not members:
+            continue
+        log(
+            f"\n══ Group {gid} ({g_i + 1}/{len(groups)}) — {len(members)} file(s) ══",
+            message_type="info",
+        )
+        wq.set_meta(gt_current_group=gid)
+
+        for stage in stages:
+            wq.set_meta(gt_current_stage=stage)
+            label = gt.STAGE_LABELS.get(stage, stage)
+            log(f"— Group {gid}: {label} ({len(members)} files) —", message_type="info")
+            if stage in ("rife1", "rife2", "export"):
+                release_processing_vram()
+
+            for f_i, item in enumerate(list(members)):
+                path = item["path"]
+                if not os.path.isfile(path):
+                    relocated = find_relocated_source(path, watch_folder, before_dir)
+                    if relocated:
+                        wq.set_item_status(path, item.get("status") or "pending", new_path=relocated)
+                        path = relocated
+                        item["path"] = path
+                    else:
+                        # maybe already archived and later stages have intermediates
+                        if not gt.input_for_stage(item, stage):
+                            log(f"Missing source, skip: {os.path.basename(item.get('path') or '')}", message_type="warning")
+                            continue
+
+                # refresh item
+                item = next(
+                    (x for x in wq.all_items() if os.path.normcase(x.get("path", "")) == os.path.normcase(path)),
+                    item,
+                )
+                if item.get("status") == "done":
+                    continue
+                if gt.stage_already_done(item, stage):
+                    log(f"  skip {label} (already have output): {os.path.basename(path)}", message_type="info")
+                    if stage == last_stage:
+                        _settle_item(item)
+                    continue
+
+                src = gt.input_for_stage(item, stage)
+                if not src:
+                    log(f"❌ No input for {label}: {os.path.basename(path)}", message_type="error")
+                    wq.set_item_status(path, "failed", error=f"no input for {stage}")
+                    failed += 1
+                    continue
+
+                progress(
+                    (g_i + (stages.index(stage) + (f_i / max(len(members), 1))) / max(len(stages), 1)) / max(len(groups), 1),
+                    desc=f"Group {gid} · {label} · {f_i + 1}/{len(members)} · {os.path.basename(path)}",
+                )
+                wq.set_item_status(path, "running")
+                wq.update_item(path, gt_stage=stage, gt_group=gid)
+                if not item.get("gt_original"):
+                    wq.update_item(path, gt_original=path)
+
+                try:
+                    if stage == "upscale":
+                        out, resized = _gt_upscale_one(
+                            src,
+                            mode=mode,
+                            model_version=model_version,
+                            scale=scale,
+                            color_fix=color_fix,
+                            tiled_vae=tiled_vae,
+                            tiled_dit=tiled_dit,
+                            tile_size=tile_size,
+                            tile_overlap=tile_overlap,
+                            unload_dit=unload_dit,
+                            dtype_str=dtype_str,
+                            seed=seed,
+                            device=device,
+                            fps_override=fps_override,
+                            quality=quality,
+                            attention_mode=attention_mode,
+                            sparse_ratio=sparse_ratio,
+                            kv_ratio=kv_ratio,
+                            local_range=local_range,
+                            batch_resize_preset=batch_resize_preset,
+                            enable_chunks=enable_chunks,
+                            chunk_duration=chunk_duration,
+                        )
+                        if not out or not os.path.isfile(out):
+                            raise RuntimeError("upscale produced no file")
+                        kept = _gt_copy_into(out, str(gt.stage_dir(ROOT_DIR, "upscale")))
+                        wq.update_item(path, gt_upscale=kept or out, gt_resized=resized, gt_stage="upscale")
+                        log(f"✅ Upscale → {kept or out}", message_type="finish")
+                    elif stage in ("rife1", "rife2"):
+                        out = _gt_rife_one(src, frames_q=frames_q, use_streaming=use_streaming)
+                        if not out or not os.path.isfile(out):
+                            raise RuntimeError(f"{stage} produced no file")
+                        kept = _gt_copy_into(out, str(gt.stage_dir(ROOT_DIR, stage)))
+                        field = "gt_rife1" if stage == "rife1" else "gt_rife2"
+                        wq.update_item(path, **{field: kept or out, "gt_stage": stage})
+                        log(f"✅ {label} → {kept or out}", message_type="finish")
+                    elif stage == "export":
+                        out = _gt_export_one(
+                            src,
+                            export_q=export_q,
+                            export_w=export_w,
+                            after_dir=after_dir,
+                            export_preset=export_preset,
+                            prefer_nvenc=prefer_nvenc,
+                        )
+                        if not out or not os.path.isfile(out):
+                            raise RuntimeError("export produced no file")
+                        try:
+                            out = rename_to_step2(
+                                out,
+                                source_stem=Path(src).stem,
+                                fps=None,
+                                ext=Path(out).suffix or ".mp4",
+                            )
+                        except Exception:
+                            pass
+                        wq.update_item(path, gt_export=out, gt_stage="export")
+                        log(f"✅ Export → {out}", message_type="finish")
+
+                    wq.set_item_status(path, "pending")
+                    if stage == last_stage:
+                        _settle_item(item)
+                except Exception as e:
+                    log(f"❌ Group {gid} {label} error: {e}", message_type="error")
+                    wq.set_item_status(path, "failed", error=str(e))
+                    failed += 1
+                    if is_cuda_oom(e) or cuda_context_poisoned(min_free_mb=1500):
+                        note = (
+                            f"⚠️ Group Therapy paused on OOM at group {gid} ({label}). "
+                            "Restart FlashVSR, then Start / Resume."
+                        )
+                        log(note, message_type="error")
+                        return last_output, wq.status_html(note)
+                finally:
+                    if stage == "upscale":
+                        release_processing_vram()
+                    try:
+                        if toolbox_processor and getattr(toolbox_processor, "rife_handler", None) and stage.startswith("rife"):
+                            if f_i == len(members) - 1:
+                                toolbox_processor.rife_handler.unload_model()
+                    except Exception:
+                        pass
+
+                if wq.stop_requested():
+                    wq.clear_stop()
+                    note = (
+                        f"⏹ Stopped after group {gid} · {label} · "
+                        f"{os.path.basename(path)}. {finished} settled this run."
+                    )
+                    log(note, message_type="warning")
+                    return last_output, wq.status_html(note)
+
+            # refresh members after a stage
+            members = [m for m in gt.group_members(wq.all_items(), gid) if m.get("status") != "done"]
+
+        log(f"══ Group {gid} complete ══", message_type="finish")
+
+    remaining = len(wq.pending_items())
+    note = (
+        f"✅ Group Therapy done — {finished} settled (original + final only) → {after_dir}"
+        if remaining == 0
+        else f"Pass done ({finished} settled, {failed} failed, {remaining} pending)."
+    )
+    progress(1.0, desc=note)
+    wq.set_meta(gt_current_stage="idle")
+    return last_output, wq.status_html(note)
 
 
 def ensure_workflow_dirs(ui: Optional[dict] = None) -> dict:
@@ -3124,10 +3689,11 @@ def _run_flashvsr_work_queue_body(
         requeue_failed=True,
         remove_missing=False,
     )
-    if pf.get("dupes") or pf.get("completed_removed") or pf.get("failed_requeued"):
+    if pf.get("dupes") or pf.get("size_dupes") or pf.get("completed_removed") or pf.get("failed_requeued"):
         log(
             "🧹 Step 1 preflight: "
-            f"{pf.get('dupes', 0)} duplicate(s) removed (kept 1), "
+            f"{pf.get('dupes', 0)} path duplicate(s) removed, "
+            f"{pf.get('size_dupes', 0)} same-size duplicate(s) skipped, "
             f"{pf.get('completed_removed', 0)} already-complete removed from queue, "
             f"{pf.get('failed_requeued', 0)} failed re-queued · "
             f"{pf.get('pending', 0)} pending left",
@@ -3473,10 +4039,11 @@ def _run_flashvsr_image_work_queue_body(
         requeue_failed=True,
         remove_missing=False,
     )
-    if pf.get("dupes") or pf.get("completed_removed") or pf.get("failed_requeued"):
+    if pf.get("dupes") or pf.get("size_dupes") or pf.get("completed_removed") or pf.get("failed_requeued"):
         log(
             "🧹 Image queue preflight: "
-            f"{pf.get('dupes', 0)} duplicate(s) removed, "
+            f"{pf.get('dupes', 0)} path duplicate(s) removed, "
+            f"{pf.get('size_dupes', 0)} same-size duplicate(s) skipped, "
             f"{pf.get('completed_removed', 0)} already-complete removed, "
             f"{pf.get('failed_requeued', 0)} failed re-queued · "
             f"{pf.get('pending', 0)} pending left",
@@ -3530,11 +4097,12 @@ def _run_flashvsr_image_work_queue_body(
                     return iterable
 
             proc = image_path
-            mode, max_width = parse_batch_resize_preset(batch_resize_preset, scale=scale)
-            if mode != "none":
+            # Resize preset mode is NOT the FlashVSR pipeline mode.
+            resize_mode, max_width = parse_batch_resize_preset(batch_resize_preset, scale=scale)
+            if resize_mode != "none":
                 cw, ch = get_image_dimensions(image_path)
                 nw, nh, will = calculate_resize_dimensions(
-                    cw, ch, max_width=max_width, scale=scale, mode=mode
+                    cw, ch, max_width=max_width, scale=scale, mode=resize_mode
                 )
                 if will:
                     proc = resize_input_image(
@@ -3542,7 +4110,7 @@ def _run_flashvsr_image_work_queue_body(
                         max_width,
                         scale=scale,
                         progress=DummyProgress(),
-                        mode=mode,
+                        mode=resize_mode,
                     )
                     log(
                         f"Image resize {cw}×{ch} → {nw}×{nh} "
@@ -5344,6 +5912,60 @@ def create_ui():
                                     batch_requeue_failed_btn = gr.Button("↺ Re-queue Failed", size="sm")
                                     batch_clear_done_btn = gr.Button("Clear Done", size="sm")
                                     batch_clear_all_btn = gr.Button("Clear Entire Queue", size="sm", variant="stop")
+
+                            with gr.TabItem("Group Therapy"):
+                                gr.Markdown(
+                                    "**Group Therapy** — take **N** files from the original folder, "
+                                    "run that group **start to finish** (upscale → RIFE → RIFE → export), "
+                                    "then the next N.\n\n"
+                                    "After each file finishes: **keep only the original + the end file**. "
+                                    "Everything else (resized, `_Upscaled`, RIFE temps) is deleted. "
+                                    "Originals go to the **Before / pairing** folder; finals go to the **After** folder."
+                                )
+                                gt_watch_folder = gr.Textbox(
+                                    value=ui.get("batch_watch_folder", r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS"),
+                                    label="Original folder (intake)",
+                                    info="Files are pulled from here in newest-first groups.",
+                                )
+                                gt_group_size = gr.Slider(
+                                    minimum=1,
+                                    maximum=50,
+                                    step=1,
+                                    value=int(ui.get("gt_group_size") or 10),
+                                    label="Group size",
+                                    info=TIPS["gt_group_size"],
+                                )
+                                with gr.Row():
+                                    gt_before_dir = gr.Textbox(
+                                        value=ui.get("gt_before_dir") or ui.get(
+                                            "batch_source_archive_dir",
+                                            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
+                                        ),
+                                        label="Before / pairing (originals)",
+                                        info=TIPS["gt_before_dir"],
+                                    )
+                                    gt_after_dir = gr.Textbox(
+                                        value=ui.get("gt_after_dir") or ui.get(
+                                            "toolbox_output_dir",
+                                            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV",
+                                        ),
+                                        label="After / matching (finals)",
+                                        info=TIPS["gt_after_dir"],
+                                    )
+                                gr.Markdown("Stages for each group (in order):")
+                                with gr.Row():
+                                    gt_do_upscale = gr.Checkbox(label="1 · Upscale", value=bool(ui.get("gt_do_upscale", True)))
+                                    gt_do_rife1 = gr.Checkbox(label="2 · RIFE 2×", value=bool(ui.get("gt_do_rife1", True)))
+                                    gt_do_rife2 = gr.Checkbox(label="3 · RIFE 2× again", value=bool(ui.get("gt_do_rife2", True)))
+                                    gt_do_export = gr.Checkbox(label="4 · Export / interpolation", value=bool(ui.get("gt_do_export", True)))
+                                gt_queue_status = gr.HTML(value=get_group_therapy_queue().status_html())
+                                with gr.Row():
+                                    gt_run_btn = gr.Button("▶️ Start / Resume Group Therapy", variant="primary", size="sm")
+                                    gt_stop_btn = gr.Button("⏹ Stop After Current", variant="stop", size="sm")
+                                with gr.Row():
+                                    gt_requeue_btn = gr.Button("↺ Re-queue Failed", size="sm")
+                                    gt_clear_done_btn = gr.Button("Clear Done", size="sm")
+                                    gt_clear_all_btn = gr.Button("Clear Entire Queue", size="sm", variant="stop")
                         
                         # Video Pre-Processing Accordion
                         with gr.Accordion("📊 Video Pre-Processing", open=False):
@@ -6695,6 +7317,76 @@ def create_ui():
             inputs=None,
             outputs=[save_status],
             show_progress="hidden"
+        )
+
+        def _gt_q_stop():
+            note = get_group_therapy_queue().request_stop()
+            log(note, message_type="warning")
+            return get_group_therapy_queue().status_html(note)
+
+        def _gt_q_clear_done():
+            n = get_group_therapy_queue().clear_done()
+            return get_group_therapy_queue().status_html(f"Cleared {n} completed item(s).")
+
+        def _gt_q_clear_all():
+            n = get_group_therapy_queue().clear_all()
+            return get_group_therapy_queue().status_html(f"Cleared entire queue ({n} items).")
+
+        def _gt_q_requeue():
+            n = get_group_therapy_queue().requeue_failed()
+            return get_group_therapy_queue().status_html(f"Re-queued {n} failed item(s).")
+
+        def handle_group_therapy(
+            mode, model_version, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap,
+            unload_dit, dtype_str, seed, device, fps_override, quality, attention_mode,
+            sparse_ratio, kv_ratio, local_range, batch_resize_preset, enable_chunks, chunk_duration,
+            group_size, watch_folder, before_dir, after_dir, do_upscale, do_rife1, do_rife2, do_export,
+        ):
+            last_video, queue_html = run_group_therapy(
+                mode, model_version, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap,
+                unload_dit, dtype_str, seed, device, fps_override, quality, attention_mode,
+                sparse_ratio, kv_ratio, local_range, batch_resize_preset, enable_chunks, chunk_duration,
+                group_size, watch_folder, before_dir, after_dir, do_upscale, do_rife1, do_rife2, do_export,
+            )
+            return last_video, last_video, None, queue_html, queue_html
+
+        gt_stop_btn.click(fn=_gt_q_stop, inputs=[], outputs=[gt_queue_status], queue=False)
+        gt_clear_done_btn.click(fn=_gt_q_clear_done, outputs=[gt_queue_status])
+        gt_clear_all_btn.click(fn=_gt_q_clear_all, outputs=[gt_queue_status])
+        gt_requeue_btn.click(fn=_gt_q_requeue, outputs=[gt_queue_status])
+        gt_run_btn.click(
+            fn=lambda: gr.update(visible=False),
+            inputs=[],
+            outputs=[video_output_analysis_html],
+        ).then(
+            fn=check_model_status,
+            inputs=[model_version_radio],
+            outputs=[save_status],
+        ).then(
+            fn=should_randomize_seed,
+            inputs=[seed_number, randomize_seed],
+            outputs=[seed_number],
+        ).then(
+            fn=handle_group_therapy,
+            inputs=[
+                mode_radio, model_version_radio, scale_slider, color_fix_checkbox, tiled_vae_checkbox,
+                tiled_dit_checkbox, tile_size_slider, tile_overlap_slider, unload_dit_checkbox,
+                dtype_radio, seed_number, device_textbox, fps_number, quality_slider, attention_mode_radio,
+                sparse_ratio_slider, kv_ratio_slider, local_range_slider, batch_resize_preset,
+                enable_chunk_processing, chunk_duration_slider,
+                gt_group_size, gt_watch_folder, gt_before_dir, gt_after_dir,
+                gt_do_upscale, gt_do_rife1, gt_do_rife2, gt_do_export,
+            ],
+            outputs=[video_output, output_file_path, video_slider_output, completion_status, gt_queue_status],
+        ).then(
+            fn=analyze_output_video,
+            inputs=[output_file_path],
+            outputs=[video_output_analysis_html],
+        ).then(
+            fn=lambda status_msg: status_msg,
+            inputs=[completion_status],
+            outputs=[save_status],
+            show_progress=False,
         )
 
         def update_monitor():

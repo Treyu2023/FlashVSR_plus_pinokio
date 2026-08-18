@@ -29,6 +29,7 @@ QUEUE_LABELS = {
     "video": "FlashVSR video queue",
     "image": "FlashVSR image queue",
     "toolbox": "Toolbox post-process queue",
+    "group": "Group Therapy",
 }
 
 
@@ -134,7 +135,7 @@ class ExclusiveQueueLock:
             return (
                 "<div style='margin-top:6px;font-size:0.85em;color:#86efac;"
                 "background:#14352a;border:1px solid #166534;padding:6px;border-radius:6px;'>"
-                "No queue running — you can start video, image, or toolbox.</div>"
+                "No queue running — you can start video, image, toolbox, or Group Therapy.</div>"
             )
         label = st.get("label") or st.get("queue") or "queue"
         return (
@@ -159,6 +160,31 @@ def _file_mtime(path: Any) -> float:
         return float(p.stat().st_mtime) if p.is_file() else 0.0
     except OSError:
         return 0.0
+
+
+def _file_size(path: Any) -> int:
+    """Best-effort size in bytes (missing files → 0). Size 0 is not a dupe key."""
+    try:
+        p = Path(path) if not isinstance(path, Path) else path
+        return int(p.stat().st_size) if p.is_file() else 0
+    except OSError:
+        return 0
+
+
+def _item_size(it: Dict[str, Any]) -> int:
+    """Cached size on the queue row, else live file size."""
+    try:
+        cached = it.get("size")
+        if cached is not None:
+            n = int(cached)
+            if n > 0:
+                return n
+    except (TypeError, ValueError):
+        pass
+    sz = _file_size(it.get("path") or "")
+    if sz > 0:
+        it["size"] = sz
+    return sz
 
 
 def _sort_paths_newest_first(paths: Sequence[Any]) -> List[Any]:
@@ -261,8 +287,14 @@ class FlashVSRWorkQueue:
             f"Batch/output: {data.get('batch_output_dir') or '(not started yet)'}",
             f"Completed: {data.get('completed_dir') or '—'}",
             f"Stop after current: {'YES' if self.stop_requested() else 'no'}",
-            "-" * 56,
         ]
+        if data.get("gt_current_stage") or data.get("gt_group_size"):
+            lines.append(
+                f"Group Therapy  size={data.get('gt_group_size') or '?'}  "
+                f"group={data.get('gt_current_group') or '-'}  "
+                f"stage={data.get('gt_current_stage') or '-'}"
+            )
+        lines.append("-" * 56)
         for i, it in enumerate(data.get("items") or []):
             mark = {
                 ST_DONE: "OK",
@@ -271,7 +303,12 @@ class FlashVSRWorkQueue:
                 ST_PENDING: "WAIT",
             }.get(it.get("status"), "?")
             name = Path(it.get("path", "")).name
-            lines.append(f"[{mark:4}] #{i + 1:03d} {name}")
+            gid = it.get("gt_group")
+            stage = it.get("gt_stage") or ""
+            extra = ""
+            if gid or stage:
+                extra = f"  G{gid or '?'} {stage}"
+            lines.append(f"[{mark:4}] #{i + 1:03d}{extra}  {name}")
             if it.get("error"):
                 lines.append(f"         ERR: {it['error']}")
         try:
@@ -313,7 +350,13 @@ class FlashVSRWorkQueue:
 
     def add_paths(self, paths: Sequence[str]) -> Tuple[int, int]:
         data = self.load()
-        existing = {_norm(it["path"]) for it in data.get("items") or [] if it.get("path")}
+        items = data.setdefault("items", [])
+        existing = {_norm(it["path"]) for it in items if it.get("path")}
+        existing_sizes: Set[int] = set()
+        for it in items:
+            sz = _item_size(it)
+            if sz > 0:
+                existing_sizes.add(sz)
         added = 0
         skipped = 0
         for p in paths:
@@ -331,7 +374,12 @@ class FlashVSRWorkQueue:
             if key in existing:
                 skipped += 1
                 continue
-            data.setdefault("items", []).append(
+            sz = _file_size(ap)
+            if sz > 0 and sz in existing_sizes:
+                # Same byte length as a file already queued / done — skip the copy
+                skipped += 1
+                continue
+            items.append(
                 {
                     "path": ap,
                     "status": ST_PENDING,
@@ -339,9 +387,12 @@ class FlashVSRWorkQueue:
                     "error": None,
                     "added": _now_iso(),
                     "finished": None,
+                    "size": sz,
                 }
             )
             existing.add(key)
+            if sz > 0:
+                existing_sizes.add(sz)
             added += 1
         if added:
             self.save(data)
@@ -420,17 +471,19 @@ class FlashVSRWorkQueue:
 
         1. Drop already-done rows (and optional skip-complete via find_output)
         2. Dedupe by absolute path — keep one copy only (prefer running → pending)
-        3. Re-queue failed for retry
-        4. Refresh STATUS.txt
+        3. Dedupe by file size — same byte length = same work (renamed copies)
+        4. Re-queue failed for retry
+        5. Refresh STATUS.txt
 
         find_output(path) -> optional existing deliverable path in the output/handoff folder.
 
-        Returns stats: {dupes, completed_removed, failed_requeued, pending, total}
+        Returns stats: {dupes, size_dupes, completed_removed, failed_requeued, pending, total}
         """
         data = self.load()
         items: List[Dict[str, Any]] = list(data.get("items") or [])
         stats = {
             "dupes": 0,
+            "size_dupes": 0,
             "completed_removed": 0,
             "failed_requeued": 0,
             "missing_removed": 0,
@@ -478,15 +531,8 @@ class FlashVSRWorkQueue:
                     it["preflight_complete"] = _now_iso()
                     it["preflight_note"] = f"output already exists: {out}"
 
-        # --- drop completed rows from the queue ---
-        if remove_completed:
-            kept: List[Dict[str, Any]] = []
-            for it in items:
-                if it.get("status") == ST_DONE:
-                    stats["completed_removed"] += 1
-                    continue
-                kept.append(it)
-            items = kept
+        # Keep DONE rows until after size-dedupe so a finished file
+        # (or its renamed copy) is not processed again.
 
         # --- optional: drop rows whose source file is gone and not relocated ---
         if remove_missing:
@@ -518,6 +564,57 @@ class FlashVSRWorkQueue:
             # else keep the earlier entry (stable)
 
         items = [best[k] for k in order]
+
+        # --- dedupe by file size (renamed copies of the same download) ---
+        # Size 0 is ignored (incomplete / missing). If any row for a size is
+        # already done or running, drop the rest. Otherwise keep the newest.
+        by_size: Dict[int, List[Dict[str, Any]]] = {}
+        no_size: List[Dict[str, Any]] = []
+        for it in items:
+            sz = _item_size(it)
+            if sz <= 0:
+                no_size.append(it)
+                continue
+            by_size.setdefault(sz, []).append(it)
+
+        size_kept: List[Dict[str, Any]] = []
+        for sz, group in by_size.items():
+            if len(group) == 1:
+                size_kept.append(group[0])
+                continue
+            winner = None
+            for it in group:
+                st = it.get("status")
+                if st == ST_RUNNING:
+                    winner = it
+                    break
+            if winner is None:
+                for it in group:
+                    if it.get("status") == ST_DONE:
+                        winner = it
+                        break
+            if winner is None:
+                winner = max(
+                    group,
+                    key=lambda it: (
+                        0 if it.get("status") == ST_FAILED else 1,
+                        _file_mtime(it.get("path") or ""),
+                    ),
+                )
+            size_kept.append(winner)
+            stats["size_dupes"] += len(group) - 1
+
+        items = size_kept + no_size
+
+        # --- drop completed rows (after size-dedupe used them as winners) ---
+        if remove_completed:
+            kept = []
+            for it in items:
+                if it.get("status") == ST_DONE:
+                    stats["completed_removed"] += 1
+                    continue
+                kept.append(it)
+            items = kept
 
         # Newest source files first (mtime desc) so Start works latest → oldest
         running = [it for it in items if it.get("status") == ST_RUNNING]
@@ -633,6 +730,22 @@ class FlashVSRWorkQueue:
                 if status in (ST_DONE, ST_FAILED):
                     it["finished"] = _now_iso()
                 break
+        self.save(data)
+
+    def update_item(self, path: str, **fields: Any) -> None:
+        """Merge extra fields onto a queue row (Group Therapy stage paths, etc.)."""
+        data = self.load()
+        key = _norm(path)
+        for it in data.get("items") or []:
+            if _norm(it.get("path", "")) == key:
+                for k, v in fields.items():
+                    it[k] = v
+                break
+        self.save(data)
+
+    def set_meta(self, **fields: Any) -> None:
+        data = self.load()
+        data.update(fields)
         self.save(data)
 
     def reconcile_missing_sources(
@@ -851,9 +964,12 @@ class FlashVSRWorkQueue:
         current_line = ""
         if running:
             idx, total = self.index_of(running.get("path", ""))
+            stage = running.get("gt_stage") or data.get("gt_current_stage") or ""
+            gid = running.get("gt_group") or data.get("gt_current_group") or ""
+            extra = f" · G{gid} {stage}" if gid or stage else ""
             current_line = (
                 f"<div style='margin-top:6px;font-weight:600;color:#7dd3fc;'>"
-                f"▶ Now: <b>{idx}/{total}</b> — {Path(running.get('path','')).name}"
+                f"▶ Now: <b>{idx}/{total}</b>{extra} — {Path(running.get('path','')).name}"
                 f"</div>"
             )
 

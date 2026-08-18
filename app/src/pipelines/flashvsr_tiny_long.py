@@ -374,6 +374,11 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         # noise = noise.to(dtype=self.torch_dtype, device=self.device)
         latents = noise
         
+        if not output_path:
+            raise ValueError(
+                "tiny-long pipeline requires output_path; got None. "
+                "This usually means pipeline mode was overwritten by a resize preset (e.g. 4k_safe)."
+            )
         writer = imageio.get_writer(output_path, fps=fps, quality=quality)
 
         process_total_num = (num_frames - 1) // 8 - 2

@@ -1,6 +1,6 @@
 # FlashVSR+ Pinokio — Custom Configuration & Code Changes
 
-**Last updated:** 2026-07-07  
+**Last updated:** 2026-08-21  
 **Install path:** `C:\pinokio\api\FlashVSR_plus_pinokio.git\app`  
 **Purpose:** Persistent record of customizations applied outside stock FlashVSR (survives app rollback/reinstall). Re-apply or merge these after updating the Pinokio launcher.
 
@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-08-21 | **Preserve auto-reapply:** Update / Install / Start run `env_guard.py reapply`. Custom files (Group Therapy, PID pairing, toolbox FPS/no-video, 4K-safe, `webui_config`) are restored if a stock pull/clone overwrote them. Stale snapshots without current markers cannot clobber live code. |
 | 2026-08-21 | **Group Therapy pairing:** no per-file `GT-<id>__name` folders. Before/After stay flat; pair id is `_PID_xxxxxxxx` at the end of the filename plus Title metadata (`PID_xxxxxxxx`). Media Center tags are not touched. Retro flatten remaps existing GT folders into the `9xxxxxxx` band so they cannot collide with new auto batches. |
 | 2026-08-18 | **Group Therapy:** process originals in groups of N (upscale → RIFE 2× → RIFE 2× → export), then the next N. After each file: keep only original + final in the user Before/After pairing folders; delete resized/upscale/RIFE temps. Image-queue `4k_safe` no longer overwrites pipeline mode (imageio URI: None). |
 | 2026-08-13 | **4K-safe pre-downscale:** default `batch_resize_preset=4K-safe (auto)` — math so `(input × scale)` never exceeds UHD 4K: **3840×2160** (16:9) or **2160×3840** (9:16). At 4× that is max **960×540** / **540×960** (grid-aligned). Fixed px presets still clamp inside that box. |
@@ -32,11 +33,15 @@
 
 | File | Action |
 |------|--------|
-| `webui_config` | **Created** — user defaults (see below) |
+| `webui_config` | **Created** — user defaults (pipeline folders + Group Therapy) |
 | `naming_utils.py` | **Created** — output filename conventions |
-| `webui.py` | **Modified** — config loading, paths, naming, resize, settings UI |
-
-**Not modified:** `start.js`, pipeline/model code (`src/`), `toolbox/toolbox.py` (except reading toolbox path from config via `webui.py`).
+| `webui.py` | **Modified** — config, paths, Group Therapy, hygiene, 4K-safe, PID pairing |
+| `group_therapy.py` | **Created** — grouped pipeline + flat `_PID_` pairing |
+| `flashvsr_work_queue.py` | **Modified** — size-dedupe, Group Therapy status |
+| `toolbox/toolbox.py` | **Modified** — FPS cap, no-video probe, HighFPS skip |
+| `src/pipelines/flashvsr_tiny_long.py` | **Modified** — refuse `output_path=None` (4k_safe mode bug) |
+| `../scripts/env_guard.py` | **Modified** — snapshot + **reapply after Update/Install/Start** |
+| `../update.js` `../install.js` `../start.js` `../pinokio.js` | **Modified** — call reapply / preflight |
 
 ---
 
@@ -177,16 +182,23 @@ If OOM returns:
 
 ## After stock rollback / Pinokio update
 
-1. Copy or recreate `webui_config` (section above).
-2. Copy `naming_utils.py` into `app\`.
-3. Merge `webui.py` changes (or restore from backup/git diff). Key symbols to search:
-   - `get_ui_defaults`
-   - `get_toolbox_output_dir`
-   - `apply_batch_resize_preset`
-   - `input_align_step`
-   - `center_crop_cover_pil`
-   - `from naming_utils import`
-4. Restart FlashVSR in Pinokio.
+**Automatic.** Pinokio **Update**, **Install**, and **Start** all run `scripts/env_guard.py reapply` / `preflight`. If stock `git pull` / `git clone` overwrote custom files, they are copied back from `local-preserve/latest`, then offline backups, then `git show mine/main`.
+
+If something still looks stock after Start:
+
+```powershell
+cd C:\pinokio\api\FlashVSR_plus_pinokio.git\app
+.\env\Scripts\Activate.ps1
+python ..\scripts\env_guard.py snapshot
+python ..\scripts\env_guard.py reapply
+```
+
+Key symbols that must exist (reapply uses these as markers):
+
+- `run_group_therapy` / `with_pid_name` in `webui.py`
+- `stamp_title_pid` / `flatten_gt_pair_folders` in `group_therapy.py`
+- `_choose_interp_factor` in `toolbox.py`
+- `gt_before_dir=` in `webui_config`
 
 ---
 

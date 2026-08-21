@@ -73,7 +73,7 @@ module.exports = {
           icon: "fa-solid fa-plug",
           text: "Update",
           href: "update.js",
-          confirm: "Stop the app first if it is running outside Pinokio (desktop launcher). Update will stop Pinokio Start, snapshot custom files, pull, reinstall requirements, and verify safetensors. Continue?"
+          confirm: "Stop the app first if it is running outside Pinokio (desktop launcher). Update will stop Start, snapshot custom files, pull, reinstall requirements, then AUTOMATICALLY reapply Group Therapy / PID pairing / toolbox customizations. Continue?"
         }, {
           icon: "fa-solid fa-plug",
           text: "Install",

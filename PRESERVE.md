@@ -23,8 +23,13 @@ git push mine main
 2. **Snapshots** custom files via `scripts/env_guard.py snapshot`
 3. **Kills** any leftover FlashVSR `python.exe` holders
 4. `git pull` (launcher monorepo; nested `app/.git` only if present)
-5. `uv pip install -r requirements.txt`
-6. **Verifies** `from safetensors import safe_open` and **repairs** if broken
+5. **Reapplies** custom overlay (`env_guard.py reapply`) — Group Therapy, PID pairing, toolbox, `webui_config`, etc.
+6. `uv pip install -r requirements.txt`
+7. **post_update** — reapply again if stock pull overwrote markers, then verify/repair safetensors
+
+Start also runs `env_guard.py preflight`, which reapplies any missing/stock-overwritten custom file before `webui.py`. Install (after Reset clones stock into `app/`) runs the same reapply.
+
+Reapply **never** copies a stale snapshot that lacks current markers (e.g. `with_pid_name`, `stamp_title_pid`). Sources, in order: `local-preserve/latest` → newest `C:\pinokio\backups\FlashVSR_plus_pinokio\<stamp>` → `git show mine/main` / `HEAD`.
 
 ## What Start does now (`start.js`)
 
@@ -72,6 +77,9 @@ python ..\scripts\env_guard.py repair
 
 # start preflight (same as Start tab)
 python ..\scripts\env_guard.py preflight
+
+# overlay custom files after a stock pull / clone (skips files that still have markers)
+python ..\scripts\env_guard.py reapply
 ```
 
 ## Do / Don't
@@ -101,11 +109,21 @@ python -c "from safetensors import safe_open; import safetensors; print('OK', sa
 
 ### B. Lost custom Python / config
 
+Prefer the automatic path (Start or):
+
+```powershell
+cd C:\pinokio\api\FlashVSR_plus_pinokio.git\app
+.\env\Scripts\Activate.ps1
+python ..\scripts\env_guard.py reapply
+```
+
+Manual copy still works:
+
 ```powershell
 $src = "C:\pinokio\backups\FlashVSR_plus_pinokio"   # pick newest stamp folder
 # or: local-preserve\latest
 Copy-Item -Force "$src\app\webui.py" "C:\pinokio\api\FlashVSR_plus_pinokio.git\app\webui.py"
-# repeat for flashvsr_work_queue.py, toolbox\*.py, webui_config, naming_utils.py, ...
+# repeat for group_therapy.py, flashvsr_work_queue.py, toolbox\*.py, webui_config, naming_utils.py, ...
 ```
 
 ### C. Full tree from git

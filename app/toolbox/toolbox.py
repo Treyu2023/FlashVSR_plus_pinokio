@@ -796,11 +796,91 @@ class ToolboxProcessor:
             return "audio" in subprocess.run(cmd, capture_output=True, text=True, check=False).stdout.strip().lower()
         except Exception: return False
 
+    def _has_video_stream(self, video_path):
+        """True if ffprobe sees a video stream (not audio-only)."""
+        if not video_path or not os.path.exists(video_path):
+            return False
+        if not self.has_ffmpeg:
+            return True
+        try:
+            cmd = [
+                self.ffprobe_exe, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+                str(video_path),
+            ]
+            out = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=12)
+            return "video" in (out.stdout or "").strip().lower()
+        except Exception:
+            return False
+
+    def _probe_fps(self, video_path) -> float:
+        """Best-effort source FPS (ffprobe, then imageio). 0 if unknown."""
+        if not video_path or not os.path.exists(video_path):
+            return 0.0
+        if self.has_ffmpeg:
+            try:
+                cmd = [
+                    self.ffprobe_exe, "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    str(video_path),
+                ]
+                out = subprocess.run(
+                    cmd, capture_output=True, text=True, check=False, timeout=12
+                ).stdout.strip().splitlines()
+                for line in out:
+                    line = (line or "").strip()
+                    if not line or line in ("0/0", "N/A"):
+                        continue
+                    if "/" in line:
+                        a, b = line.split("/", 1)
+                        den = float(b)
+                        if den:
+                            val = float(a) / den
+                            if 1.0 <= val <= 480.0:
+                                return val
+                    else:
+                        val = float(line)
+                        if 1.0 <= val <= 480.0:
+                            return val
+            except Exception:
+                pass
+        try:
+            with imageio.get_reader(video_path) as reader:
+                fps = float((reader.get_meta_data() or {}).get("fps") or 0)
+            if 1.0 <= fps <= 480.0:
+                return fps
+        except Exception:
+            pass
+        return 0.0
+
+    @staticmethod
+    def _choose_interp_factor(src_fps: float, requested: int, max_out_fps: float) -> int:
+        """
+        Never 4× a 60fps clip into 240. Drop 4→2→1 until output stays at/under the cap.
+        """
+        factor = int(requested or 1)
+        if factor < 1:
+            factor = 1
+        src = float(src_fps or 0)
+        cap = float(max_out_fps or 120)
+        if src <= 0:
+            return factor
+        while factor > 1 and (src * factor) > (cap + 1.0):
+            factor //= 2
+        return factor
+
     def adjust_frames(self, video_path, fps_mode, speed_factor, use_streaming, output_quality=90, progress=gr.Progress()):
         if not video_path: print("No input video for frame adjustment."); return None
         
         # Normalize input path to prevent filename length issues
         video_path = self._normalize_input_path(video_path)
+        if not self._has_video_stream(video_path):
+            print(
+                f"ERROR: No video stream in {Path(video_path).name} "
+                f"(audio-only or corrupt). RIFE cannot interpolate this file."
+            )
+            return None
         
         # Convert quality (0-100) to CRF (15-35)
         crf = int(35 - (output_quality / 100) * 20)
@@ -808,10 +888,32 @@ class ToolboxProcessor:
         interpolation_factor = 1
         if "2x" in fps_mode: interpolation_factor = 2
         elif "4x" in fps_mode: interpolation_factor = 4
+        try:
+            max_out_fps = float(os.environ.get("FLASHVSR_MAX_OUT_FPS", "120") or 120)
+        except (TypeError, ValueError):
+            max_out_fps = 120.0
+        src_fps = self._probe_fps(video_path)
+        if src_fps >= max(160.0, max_out_fps * 1.25):
+            print(
+                f"ERROR: {Path(video_path).name} is already {src_fps:.1f} FPS "
+                f"(over {max_out_fps:.0f} cap). Skipping RIFE — move to HighFPS."
+            )
+            return None
+        requested = interpolation_factor
+        interpolation_factor = self._choose_interp_factor(src_fps, interpolation_factor, max_out_fps)
+        if interpolation_factor != requested:
+            print(
+                f"INFO: Capped interpolation {requested}x → {interpolation_factor}x "
+                f"(source {src_fps:.1f} FPS, max out {max_out_fps:.0f}). "
+                f"60fps sources stay at 2x (120), never 4x (240)."
+            )
         should_interpolate = interpolation_factor > 1
 
         if not should_interpolate and speed_factor == 1.0:
-            print("INFO: No frame interpolation or speed change requested. Skipping frame adjustment.")
+            print(
+                "INFO: No frame interpolation needed "
+                f"(source {src_fps:.1f} FPS already at/under cap). Skipping RIFE."
+            )
             return video_path
 
         temp_video_path = None
@@ -823,7 +925,9 @@ class ToolboxProcessor:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=UserWarning)
                 reader = imageio.get_reader(video_path)
-                fps = reader.get_meta_data()['fps']
+                fps = float((reader.get_meta_data() or {}).get("fps") or src_fps or 30)
+            if src_fps > 0:
+                fps = src_fps
             
             output_fps = fps * interpolation_factor
             print(f"Input: {fps:.2f} FPS → Output: {output_fps:.2f} FPS")
@@ -1012,7 +1116,7 @@ class ToolboxProcessor:
             raise
         except Exception as e:
             print(f"Error during frame adjustment: {e}\n{traceback.format_exc()}")
-            return video_path
+            return None
         finally:
             try:
                 self.rife_handler.unload_model()
@@ -1474,11 +1578,21 @@ class ToolboxProcessor:
                     messages.append(f"❌ {str(e)}")
                     messages.append(f"❌ Operation '{op_name}' failed. Aborting pipeline.")
                     return None, "\n".join(messages)
+                if not current_video_path:
+                    messages.append(
+                        f"❌ Operation '{op_name}' failed (no output — "
+                        f"audio-only, already 200+ FPS, or corrupt). Aborting pipeline."
+                    )
+                    return None, "\n".join(messages)
                 if current_video_path == original_path:
+                    if op_name == "Frame Adjust":
+                        messages.append(
+                            "  -> 'Frame Adjust' skipped (source already at/under FPS cap)."
+                        )
+                        continue
                     messages.append(f"❌ Operation '{op_name}' failed. Aborting pipeline.")
                     return None, "\n".join(messages)
-                else:
-                    messages.append(f"  -> '{op_name}' step completed.")
+                messages.append(f"  -> '{op_name}' step completed.")
         return current_video_path, "\n".join(messages)
 
     def process_batch(self, input_paths, operations, params, progress=gr.Progress()):

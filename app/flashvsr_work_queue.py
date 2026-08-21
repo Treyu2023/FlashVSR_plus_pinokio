@@ -308,6 +308,9 @@ class FlashVSRWorkQueue:
             extra = ""
             if gid or stage:
                 extra = f"  G{gid or '?'} {stage}"
+            pid = it.get("gt_pair_id")
+            if pid:
+                extra += f"  pair={pid}"
             lines.append(f"[{mark:4}] #{i + 1:03d}{extra}  {name}")
             if it.get("error"):
                 lines.append(f"         ERR: {it['error']}")
@@ -951,6 +954,27 @@ class FlashVSRWorkQueue:
                 return i + 1, total
         return 0, total
 
+    @staticmethod
+    def _group_therapy_html(data: Dict[str, Any]) -> str:
+        if not (data.get("gt_group_size") or data.get("gt_current_stage") or data.get("gt_before_dir")):
+            return ""
+        stage = data.get("gt_current_stage") or "—"
+        gid = data.get("gt_current_group") or "—"
+        size = data.get("gt_group_size") or "—"
+        stages = data.get("gt_stages") or "upscale,rife1,rife2,export"
+        before = data.get("gt_before_dir") or "—"
+        after = data.get("gt_after_dir") or "—"
+        return (
+            f"<div style='margin-top:8px;padding:6px 8px;background:#0b1220;border:1px solid #334155;"
+            f"border-radius:6px;font-size:0.85em;color:#cbd5e1;line-height:1.45;'>"
+            f"<b style='color:#fbbf24;'>Group Therapy</b> · size <b>{size}</b> · "
+            f"group <b>{gid}</b> · stage <b style='color:#86efac;'>{stage}</b><br>"
+            f"<span style='color:#94a3b8;'>stages:</span> {stages}<br>"
+            f"<span style='color:#94a3b8;'>Before:</span> <code>{before}</code><br>"
+            f"<span style='color:#94a3b8;'>After:</span> <code>{after}</code>"
+            f"</div>"
+        )
+
     def status_html(self, note: str = "") -> str:
         data = self.load()
         c = self.counts(data)
@@ -1016,6 +1040,7 @@ class FlashVSRWorkQueue:
     {stop_badge}
   </div>
   {current_line}
+  {self._group_therapy_html(data)}
   <div style="margin-top:6px;font-size:0.85em;color:#94a3b8;">Output / handoff: <code style="color:#cbd5e1;background:#1a202c;padding:1px 4px;border-radius:3px;">{completed}</code></div>
   <div style="margin-top:4px;font-size:0.8em;color:#64748b;">Status: <code style="color:#94a3b8;background:#1a202c;padding:1px 4px;border-radius:3px;">{self.status_path}</code></div>
   {preview}

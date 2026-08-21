@@ -276,8 +276,8 @@ TIPS = {
         "Group Therapy size — how many originals go through one full pipeline pass "
         "before the next group starts. 10 = 10 upscale → 10 RIFE → 10 RIFE → 10 export."
     ),
-    "gt_before_dir": "Before / pairing folder — originals land here after a Group Therapy file finishes.",
-    "gt_after_dir": "After / matching folder — finals land here (usually Ready for CIV).",
+    "gt_before_dir": "Before folder (flat) — originals land here as name_PID_xxxxxxxx.mp4 (same id as After). Title metadata is also set to PID_xxxxxxxx; Media Center tags are not touched.",
+    "gt_after_dir": "After folder (flat) — finals land here as name_PID_xxxxxxxx.mp4 (same id as Before). No per-file subfolders.",
     "folder_path": "Folder of videos/images for batch. Use absolute Windows paths (e.g. D:\\clips\\batch).",
     "img_quality": "Still image encode quality. Higher = larger files. 7 default matches video profile.",
     "img_fps": "Unused for still images (placeholder control shared with video advanced block).",
@@ -296,9 +296,9 @@ WORKFLOW_DEFAULTS = {
     "batch_watch_folder": r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS",
     "batch_source_archive_dir": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
     "batch_upscale_handoff_dir": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox",
-    "img_upscale_handoff_dir": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV\images",
+    "img_upscale_handoff_dir": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Post Scaling\Ready for CIV\images",
     "tb_inbox_folder": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox",
-    "toolbox_output_dir": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV",
+    "toolbox_output_dir": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Post Scaling\Ready for CIV",
 }
 
 # (step#, short title, config key, what lands here)
@@ -408,7 +408,9 @@ def workflow_paths_html(config: Optional[dict] = None) -> str:
         "① <b>Upscale</b> → name like <code style='color:#86efac;'>clip_4K_9x16_Upscaled.mp4</code> "
         "into Ready for Toolbox<br>"
         "② <b>Interp + Export</b> → <code style='color:#fbbf24;'>clip_4K_9x16_Upscaled_30fps.mp4</code> "
-        "into Ready for CIV · Step‑1 file moves to <code>Ready for Toolbox\\Bin\\</code>"
+        "into Ready for CIV · Step‑1 file moves to <code>Ready for Toolbox\\Bin\\</code><br>"
+        "Group Therapy pairing: same files stay <b>flat</b> in Before/After with "
+        "<code style='color:#86efac;'>_PID_xxxxxxxx</code> on the name (Title metadata too, not tags)."
         "</div>"
     )
     return (
@@ -632,7 +634,7 @@ def get_ui_defaults(config=None):
         ),
         # Image upscales skip RIFE → go straight to Ready for CIV
         "img_upscale_handoff_dir": (
-            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV\images",
+            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Post Scaling\Ready for CIV\images",
             str,
         ),
         "tb_inbox_folder": (
@@ -640,6 +642,9 @@ def get_ui_defaults(config=None):
             str,
         ),
         "tb_fps_mode": ("4x Frames", str),
+        "tb_max_out_fps": (120, int),
+        "tb_high_fps_floor": (160, int),
+        "tb_scale_back_fps": (60, int),
         "tb_pipeline_ops": ("Frame Adjust,Export", str),
         "tb_frames_quality": (98, int),
         "tb_export_quality": (96, int),
@@ -657,7 +662,7 @@ def get_ui_defaults(config=None):
             str,
         ),
         "gt_after_dir": (
-            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV",
+            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Post Scaling\Ready for CIV",
             str,
         ),
     }
@@ -1295,6 +1300,21 @@ def merge_video_with_audio(video_only_path, audio_source_path, output_path):
             vcodec='copy',
             acodec='copy'
         ).run(overwrite_output=True, quiet=True)
+
+        # Never leave an audio-only file as the "upscaled" deliverable
+        try:
+            probe_out = ffmpeg.probe(output_path)
+            if not any(s.get("codec_type") == "video" for s in probe_out.get("streams", [])):
+                log(
+                    "[FlashVSR] Audio merge produced no video stream — keeping silent video instead.",
+                    message_type="warning",
+                )
+                if os.path.isfile(output_path):
+                    os.remove(output_path)
+                shutil.move(video_only_path, output_path)
+                return
+        except Exception:
+            pass
 
         log("[FlashVSR] Audio successfully merged.", message_type='finish')
 
@@ -3019,6 +3039,11 @@ def _run_group_therapy_body(
     os.makedirs(after_dir, exist_ok=True)
 
     if watch_folder and os.path.isdir(watch_folder):
+        _log_hygiene(
+            watch_folder,
+            "watch",
+            hygiene_scan_folder(watch_folder, role="watch", scale=int(scale or 4)),
+        )
         added, skipped = wq.add_folder(watch_folder)
         if added:
             log(f"Group Therapy: added {added} from {watch_folder}", message_type="info")
@@ -3030,6 +3055,9 @@ def _run_group_therapy_body(
         log(f"Re-queued {stuck} stuck Group Therapy job(s)", message_type="info")
     wq.requeue_failed()
     gt.assign_groups(wq, group_size)
+    already = gt.mark_already_paired(wq, after_dir)
+    if already:
+        log(f"Group Therapy: skipped {already} already-paired file(s)", message_type="info")
     wq.set_fixed_completed_dir(after_dir)
     wq.set_meta(
         gt_group_size=group_size,
@@ -3082,13 +3110,17 @@ def _run_group_therapy_body(
             gt_export=after_p,
             gt_before=before_p,
             gt_after=after_p,
+            gt_pair_id=fresh.get("gt_pair_id"),
+            gt_pair_folder=fresh.get("gt_pair_folder"),
         )
         wq.set_item_status(path, "done", output=after_p)
         last_output = after_p
         finished += 1
+        pid = fresh.get("gt_pair_id") or "?"
+        folder = fresh.get("gt_pair_folder") or ""
         log(
-            f"🧹 Kept original + final only ({deleted} temps deleted)\n"
-            f"   before: {before_p}\n   after:  {after_p}",
+            f"🧹 Pair {pid} — original + final only ({deleted} temps deleted)\n"
+            f"   id: {folder}\n   before: {before_p}\n   after:  {after_p}",
             message_type="finish",
         )
 
@@ -3148,7 +3180,15 @@ def _run_group_therapy_body(
                     desc=f"Group {gid} · {label} · {f_i + 1}/{len(members)} · {os.path.basename(path)}",
                 )
                 wq.set_item_status(path, "running")
-                wq.update_item(path, gt_stage=stage, gt_group=gid)
+                pair_id = gt.ensure_pair_id(item)
+                pair_folder = item.get("gt_pair_folder") or gt.pair_folder_name(pair_id, path)
+                wq.update_item(
+                    path,
+                    gt_stage=stage,
+                    gt_group=gid,
+                    gt_pair_id=pair_id,
+                    gt_pair_folder=pair_folder,
+                )
                 if not item.get("gt_original"):
                     wq.update_item(path, gt_original=path)
 
@@ -3184,6 +3224,21 @@ def _run_group_therapy_body(
                         wq.update_item(path, gt_upscale=kept or out, gt_resized=resized, gt_stage="upscale")
                         log(f"✅ Upscale → {kept or out}", message_type="finish")
                     elif stage in ("rife1", "rife2"):
+                        cur_fps = probe_file_fps(src)
+                        if cur_fps >= 160:
+                            raise RuntimeError(
+                                f"already {cur_fps:.0f} FPS — not interpolating (would be 200+)"
+                            )
+                        if stage == "rife2" and cur_fps * 2.0 > 121:
+                            log(
+                                f"Skip RIFE pass 2 — {os.path.basename(src)} is already "
+                                f"{cur_fps:.0f} FPS (4× would be {cur_fps * 2:.0f})",
+                                message_type="info",
+                            )
+                            wq.update_item(path, gt_rife2=src, gt_stage="rife2")
+                            if last_stage == "rife2":
+                                _settle_item(item)
+                            continue
                         out = _gt_rife_one(src, frames_q=frames_q, use_streaming=use_streaming)
                         if not out or not os.path.isfile(out):
                             raise RuntimeError(f"{stage} produced no file")
@@ -3192,23 +3247,40 @@ def _run_group_therapy_body(
                         wq.update_item(path, **{field: kept or out, "gt_stage": stage})
                         log(f"✅ {label} → {kept or out}", message_type="finish")
                     elif stage == "export":
+                        export_into = after_dir
+                        os.makedirs(export_into, exist_ok=True)
                         out = _gt_export_one(
                             src,
                             export_q=export_q,
                             export_w=export_w,
-                            after_dir=after_dir,
+                            after_dir=export_into,
                             export_preset=export_preset,
                             prefer_nvenc=prefer_nvenc,
                         )
                         if not out or not os.path.isfile(out):
                             raise RuntimeError("export produced no file")
                         try:
+                            fps_est = probe_file_fps(out)
+                            tagged = re.search(r"_(\d+)fps$", Path(out).stem, re.I)
+                            if tagged:
+                                fps_est = float(tagged.group(1))
+                            if not fps_est:
+                                fps_est = probe_file_fps(src) or 30.0
                             out = rename_to_step2(
                                 out,
                                 source_stem=Path(src).stem,
-                                fps=None,
+                                fps=fps_est,
                                 ext=Path(out).suffix or ".mp4",
                             )
+                            pid = pair_id or gt.ensure_pair_id(item)
+                            pid_name = gt.with_pid_name(out, pid)
+                            pid_dest = os.path.join(os.path.dirname(out), os.path.basename(pid_name))
+                            if os.path.normcase(out) != os.path.normcase(pid_dest):
+                                if os.path.exists(pid_dest):
+                                    pid_dest = gt.unique_pid_dest(os.path.dirname(out), os.path.basename(pid_name))
+                                os.replace(out, pid_dest)
+                                out = pid_dest
+                            gt.stamp_title_pid(out, pid)
                         except Exception:
                             pass
                         wq.update_item(path, gt_export=out, gt_stage="export")
@@ -3251,6 +3323,7 @@ def _run_group_therapy_body(
             members = [m for m in gt.group_members(wq.all_items(), gid) if m.get("status") != "done"]
 
         log(f"══ Group {gid} complete ══", message_type="finish")
+        gt.cleanup_empty_work(ROOT_DIR)
 
     remaining = len(wq.pending_items())
     note = (
@@ -3643,6 +3716,15 @@ def _run_flashvsr_work_queue_body(
 
     # Auto-pick up new downloads from the watch folder each Start / Resume
     if watch_folder and os.path.isdir(watch_folder):
+        _log_hygiene(
+            watch_folder,
+            "watch",
+            hygiene_scan_folder(
+                watch_folder,
+                role="watch",
+                scale=int(scale or ui.get("scale") or 4),
+            ),
+        )
         added, skipped = wq.add_folder(watch_folder)
         if added:
             log(
@@ -4206,12 +4288,496 @@ def _toolbox_max_attempts() -> int:
         return 3
 
 
-def _fail_toolbox_item_requeue(wq, video_path: str, reason: str, *, max_attempts: int) -> str:
+def _toolbox_error_is_permanent(reason: str, messages: str = "") -> bool:
+    blob = f"{reason}\n{messages}".lower()
+    needles = (
+        "no video stream",
+        "audio-only",
+        "does not contain any stream",
+        "could not load meta information",
+        "output file does not contain any stream",
+        "already 200+ fps",
+        "highfps",
+        "over ",
+        "fps cap",
+    )
+    return any(n in blob for n in needles)
+
+
+def _parse_fps_rate(text: str) -> float:
+    text = (text or "").strip()
+    if not text or text in ("0/0", "N/A"):
+        return 0.0
+    try:
+        if "/" in text:
+            a, b = text.split("/", 1)
+            den = float(b)
+            return (float(a) / den) if den else 0.0
+        return float(text)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def probe_file_wh(video_path: str) -> tuple:
+    """ffprobe width, height. (0, 0) if unknown / no video."""
+    if not video_path or not os.path.isfile(video_path):
+        return 0, 0
+    try:
+        exe = "ffprobe"
+        if toolbox_processor and getattr(toolbox_processor, "ffprobe_exe", None):
+            exe = toolbox_processor.ffprobe_exe
+        out = subprocess.run(
+            [
+                exe, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x",
+                video_path,
+            ],
+            capture_output=True, text=True, timeout=12, check=False,
+        ).stdout.strip()
+        if "x" in out:
+            w, h = out.split("x", 1)
+            return int(float(w)), int(float(h))
+    except Exception:
+        pass
+    try:
+        return get_video_dimensions(video_path)
+    except Exception:
+        return 0, 0
+
+
+def probe_file_fps(video_path: str) -> float:
+    """ffprobe / imageio FPS. 0 if unknown."""
+    if not video_path or not os.path.isfile(video_path):
+        return 0.0
+    try:
+        exe = "ffprobe"
+        if toolbox_processor and getattr(toolbox_processor, "ffprobe_exe", None):
+            exe = toolbox_processor.ffprobe_exe
+        out = subprocess.run(
+            [
+                exe, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ],
+            capture_output=True, text=True, timeout=12, check=False,
+        ).stdout.splitlines()
+        for line in out:
+            fps = _parse_fps_rate(line)
+            if 1.0 <= fps <= 480.0:
+                return fps
+    except Exception:
+        pass
+    try:
+        with imageio.get_reader(video_path) as reader:
+            fps = float((reader.get_meta_data() or {}).get("fps") or 0)
+        if 1.0 <= fps <= 480.0:
+            return fps
+    except Exception:
+        pass
+    return 0.0
+
+
+def scale_back_fps(src_path: str, dest_path: str, target_fps: float = 60.0) -> Optional[str]:
+    """Write a playable copy at target_fps (frame drop, no RIFE)."""
+    if not src_path or not os.path.isfile(src_path):
+        return None
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y", "-i", src_path,
+        "-filter:v", f"fps={int(round(target_fps))}",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        dest_path,
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=600)
+        return dest_path if os.path.isfile(dest_path) else None
+    except Exception as e:
+        log(f"FPS scale-back failed for {os.path.basename(src_path)}: {e}", message_type="warning")
+        return None
+
+
+def quarantine_high_fps(video_path: str, *, fps: float, scale_to: float = 60.0) -> Optional[str]:
+    """Move an already-too-fast file out of the inbox / CIV folder and make a 60fps copy."""
+    if not video_path or not os.path.isfile(video_path):
+        return None
+    dest_dir = os.path.join(os.path.dirname(video_path), "HighFPS")
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = unique_dest_path(dest_dir, os.path.basename(video_path))
+        shutil.move(video_path, dest)
+    except OSError as e:
+        log(f"Could not quarantine high-FPS file: {e}", message_type="warning")
+        return None
+    playable_dir = os.path.join(dest_dir, f"at_{int(round(scale_to))}fps")
+    playable = unique_dest_path(
+        playable_dir,
+        f"{Path(dest).stem}_at{int(round(scale_to))}fps{Path(dest).suffix}",
+    )
+    made = scale_back_fps(dest, playable, target_fps=scale_to)
+    log(
+        f"📦 High-FPS ({fps:.0f}) → {dest}"
+        + (f" · playable {int(round(scale_to))}fps copy → {made}" if made else ""),
+        message_type="warning",
+    )
+    return dest
+
+
+def sweep_high_fps_folder(folder: str, *, floor: float = 160.0, scale_to: float = 60.0) -> int:
+    """Move already-exported 200fps+ files out of a deliverable folder."""
+    if not folder or not os.path.isdir(folder):
+        return 0
+    moved = 0
+    try:
+        names = list(os.listdir(folder))
+    except OSError:
+        return 0
+    for name in names:
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path):
+            continue
+        if Path(path).suffix.lower() not in {".mp4", ".mov", ".mkv", ".webm", ".m4v"}:
+            continue
+        stem = Path(name).stem.lower()
+        looks_fast = bool(re.search(r"_(1[8-9]\d|2\d\d|3\d\d|4[0-7]\d)fps$", stem))
+        fps = probe_file_fps(path)
+        if not looks_fast and fps < floor:
+            continue
+        if fps and fps < floor and not looks_fast:
+            continue
+        if quarantine_high_fps(path, fps=fps or 240.0, scale_to=scale_to):
+            moved += 1
+    return moved
+
+
+def quarantine_novideo_source(video_path: str) -> Optional[str]:
+    """Move audio-only / no-video inbox files out of the toolbox queue folder."""
+    if not video_path or not os.path.isfile(video_path):
+        return None
+    dest_dir = os.path.join(os.path.dirname(video_path), "NoVideo")
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = unique_dest_path(dest_dir, os.path.basename(video_path))
+        shutil.move(video_path, dest)
+        return dest
+    except OSError as e:
+        log(f"Could not quarantine no-video file: {e}", message_type="warning")
+        return None
+
+
+_HYGIENE_SKIP_DIRS = {
+    "novideo", "highfps", "over4k", "bin", "at_60fps", "done", "archive", "work",
+}
+
+
+def _hygiene_video_files(folder: str) -> list:
+    out = []
+    if not folder or not os.path.isdir(folder):
+        return out
+    try:
+        for p in Path(folder).iterdir():
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in VIDEO_EXTS:
+                continue
+            out.append(str(p))
+    except OSError:
+        pass
+    return out
+
+
+def _target_hygiene_size(w: int, h: int, *, role: str, scale: int) -> tuple:
+    """Return (new_w, new_h, needs_resize)."""
+    if w <= 0 or h <= 0:
+        return w, h, False
+    if role == "watch":
+        return calculate_resize_dimensions(w, h, mode="4k_safe", scale=scale)
+    lim_w, lim_h = uhd_4k_output_limits(w, h)
+    if w <= lim_w and h <= lim_h:
+        return w, h, False
+    factor = min(lim_w / float(w), lim_h / float(h), 1.0)
+    nw = max(2, int(w * factor) // 2 * 2)
+    nh = max(2, int(h * factor) // 2 * 2)
+    return nw, nh, (nw, nh) != (w, h)
+
+
+def _ffmpeg_scale_to(src_path: str, dest_path: str, new_w: int, new_h: int) -> Optional[str]:
+    """
+    FlashVSR-style 4K-safe pre-downscale: cover the target box (no stretch),
+    center-crop to the grid-aligned size, high-quality intermediate (CRF 14 / slow).
+    Same filter as resize_input_video() so 4× stays inside UHD without crushing detail.
+    """
+    if not src_path or not os.path.isfile(src_path):
+        return None
+    if not is_ffmpeg_available():
+        log("FFmpeg not available — cannot 4K-safe downscale", message_type="error")
+        return None
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    nw, nh = int(new_w), int(new_h)
+    vf = (
+        f"scale={nw}:{nh}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop={nw}:{nh}"
+    )
+    base = [
+        "ffmpeg", "-y", "-i", src_path,
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "slow", "-crf", "14",
+        "-pix_fmt", "yuv420p",
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+    ]
+    cmd = base + ["-c:a", "aac", "-b:a", "256k", dest_path]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900)
+    except Exception as e:
+        log(f"4K-safe encode failed for {os.path.basename(src_path)}: {e}", message_type="error")
+        if os.path.isfile(dest_path):
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
+        return None
+    if not os.path.isfile(dest_path) or os.path.getsize(dest_path) < 1024:
+        return None
+    return dest_path
+
+
+def downscale_replace_uhd(src_path: str, new_w: int, new_h: int) -> Optional[str]:
+    """
+    Archive the oversize original to Over4K\\ and write a 4K-safe file
+    back at the same path so queue rows keep working.
+    """
+    if not src_path or not os.path.isfile(src_path):
+        return None
+    if not is_ffmpeg_available():
+        log("FFmpeg not available — cannot fix over-4K file", message_type="error")
+        return None
+    folder = os.path.dirname(src_path)
+    archive_dir = os.path.join(folder, "Over4K")
+    os.makedirs(archive_dir, exist_ok=True)
+    archived = unique_dest_path(archive_dir, os.path.basename(src_path))
+    tmp = os.path.join(
+        folder,
+        f".{Path(src_path).stem}_4kfix_{time.strftime('%H%M%S')}{Path(src_path).suffix}",
+    )
+    if not _ffmpeg_scale_to(src_path, tmp, new_w, new_h):
+        return None
+    try:
+        shutil.move(src_path, archived)
+        os.replace(tmp, src_path)
+    except OSError as e:
+        log(f"Over-4K replace failed: {e}", message_type="error")
+        return None
+    log(
+        f"🖼 4K-safe pre-downscale {os.path.basename(src_path)} → {new_w}×{new_h} "
+        f"(cover+crop, CRF 14 — 4× stays UHD). Original in Over4K\\",
+        message_type="finish",
+    )
+    return src_path
+
+
+def _inbox_has_file(inbox: str, name: str) -> bool:
+    if not inbox or not name:
+        return False
+    return os.path.isfile(os.path.join(inbox, name))
+
+
+def hygiene_reclaim_sidecars(
+    inbox: str,
+    *,
+    role: str = "toolbox",
+    scale: int = 4,
+    high_fps_floor: float = 160.0,
+    scale_back_fps_to: float = 60.0,
+) -> dict:
+    """
+    Scan folders hygiene *moves files into* (Over4K, HighFPS) and put a
+    processable copy back in the inbox so the queue can pick it up.
+    """
+    stats = {"reclaimed": 0, "errors": 0}
+    if not inbox or not os.path.isdir(inbox):
+        return stats
+    scale = max(1, int(scale or 4))
+    target_fps = int(round(scale_back_fps_to or 60))
+
+    over4k = os.path.join(inbox, "Over4K")
+    for src in _hygiene_video_files(over4k):
+        name = os.path.basename(src)
+        dest = os.path.join(inbox, name)
+        if _inbox_has_file(inbox, name):
+            continue
+        w, h = probe_file_wh(src)
+        if w <= 0 or h <= 0:
+            continue
+        nw, nh, will = _target_hygiene_size(w, h, role=role, scale=scale)
+        try:
+            if will:
+                if not _ffmpeg_scale_to(src, dest, nw, nh):
+                    stats["errors"] += 1
+                    continue
+            else:
+                shutil.copy2(src, dest)
+            stats["reclaimed"] += 1
+            log(
+                f"↩️  Reclaimed from Over4K → queue: {name}"
+                + (
+                    f" ({w}×{h} → {nw}×{nh} 4K-safe so 4× stays UHD)"
+                    if will
+                    else ""
+                ),
+                message_type="finish",
+            )
+        except Exception as e:
+            stats["errors"] += 1
+            log(f"Reclaim Over4K failed {name}: {e}", message_type="warning")
+
+    high = os.path.join(inbox, "HighFPS")
+    playable = os.path.join(high, f"at_{target_fps}fps")
+    # Prefer already-scaled playable copies first
+    for src in _hygiene_video_files(playable):
+        name = os.path.basename(src)
+        if _inbox_has_file(inbox, name):
+            continue
+        dest = os.path.join(inbox, name)
+        try:
+            shutil.copy2(src, dest)
+            stats["reclaimed"] += 1
+            log(f"↩️  Reclaimed {target_fps}fps copy → queue: {name}", message_type="finish")
+        except Exception as e:
+            stats["errors"] += 1
+            log(f"Reclaim HighFPS/at_{target_fps} failed {name}: {e}", message_type="warning")
+
+    for src in _hygiene_video_files(high):
+        name = os.path.basename(src)
+        stem, ext = os.path.splitext(name)
+        dest_name = f"{stem}_at{target_fps}fps{ext}"
+        if _inbox_has_file(inbox, dest_name) or _inbox_has_file(inbox, name):
+            continue
+        fps = probe_file_fps(src)
+        dest = os.path.join(inbox, dest_name)
+        try:
+            if fps >= high_fps_floor:
+                if not scale_back_fps(src, dest, target_fps=target_fps):
+                    stats["errors"] += 1
+                    continue
+            else:
+                # Already playable — send back as-is
+                dest = os.path.join(inbox, name)
+                if _inbox_has_file(inbox, name):
+                    continue
+                shutil.copy2(src, dest)
+            stats["reclaimed"] += 1
+            log(
+                f"↩️  Reclaimed from HighFPS → queue: {os.path.basename(dest)}"
+                + (f" ({fps:.0f} → {target_fps} fps)" if fps >= high_fps_floor else ""),
+                message_type="finish",
+            )
+        except Exception as e:
+            stats["errors"] += 1
+            log(f"Reclaim HighFPS failed {name}: {e}", message_type="warning")
+
+    return stats
+
+
+def hygiene_scan_folder(
+    folder: str,
+    *,
+    role: str = "toolbox",
+    scale: int = 4,
+    high_fps_floor: float = 160.0,
+    scale_back_fps_to: float = 60.0,
+) -> dict:
+    """
+    Scan New Downloads (role=watch) or Ready for Toolbox (role=toolbox)
+    and fix/quarantine bad files before the queue picks them up.
+
+    Rules:
+      - no video stream → NoVideo\\
+      - already 160+ FPS → HighFPS\\ + 60fps playable copy
+      - would exceed UHD after ×scale (watch) or already over UHD (toolbox)
+        → FlashVSR 4K-safe pre-downscale (lanczos cover + center crop, CRF 14).
+        Original archived in Over4K\\
+    """
+    stats = {"novideo": 0, "highfps": 0, "over4k": 0, "reclaimed": 0, "ok": 0, "errors": 0}
+    if not folder or not os.path.isdir(folder):
+        return stats
+    scale = max(1, int(scale or 4))
+    # First: pull fixable files out of Over4K / HighFPS back into this inbox
+    rec = hygiene_reclaim_sidecars(
+        folder,
+        role=role,
+        scale=scale,
+        high_fps_floor=high_fps_floor,
+        scale_back_fps_to=scale_back_fps_to,
+    )
+    stats["reclaimed"] += int(rec.get("reclaimed") or 0)
+    stats["errors"] += int(rec.get("errors") or 0)
+
+    for path in _hygiene_video_files(folder):
+        name = os.path.basename(path)
+        try:
+            w, h = probe_file_wh(path)
+            if w <= 0 or h <= 0:
+                if quarantine_novideo_source(path):
+                    stats["novideo"] += 1
+                    log(f"🧹 {name}: no video stream → NoVideo\\", message_type="warning")
+                else:
+                    stats["errors"] += 1
+                continue
+
+            fps = probe_file_fps(path)
+            if fps >= high_fps_floor:
+                if quarantine_high_fps(path, fps=fps, scale_to=scale_back_fps_to):
+                    stats["highfps"] += 1
+                else:
+                    stats["errors"] += 1
+                continue
+
+            nw, nh, will = _target_hygiene_size(w, h, role=role, scale=scale)
+            if will and (nw, nh) != (w, h):
+                if downscale_replace_uhd(path, nw, nh):
+                    stats["over4k"] += 1
+                else:
+                    stats["errors"] += 1
+                continue
+            stats["ok"] += 1
+        except Exception as e:
+            stats["errors"] += 1
+            log(f"Hygiene skip {name}: {e}", message_type="warning")
+    return stats
+
+
+def _log_hygiene(folder: str, role: str, stats: dict) -> None:
+    if not any(stats.get(k) for k in ("novideo", "highfps", "over4k", "reclaimed", "errors")):
+        return
+    log(
+        f"🧹 Folder hygiene ({role}) {folder}: "
+        f"{stats.get('reclaimed', 0)} put back in queue, "
+        f"{stats.get('over4k', 0)} 4K-safe pre-downscale, "
+        f"{stats.get('highfps', 0)} high-FPS moved, "
+        f"{stats.get('novideo', 0)} no-video moved, "
+        f"{stats.get('ok', 0)} ok, "
+        f"{stats.get('errors', 0)} errors",
+        message_type="info",
+    )
+
+
+def _fail_toolbox_item_requeue(
+    wq, video_path: str, reason: str, *, max_attempts: int, permanent: bool = False
+) -> str:
     """
     Fail this attempt and put the source back at the END of the queue (pending)
     so other jobs run first. Source file is left in place (inbox).
     Returns: requeued | failed_permanent | missing
     """
+    if permanent:
+        wq.set_item_status(video_path, "failed", error=reason)
+        name = os.path.basename(video_path)
+        log(f"❌ {name} skipped (will not retry). Reason: {reason}", message_type="error")
+        return "failed_permanent"
     result = wq.requeue_to_end(video_path, error=reason, max_attempts=max_attempts)
     name = os.path.basename(video_path)
     if result == "requeued":
@@ -4248,6 +4814,17 @@ def _run_toolbox_work_queue_body(wq, progress):
     toolbox_processor.autosave_enabled = True
 
     if inbox and os.path.isdir(inbox):
+        _log_hygiene(
+            inbox,
+            "toolbox",
+            hygiene_scan_folder(
+                inbox,
+                role="toolbox",
+                scale=int(ui.get("scale") or 4),
+                high_fps_floor=float(ui.get("tb_high_fps_floor") or 160),
+                scale_back_fps_to=float(ui.get("tb_scale_back_fps") or 60),
+            ),
+        )
         added, skipped = wq.add_folder(inbox)
         if added:
             log(f"Toolbox inbox: added {added} from {inbox}", message_type="info")
@@ -4287,6 +4864,10 @@ def _run_toolbox_work_queue_body(wq, progress):
     if not selected_ops:
         selected_ops = ["Frame Adjust", "Export"]
     fps_mode = ui.get("tb_fps_mode") or "4x Frames"
+    max_out_fps = float(ui.get("tb_max_out_fps") or 120)
+    high_fps_floor = float(ui.get("tb_high_fps_floor") or 160)
+    scale_back_fps_to = float(ui.get("tb_scale_back_fps") or 60)
+    os.environ["FLASHVSR_MAX_OUT_FPS"] = str(int(max_out_fps))
     frames_q = int(ui.get("tb_frames_quality") or 95)
     export_q = int(ui.get("tb_export_quality") or 92)
     export_w = int(ui.get("tb_export_max_width") or 3840)
@@ -4325,10 +4906,17 @@ def _run_toolbox_work_queue_body(wq, progress):
     toolbox_processor.prefer_nvenc = prefer_nvenc
 
     completed_dir = wq.set_fixed_completed_dir(ready_civ)
+    swept = sweep_high_fps_folder(ready_civ, floor=high_fps_floor, scale_to=scale_back_fps_to)
+    if swept:
+        log(
+            f"High-FPS sweep (Ready for CIV): moved {swept} already-200+ file(s) → HighFPS",
+            message_type="warning",
+        )
+
     log(
         f"Toolbox: {selected_ops} | RIFE {fps_mode} "
         f"(stream={use_streaming}, export={export_preset}, nvenc={prefer_nvenc}, "
-        f"timeout={item_timeout}s, max_try={max_attempts}) → {ready_civ}",
+        f"max_out={int(max_out_fps)}fps, timeout={item_timeout}s, max_try={max_attempts}) → {ready_civ}",
         message_type="info",
     )
     last_out = None
@@ -4380,8 +4968,23 @@ def _run_toolbox_work_queue_body(wq, progress):
         )
         progress(run_i / max(pending_count, 1), desc=label)
         log(f"\n--- {label} ---", message_type="info")
+        src_fps = probe_file_fps(video_path)
+        if src_fps >= high_fps_floor:
+            q = quarantine_high_fps(video_path, fps=src_fps, scale_to=scale_back_fps_to)
+            reason = (
+                f"Already {src_fps:.0f} FPS — not 4× RIFE (would be ~{src_fps * 4:.0f}). "
+                f"Moved to HighFPS"
+                + (f" → {q}" if q else "")
+            )
+            log(reason, message_type="warning")
+            _fail_toolbox_item_requeue(
+                wq, video_path, reason, max_attempts=max_attempts, permanent=True
+            )
+            permanent_fail += 1
+            continue
         wq.set_item_status(video_path, "running")
         t0 = time.time()
+        result_path, messages = None, ""
 
         try:
             # Hard wall-clock so a hung RIFE/ffmpeg cannot block the whole queue forever
@@ -4432,14 +5035,12 @@ def _run_toolbox_work_queue_body(wq, progress):
                     except Exception:
                         fps_est = None
                     if not fps_est:
-                        # 4x Frames ≈ 4× source fps; 2x ≈ 2×
-                        try:
-                            src_meta = imageio.get_reader(video_path).get_meta_data()
-                            base_fps = float(src_meta.get("fps") or 30)
-                        except Exception:
-                            base_fps = 30.0
-                        mult = 4.0 if "4x" in str(fps_mode) else (2.0 if "2x" in str(fps_mode) else 1.0)
-                        fps_est = base_fps * mult
+                        base_fps = probe_file_fps(video_path) or 30.0
+                        requested = 4 if "4x" in str(fps_mode) else (2 if "2x" in str(fps_mode) else 1)
+                        factor = ToolboxProcessor._choose_interp_factor(
+                            base_fps, requested, max_out_fps
+                        )
+                        fps_est = base_fps * factor
                     final = rename_to_step2(
                         final,
                         source_stem=Path(video_path).stem,
@@ -4483,18 +5084,39 @@ def _run_toolbox_work_queue_body(wq, progress):
                 )
             else:
                 reason = "pipeline returned no output"
-                res = _fail_toolbox_item_requeue(
-                    wq, video_path, reason, max_attempts=max_attempts
-                )
+                msgs = messages if isinstance(messages, str) else ""
+                if _toolbox_error_is_permanent(reason, msgs):
+                    reason = (
+                        "No video stream (audio-only / corrupt). "
+                        "RIFE cannot interpolate this file."
+                    )
+                    q = quarantine_novideo_source(video_path)
+                    if q:
+                        log(f"📦 Quarantined no-video file → {q}", message_type="warning")
+                    res = _fail_toolbox_item_requeue(
+                        wq, video_path, reason, max_attempts=max_attempts, permanent=True
+                    )
+                else:
+                    res = _fail_toolbox_item_requeue(
+                        wq, video_path, reason, max_attempts=max_attempts
+                    )
                 if res == "requeued":
                     requeued += 1
                 else:
                     permanent_fail += 1
         except Exception as e:
             log(f"❌ Toolbox error: {e}", message_type="error")
-            res = _fail_toolbox_item_requeue(
-                wq, video_path, str(e), max_attempts=max_attempts
-            )
+            if _toolbox_error_is_permanent(str(e)):
+                q = quarantine_novideo_source(video_path)
+                if q:
+                    log(f"📦 Quarantined no-video file → {q}", message_type="warning")
+                res = _fail_toolbox_item_requeue(
+                    wq, video_path, str(e), max_attempts=max_attempts, permanent=True
+                )
+            else:
+                res = _fail_toolbox_item_requeue(
+                    wq, video_path, str(e), max_attempts=max_attempts
+                )
             if res == "requeued":
                 requeued += 1
             else:
@@ -5919,8 +6541,10 @@ def create_ui():
                                     "run that group **start to finish** (upscale → RIFE → RIFE → export), "
                                     "then the next N.\n\n"
                                     "After each file finishes: **keep only the original + the end file**. "
-                                    "Everything else (resized, `_Upscaled`, RIFE temps) is deleted. "
-                                    "Originals go to the **Before / pairing** folder; finals go to the **After** folder."
+                                    "Everything else (resized, `_Upscaled`, RIFE temps) is deleted.\n\n"
+                                    "Each pair is tagged **`_PID_xxxxxxxx`** at the end of the filename "
+                                    "(and Title metadata — not Media Center tags). "
+                                    "Before and After stay **flat folders** so you can compare side by side."
                                 )
                                 gt_watch_folder = gr.Textbox(
                                     value=ui.get("batch_watch_folder", r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS"),
@@ -5941,15 +6565,15 @@ def create_ui():
                                             "batch_source_archive_dir",
                                             r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
                                         ),
-                                        label="Before / pairing (originals)",
+                                        label="Before (originals, flat)",
                                         info=TIPS["gt_before_dir"],
                                     )
                                     gt_after_dir = gr.Textbox(
                                         value=ui.get("gt_after_dir") or ui.get(
                                             "toolbox_output_dir",
-                                            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV",
+                                            r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Post Scaling\Ready for CIV",
                                         ),
-                                        label="After / matching (finals)",
+                                        label="After (finals, flat)",
                                         info=TIPS["gt_after_dir"],
                                     )
                                 gr.Markdown("Stages for each group (in order):")
@@ -5960,6 +6584,7 @@ def create_ui():
                                     gt_do_export = gr.Checkbox(label="4 · Export / interpolation", value=bool(ui.get("gt_do_export", True)))
                                 gt_queue_status = gr.HTML(value=get_group_therapy_queue().status_html())
                                 with gr.Row():
+                                    gt_add_btn = gr.Button("➕ Scan original folder", size="sm")
                                     gt_run_btn = gr.Button("▶️ Start / Resume Group Therapy", variant="primary", size="sm")
                                     gt_stop_btn = gr.Button("⏹ Stop After Current", variant="stop", size="sm")
                                 with gr.Row():
@@ -7319,6 +7944,21 @@ def create_ui():
             show_progress="hidden"
         )
 
+        def _gt_q_add(watch):
+            wq = get_group_therapy_queue()
+            watch = str(watch or "").strip()
+            if watch:
+                cfg = load_config()
+                cfg["batch_watch_folder"] = watch
+                save_config(cfg)
+            a, s = wq.add_folder(watch) if watch and os.path.isdir(watch) else (0, 0)
+            ui = get_ui_defaults()
+            gt.assign_groups(wq, int(ui.get("gt_group_size") or 10))
+            note = f"Added {a} video(s)" + (f", skipped {s} already in queue" if s else "")
+            if a == 0 and s == 0:
+                note = "Nothing to add — set the original folder path."
+            return wq.status_html(note)
+
         def _gt_q_stop():
             note = get_group_therapy_queue().request_stop()
             log(note, message_type="warning")
@@ -7350,6 +7990,7 @@ def create_ui():
             )
             return last_video, last_video, None, queue_html, queue_html
 
+        gt_add_btn.click(fn=_gt_q_add, inputs=[gt_watch_folder], outputs=[gt_queue_status])
         gt_stop_btn.click(fn=_gt_q_stop, inputs=[], outputs=[gt_queue_status], queue=False)
         gt_clear_done_btn.click(fn=_gt_q_clear_done, outputs=[gt_queue_status])
         gt_clear_all_btn.click(fn=_gt_q_clear_all, outputs=[gt_queue_status])
@@ -8352,6 +8993,16 @@ def create_ui():
                 value=_wp["toolbox_output_dir"],
                 info="Interp+export finals with _##fps in the name",
             )
+            gt_settings_before = gr.Textbox(
+                label="Group Therapy — Before (originals, flat folder)",
+                value=str(config.get("gt_before_dir") or _wp["batch_source_archive_dir"]),
+                info="Originals stay in this folder with _PID_xxxxxxxx at the end of the filename (and Title metadata). Same id as After. No per-song subfolders.",
+            )
+            gt_settings_after = gr.Textbox(
+                label="Group Therapy — After (finals, flat folder)",
+                value=str(config.get("gt_after_dir") or _wp["toolbox_output_dir"]),
+                info="Finals stay in this folder with _PID_xxxxxxxx at the end of the filename (and Title metadata). Same id as Before. No per-song subfolders.",
+            )
             workflow_status = gr.Textbox(label="Pipeline status", interactive=False, show_label=True)
             with gr.Row():
                 apply_workflow_btn = gr.Button("💾 Save all pipeline folders", size="sm", variant="primary")
@@ -8426,8 +9077,8 @@ def create_ui():
                 return None, f"❌ {label}: cannot create folder — {e}"
             return p, None
 
-        def apply_workflow_folders(s1, s2, s3, s4, s5, s6):
-            """Save all six pipeline steps. Step 3 is also output_dir (no app\\outputs archetype)."""
+        def apply_workflow_folders(s1, s2, s3, s4, s5, s6, gt_before="", gt_after=""):
+            """Save all six pipeline steps + Group Therapy Before/After folders (flat PID pairing)."""
             cfg = load_config()
             mapping = [
                 ("batch_watch_folder", s1, "Step 1"),
@@ -8436,6 +9087,8 @@ def create_ui():
                 ("img_upscale_handoff_dir", s4, "Step 4"),
                 ("tb_inbox_folder", s5, "Step 5"),
                 ("toolbox_output_dir", s6, "Step 6"),
+                ("gt_before_dir", gt_before or s2, "Group Therapy Before"),
+                ("gt_after_dir", gt_after or s6, "Group Therapy After"),
             ]
             saved = []
             for key, raw, label in mapping:
@@ -8461,6 +9114,8 @@ def create_ui():
             for key, default in WORKFLOW_DEFAULTS.items():
                 cfg[key] = default
             cfg["output_dir"] = WORKFLOW_DEFAULTS["batch_upscale_handoff_dir"]
+            cfg["gt_before_dir"] = WORKFLOW_DEFAULTS["batch_source_archive_dir"]
+            cfg["gt_after_dir"] = WORKFLOW_DEFAULTS["toolbox_output_dir"]
             save_config(cfg)
             _apply_toolbox_output_dir()
             ensure_workflow_dirs()
@@ -8472,6 +9127,8 @@ def create_ui():
                 wp["img_upscale_handoff_dir"],
                 wp["tb_inbox_folder"],
                 wp["toolbox_output_dir"],
+                cfg["gt_before_dir"],
+                cfg["gt_after_dir"],
                 workflow_paths_html(cfg),
                 "✅ Reset all steps to FAFO defaults (Step 3 = Ready for Toolbox).",
             )
@@ -8481,7 +9138,10 @@ def create_ui():
 
         apply_workflow_btn.click(
             fn=apply_workflow_folders,
-            inputs=[step1_watch, step2_archive, step3_upscale, step4_images, step5_inbox, step6_final],
+            inputs=[
+                step1_watch, step2_archive, step3_upscale, step4_images, step5_inbox, step6_final,
+                gt_settings_before, gt_settings_after,
+            ],
             outputs=[workflow_map, workflow_status],
         )
         reset_workflow_btn.click(
@@ -8494,6 +9154,8 @@ def create_ui():
                 step4_images,
                 step5_inbox,
                 step6_final,
+                gt_settings_before,
+                gt_settings_after,
                 workflow_map,
                 workflow_status,
             ],

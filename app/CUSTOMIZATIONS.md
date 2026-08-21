@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-08-21 | **Group Therapy pairing:** no per-file `GT-<id>__name` folders. Before/After stay flat; pair id is `_PID_xxxxxxxx` at the end of the filename plus Title metadata (`PID_xxxxxxxx`). Media Center tags are not touched. Retro flatten remaps existing GT folders into the `9xxxxxxx` band so they cannot collide with new auto batches. |
 | 2026-08-18 | **Group Therapy:** process originals in groups of N (upscale → RIFE 2× → RIFE 2× → export), then the next N. After each file: keep only original + final in the user Before/After pairing folders; delete resized/upscale/RIFE temps. Image-queue `4k_safe` no longer overwrites pipeline mode (imageio URI: None). |
 | 2026-08-13 | **4K-safe pre-downscale:** default `batch_resize_preset=4K-safe (auto)` — math so `(input × scale)` never exceeds UHD 4K: **3840×2160** (16:9) or **2160×3840** (9:16). At 4× that is max **960×540** / **540×960** (grid-aligned). Fixed px presets still clamp inside that box. |
 | 2026-08-16 | **Queue size-dedupe:** skip add + preflight drop when another queued/done file has the **same byte size** (renamed copies). Path dedupe still applies. Size 0 ignored. |
@@ -86,7 +87,7 @@ Stock FlashVSR only read theme/autosave/output from `webui_config`. Added `get_u
 | 3 | After upscale (videos) | `D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox` |
 | 4 | After upscale (images) | `...\Ready for CIV\images` |
 | 5 | Toolbox inbox | same as step 3 |
-| 6 | Final / Ready for CIV | `D:\OUTPUTS\__X_GROK\Upscaled Videos\Current\Ready for CIV` |
+| 6 | Final / Ready for CIV | `D:\OUTPUTS\__X_GROK\Upscaled Videos\Post Scaling\Ready for CIV` |
 
 **Name tags:** `_1` upscale · `_2` interpolate · `_3` export  
 **Code:** `WORKFLOW_DEFAULTS`, `get_workflow_paths()`, `workflow_paths_html()`, Settings → **Save all pipeline folders**.
@@ -150,8 +151,8 @@ Resize flow (video + image):
 ## Intended workflow
 
 1. Drop sources in **Step 1** (NEW DOWNLOADS).
-2. Video queue upscales → **Step 3 Ready for Toolbox** (`_1`); originals → Step 2.
-3. Toolbox reads Step 5/3 → export → **Step 6 Ready for CIV** (`_3`).
+2. **Group Therapy** (recommended for mixed batches): pick group size + Before/After folders, Start. Each group of N runs **upscale → RIFE 2× → RIFE 2× → export**, then the next N. Both sides stay **flat** (no per-file folders). Pairing is `_PID_xxxxxxxx` at the end of the filename plus Title=`PID_xxxxxxxx` (not Media Center tags). Only original + final are kept.
+3. Or classic split: Video queue upscales → **Step 3 Ready for Toolbox**; originals → Step 2. Toolbox reads Step 5/3 → export → **Step 6 Ready for CIV**.
 4. Images → **Step 4** Ready for CIV\images (skip RIFE).
 
 ---

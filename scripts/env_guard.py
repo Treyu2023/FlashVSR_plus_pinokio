@@ -59,9 +59,9 @@ CRITICAL = [
 
 # Strings that MUST appear in a live custom file. Missing ⇒ stock overwrite.
 MARKERS = {
-    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir"),
+    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir", "no size recode"),
     "app/group_therapy.py": ("stamp_title_pid", "flatten_gt_pair_folders", "pid_token"),
-    "app/flashvsr_work_queue.py": ("gt_pair_id",),
+    "app/flashvsr_work_queue.py": ("gt_pair_id", "drop_wrong_stage_pending"),
     "app/naming_utils.py": ("clean_original_stem", "step1_filename"),
     "app/toolbox/toolbox.py": ("_choose_interp_factor", "_has_video_stream"),
     "app/src/pipelines/flashvsr_tiny_long.py": (

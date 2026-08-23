@@ -3049,6 +3049,20 @@ def _run_group_therapy_body(
             log(f"Group Therapy: added {added} from {watch_folder}", message_type="info")
         elif not skipped:
             log(f"Group Therapy: no new videos in {watch_folder}", message_type="info")
+        if skipped:
+            log(
+                f"Group Therapy: skipped {skipped} already-queued or already-upscaled "
+                f"(upscaled files belong on Toolbox)",
+                message_type="info",
+            )
+
+    dropped = wq.drop_wrong_stage_pending()
+    if dropped:
+        log(
+            f"Group Therapy: removed {dropped} already-upscaled pending file(s) — "
+            f"those stay on Toolbox (RIFE + export), not another upscale",
+            message_type="warning",
+        )
 
     stuck = wq.reset_stuck_running()
     if stuck:
@@ -3729,15 +3743,27 @@ def _run_flashvsr_work_queue_body(
         if added:
             log(
                 f"Watch folder: added {added} from {watch_folder}"
-                + (f" (skipped {skipped} already queued)" if skipped else ""),
+                + (f" (skipped {skipped} already queued / already-upscaled)" if skipped else ""),
                 message_type="info",
             )
         elif skipped:
-            log(f"Watch folder: {skipped} already in queue ({watch_folder})", message_type="info")
+            log(
+                f"Watch folder: {skipped} skipped (already queued or already-upscaled) "
+                f"({watch_folder})",
+                message_type="info",
+            )
         else:
             log(f"Watch folder empty or no new videos: {watch_folder}", message_type="info")
     elif watch_folder:
         log(f"Watch folder missing (create it or fix path): {watch_folder}", message_type="warning")
+
+    dropped = wq.drop_wrong_stage_pending()
+    if dropped:
+        log(
+            f"Video queue: removed {dropped} already-upscaled pending file(s) — "
+            f"those belong on Toolbox (RIFE + export), not another FlashVSR pass",
+            message_type="warning",
+        )
 
     stuck = wq.reset_stuck_running()
     if stuck:
@@ -4097,6 +4123,13 @@ def _run_flashvsr_image_work_queue_body(
             log(f"Image watch: added {added} from {watch_folder}", message_type="info")
         elif not skipped:
             log(f"Image watch: no new images in {watch_folder}", message_type="info")
+
+    dropped = wq.drop_wrong_stage_pending()
+    if dropped:
+        log(
+            f"Image queue: removed {dropped} already-upscaled pending file(s)",
+            message_type="warning",
+        )
 
     stuck = wq.reset_stuck_running()
     if stuck:
@@ -4490,18 +4523,16 @@ def _hygiene_video_files(folder: str) -> list:
 
 
 def _target_hygiene_size(w: int, h: int, *, role: str, scale: int) -> tuple:
-    """Return (new_w, new_h, needs_resize)."""
+    """Return (new_w, new_h, needs_resize).
+
+    Watch / intake only: 4K-safe so (input × scale) stays inside UHD.
+    Toolbox is post-upscale (RIFE + export) — never recode/downscale here.
+    """
     if w <= 0 or h <= 0:
         return w, h, False
     if role == "watch":
         return calculate_resize_dimensions(w, h, mode="4k_safe", scale=scale)
-    lim_w, lim_h = uhd_4k_output_limits(w, h)
-    if w <= lim_w and h <= lim_h:
-        return w, h, False
-    factor = min(lim_w / float(w), lim_h / float(h), 1.0)
-    nw = max(2, int(w * factor) // 2 * 2)
-    nh = max(2, int(h * factor) // 2 * 2)
-    return nw, nh, (nw, nh) != (w, h)
+    return w, h, False
 
 
 def _ffmpeg_scale_to(src_path: str, dest_path: str, new_w: int, new_h: int) -> Optional[str]:
@@ -4604,35 +4635,52 @@ def hygiene_reclaim_sidecars(
     target_fps = int(round(scale_back_fps_to or 60))
 
     over4k = os.path.join(inbox, "Over4K")
-    for src in _hygiene_video_files(over4k):
-        name = os.path.basename(src)
-        dest = os.path.join(inbox, name)
-        if _inbox_has_file(inbox, name):
-            continue
-        w, h = probe_file_wh(src)
-        if w <= 0 or h <= 0:
-            continue
-        nw, nh, will = _target_hygiene_size(w, h, role=role, scale=scale)
-        try:
-            if will:
-                if not _ffmpeg_scale_to(src, dest, nw, nh):
-                    stats["errors"] += 1
-                    continue
-            else:
-                shutil.copy2(src, dest)
-            stats["reclaimed"] += 1
-            log(
-                f"↩️  Reclaimed from Over4K → queue: {name}"
-                + (
-                    f" ({w}×{h} → {nw}×{nh} 4K-safe so 4× stays UHD)"
-                    if will
-                    else ""
-                ),
-                message_type="finish",
-            )
-        except Exception as e:
-            stats["errors"] += 1
-            log(f"Reclaim Over4K failed {name}: {e}", message_type="warning")
+    if role != "watch":
+        # Toolbox inbox: Over4K holds real upscales that were wrongly recoded.
+        # Put the original back (overwrite the CRF-14 recode) — no scaling.
+        for src in _hygiene_video_files(over4k):
+            name = os.path.basename(src)
+            dest = os.path.join(inbox, name)
+            try:
+                os.replace(src, dest)
+                stats["reclaimed"] += 1
+                log(
+                    f"↩️  Restored original upscale from Over4K (no recode) → {name}",
+                    message_type="finish",
+                )
+            except Exception as e:
+                stats["errors"] += 1
+                log(f"Restore Over4K failed {name}: {e}", message_type="warning")
+    else:
+        for src in _hygiene_video_files(over4k):
+            name = os.path.basename(src)
+            dest = os.path.join(inbox, name)
+            if _inbox_has_file(inbox, name):
+                continue
+            w, h = probe_file_wh(src)
+            if w <= 0 or h <= 0:
+                continue
+            nw, nh, will = _target_hygiene_size(w, h, role=role, scale=scale)
+            try:
+                if will:
+                    if not _ffmpeg_scale_to(src, dest, nw, nh):
+                        stats["errors"] += 1
+                        continue
+                else:
+                    shutil.copy2(src, dest)
+                stats["reclaimed"] += 1
+                log(
+                    f"↩️  Reclaimed from Over4K → queue: {name}"
+                    + (
+                        f" ({w}×{h} → {nw}×{nh} 4K-safe so 4× stays UHD)"
+                        if will
+                        else ""
+                    ),
+                    message_type="finish",
+                )
+            except Exception as e:
+                stats["errors"] += 1
+                log(f"Reclaim Over4K failed {name}: {e}", message_type="warning")
 
     high = os.path.join(inbox, "HighFPS")
     playable = os.path.join(high, f"at_{target_fps}fps")
@@ -4689,6 +4737,7 @@ def hygiene_scan_folder(
     scale: int = 4,
     high_fps_floor: float = 160.0,
     scale_back_fps_to: float = 60.0,
+    should_stop=None,
 ) -> dict:
     """
     Scan New Downloads (role=watch) or Ready for Toolbox (role=toolbox)
@@ -4697,9 +4746,10 @@ def hygiene_scan_folder(
     Rules:
       - no video stream → NoVideo\\
       - already 160+ FPS → HighFPS\\ + 60fps playable copy
-      - would exceed UHD after ×scale (watch) or already over UHD (toolbox)
+      - watch only: would exceed UHD after ×scale
         → FlashVSR 4K-safe pre-downscale (lanczos cover + center crop, CRF 14).
         Original archived in Over4K\\
+      - toolbox: no size recode. Post-scale path is RIFE + export only.
     """
     stats = {"novideo": 0, "highfps": 0, "over4k": 0, "reclaimed": 0, "ok": 0, "errors": 0}
     if not folder or not os.path.isdir(folder):
@@ -4717,6 +4767,9 @@ def hygiene_scan_folder(
     stats["errors"] += int(rec.get("errors") or 0)
 
     for path in _hygiene_video_files(folder):
+        if should_stop and should_stop():
+            log("⏹ Hygiene stopped — remaining files left as-is", message_type="warning")
+            break
         name = os.path.basename(path)
         try:
             w, h = probe_file_wh(path)
@@ -4736,13 +4789,14 @@ def hygiene_scan_folder(
                     stats["errors"] += 1
                 continue
 
-            nw, nh, will = _target_hygiene_size(w, h, role=role, scale=scale)
-            if will and (nw, nh) != (w, h):
-                if downscale_replace_uhd(path, nw, nh):
-                    stats["over4k"] += 1
-                else:
-                    stats["errors"] += 1
-                continue
+            if role == "watch":
+                nw, nh, will = _target_hygiene_size(w, h, role=role, scale=scale)
+                if will and (nw, nh) != (w, h):
+                    if downscale_replace_uhd(path, nw, nh):
+                        stats["over4k"] += 1
+                    else:
+                        stats["errors"] += 1
+                    continue
             stats["ok"] += 1
         except Exception as e:
             stats["errors"] += 1
@@ -4823,6 +4877,7 @@ def _run_toolbox_work_queue_body(wq, progress):
                 scale=int(ui.get("scale") or 4),
                 high_fps_floor=float(ui.get("tb_high_fps_floor") or 160),
                 scale_back_fps_to=float(ui.get("tb_scale_back_fps") or 60),
+                should_stop=wq.stop_requested,
             ),
         )
         added, skipped = wq.add_folder(inbox)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 from datetime import datetime
@@ -31,6 +32,35 @@ QUEUE_LABELS = {
     "toolbox": "Toolbox post-process queue",
     "group": "Group Therapy",
 }
+
+# Nested folders hygiene / pipeline never queues from
+SKIP_PARENT_DIRS = {
+    "novideo", "highfps", "over4k", "bin", "at_60fps",
+    "done", "archive", "work", "failed", "completed",
+}
+
+# Already-upscaled / step-1 outputs — video / image / Group Therapy must not pick these up
+_UPSCALED_OUTPUT_RE = re.compile(
+    r"(?:upscaled_x\d+|_Upscaled(?:_|\.|$)|^UpScale(?:2K|4K|8K)|_chunked_1(?:_|\.|$))",
+    re.I,
+)
+
+# Queues that run FlashVSR upscale (not RIFE/export)
+_UPSCALE_QUEUES = {"video", "image", "group"}
+
+
+def looks_like_upscaled_output(path: str) -> bool:
+    """True if this file is already a FlashVSR / step-1 output (belongs on Toolbox)."""
+    name = Path(path or "").name
+    return bool(name) and bool(_UPSCALED_OUTPUT_RE.search(name))
+
+
+def _path_in_sidecar_dir(path: str) -> bool:
+    try:
+        parts = {p.lower() for p in Path(path).parts}
+    except Exception:
+        return False
+    return bool(parts & SKIP_PARENT_DIRS)
 
 
 def _now_iso() -> str:
@@ -373,6 +403,13 @@ class FlashVSRWorkQueue:
                 continue
             if Path(ap).suffix.lower() not in self.extensions:
                 continue
+            if _path_in_sidecar_dir(ap):
+                skipped += 1
+                continue
+            if self.name in _UPSCALE_QUEUES and looks_like_upscaled_output(ap):
+                # Already upscaled — Toolbox / RIFE+export, not another FlashVSR pass
+                skipped += 1
+                continue
             key = _norm(ap)
             if key in existing:
                 skipped += 1
@@ -412,8 +449,7 @@ class FlashVSRWorkQueue:
         if recursive:
             for f in root.rglob("*"):
                 if f.is_file() and f.suffix.lower() in self.extensions:
-                    # skip nested done/archive folders
-                    if any(part.lower() in {"done", "archive", "failed", "completed"} for part in f.parts):
+                    if _path_in_sidecar_dir(str(f)):
                         continue
                     found.append(f)
         else:
@@ -423,6 +459,31 @@ class FlashVSRWorkQueue:
         # Latest video/image first so Start processes fresh work before older backlog
         paths = [str(p) for p in _sort_paths_newest_first(found)]
         return self.add_paths(paths)
+
+    def drop_wrong_stage_pending(self) -> int:
+        """
+        Pull already-upscaled files off video / image / Group Therapy pending lists.
+        Those belong on the Toolbox queue (RIFE + export), not another upscale pass.
+        """
+        if self.name not in _UPSCALE_QUEUES:
+            return 0
+        data = self.load()
+        items: List[Dict[str, Any]] = list(data.get("items") or [])
+        if not items:
+            return 0
+        kept: List[Dict[str, Any]] = []
+        dropped = 0
+        for it in items:
+            st = it.get("status", ST_PENDING)
+            path = it.get("path") or ""
+            if st in (ST_PENDING, ST_FAILED) and looks_like_upscaled_output(path):
+                dropped += 1
+                continue
+            kept.append(it)
+        if dropped:
+            data["items"] = kept
+            self.save(data)
+        return dropped
 
     def reorder_pending_newest_first(self) -> int:
         """

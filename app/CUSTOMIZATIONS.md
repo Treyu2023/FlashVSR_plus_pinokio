@@ -1,6 +1,6 @@
 # FlashVSR+ Pinokio — Custom Configuration & Code Changes
 
-**Last updated:** 2026-08-21  
+**Last updated:** 2026-08-23  
 **Install path:** `C:\pinokio\api\FlashVSR_plus_pinokio.git\app`  
 **Purpose:** Persistent record of customizations applied outside stock FlashVSR (survives app rollback/reinstall). Re-apply or merge these after updating the Pinokio launcher.
 
@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-08-23 | **Toolbox does not pre-downscale:** Ready-for-Toolbox hygiene no longer recodes over-UHD upscales (that was FlashVSR intake work). Toolbox = RIFE + export only. Over4K originals are restored over the CRF-14 recodes. Video / image / Group Therapy skip already-upscaled files so they are not 4×'d again. |
 | 2026-08-21 | **Preserve auto-reapply:** Update / Install / Start run `env_guard.py reapply`. Custom files (Group Therapy, PID pairing, toolbox FPS/no-video, 4K-safe, `webui_config`) are restored if a stock pull/clone overwrote them. Stale snapshots without current markers cannot clobber live code. |
 | 2026-08-21 | **Group Therapy pairing:** no per-file `GT-<id>__name` folders. Before/After stay flat; pair id is `_PID_xxxxxxxx` at the end of the filename plus Title metadata (`PID_xxxxxxxx`). Media Center tags are not touched. Retro flatten remaps existing GT folders into the `9xxxxxxx` band so they cannot collide with new auto batches. |
 | 2026-08-18 | **Group Therapy:** process originals in groups of N (upscale → RIFE 2× → RIFE 2× → export), then the next N. After each file: keep only original + final in the user Before/After pairing folders; delete resized/upscale/RIFE temps. Image-queue `4k_safe` no longer overwrites pipeline mode (imageio URI: None). |
@@ -35,9 +36,9 @@
 |------|--------|
 | `webui_config` | **Created** — user defaults (pipeline folders + Group Therapy) |
 | `naming_utils.py` | **Created** — output filename conventions |
-| `webui.py` | **Modified** — config, paths, Group Therapy, hygiene, 4K-safe, PID pairing |
+| `webui.py` | **Modified** — config, paths, Group Therapy, hygiene, 4K-safe, PID pairing; toolbox hygiene no longer recodes |
 | `group_therapy.py` | **Created** — grouped pipeline + flat `_PID_` pairing |
-| `flashvsr_work_queue.py` | **Modified** — size-dedupe, Group Therapy status |
+| `flashvsr_work_queue.py` | **Modified** — size-dedupe, Group Therapy status, skip already-upscaled on video/image/group |
 | `toolbox/toolbox.py` | **Modified** — FPS cap, no-video probe, HighFPS skip |
 | `src/pipelines/flashvsr_tiny_long.py` | **Modified** — refuse `output_path=None` (4k_safe mode bug) |
 | `../scripts/env_guard.py` | **Modified** — snapshot + **reapply after Update/Install/Start** |

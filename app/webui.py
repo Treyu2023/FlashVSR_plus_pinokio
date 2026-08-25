@@ -139,25 +139,24 @@ TIPS = {
         "turning off is only for short tiny-mode tests."
     ),
     "tile_size": (
-        "Tile Size — default 320. Larger tiles = fewer seams / more detail per tile; uses more VRAM. "
-        "If OOM on tall 4× outputs, drop to 256 or lower. Must keep overlap < half of tile size."
+        "Tile Size — default 256. Larger tiles = fewer seams / more VRAM. "
+        "Must keep overlap < half of tile size (256 → overlap ≤128)."
     ),
     "tile_overlap": (
-        "Tile Overlap — default 32. Softens tile seams without eating too much of each tile. "
-        "Must stay < half of tile size (e.g. tile 320 → overlap ≤160). Raise to 48 if you see soft grid seams."
+        "Tile Overlap — default 32. Softens tile seams. Must stay < half of tile size."
     ),
     "enable_chunks": (
         "Process as Chunks — ON (default). Splits long videos into segments so 64GB system RAM and 24GB VRAM stay healthy. "
         "Keep on for anything longer than ~10–15s at 4×. Disable only for short tests."
     ),
     "chunk_duration": (
-        "Max Chunk Duration — default 10s with 1024px inputs (was 12s @ 768). Longer = fewer seams but more peak VRAM. "
-        "If free VRAM drops under ~4GB mid-run, lower to 8s. Raise to 12–15s only when VRAM headroom is large."
+        "Max Chunk Duration — default 10.25s. Longer = fewer seams but more peak VRAM. "
+        "If free VRAM drops under ~4GB mid-run, lower to 8s."
     ),
     "batch_resize": (
-        "Pre-downscale before FlashVSR. Default 4K-safe (auto): math so (input × scale) never exceeds "
-        "UHD 4K — 3840×2160 for 16:9 landscape, or 2160×3840 for 9:16 portrait (at 4× → max 960×540 or 540×960). "
-        "Only shrinks, never upsizes. Fixed px presets also clamp so 4× stays inside that 4K box. "
+        "Downscale happens per file as it is processed (never the whole folder first). "
+        "4K-safe uses separate 16:9 and 9:16 input sizes (default ¼ of UHD: 960×540 and 540×960). "
+        "Fit-scale + lanczos/full-chroma, CRF 12, tagged bt709 + source color range. "
         "No Resize = leave source as-is (may exceed 4K after upscale)."
     ),
     "autosave": (
@@ -181,7 +180,7 @@ TIPS = {
         "Raise to 9–11 for smoother temporal stability on motion-heavy clips."
     ),
     "quality": (
-        "Output Video Quality — encode quality slider (1–10). Default 9 keeps fine detail for CIV/export. "
+        "Output Video Quality — encode quality slider (1–10). Default 10 is max detail for CIV/export. "
         "8–10 = near-lossless but large files on 4K-class outputs. 5–7 = smaller previews / drafts."
     ),
     "kv_ratio": (
@@ -274,12 +273,16 @@ TIPS = {
     "tb_inbox_folder": "Step 5 — Toolbox watches / picks from here (usually same as Step 3).",
     "gt_group_size": (
         "Group Therapy size — how many originals go through one full pipeline pass "
-        "before the next group starts. 10 = 10 upscale → 10 RIFE → 10 RIFE → 10 export."
+        "before the next group starts. Default 5."
     ),
     "gt_before_dir": "Before folder (flat) — originals land here as name_PID_xxxxxxxx.mp4 (same id as After). Title metadata is also set to PID_xxxxxxxx; Media Center tags are not touched.",
     "gt_after_dir": "After folder (flat) — finals land here as name_PID_xxxxxxxx.mp4 (same id as Before). No per-file subfolders.",
     "folder_path": "Folder of videos/images for batch. Use absolute Windows paths (e.g. D:\\clips\\batch).",
-    "img_quality": "Still image encode quality. Higher = larger files. 7 default matches video profile.",
+    "img_quality": "Still image encode quality (1–10). Default 10 matches video.",
+    "gt_rife_mode": (
+        "Group Therapy RIFE stage — Off / 2× / 4×. 4× = two 2× interpolations (24fps → 96fps). "
+        "These controls live on this tab and are what Group Therapy actually uses (Toolbox sliders do not)."
+    ),
     "img_fps": "Unused for still images (placeholder control shared with video advanced block).",
     "two_pass": "Two-Pass Encoding — better compression at same quality; slower. Hidden/experimental for long clips.",
 }
@@ -600,18 +603,18 @@ def get_ui_defaults(config=None):
         config = load_config()
     # Fallbacks when webui_config key is missing (user profile defaults).
     specs = {
-        "chunk_duration": (10.0, float),
+        "chunk_duration": (10.25, float),
         "enable_chunks": (True, bool),
         "tiled_dit": (True, bool),
         "tiled_vae": (True, bool),
         "unload_dit": (True, bool),
-        "tile_size": (320, int),
+        "tile_size": (256, int),
         "tile_overlap": (32, int),
         "attention_mode": ("sage", str),
         "sparse_ratio": (1.0, float),
         "local_range": (7, int),
         "kv_ratio": (3, int),
-        "quality": (9, int),
+        "quality": (10, int),
         "randomize_seed": (False, bool),
         "scale": (4, int),
         "mode": ("tiny", str),
@@ -622,6 +625,11 @@ def get_ui_defaults(config=None):
         "device": ("cuda:0", str),
         # 1024×4 ≈ 4096 wide — keeps more source detail than 768 (was crushing Grok clips)
         "batch_resize_preset": ("4K-safe (auto)", str),
+        # ¼ of UHD 4K input (16:9 3840×2160 → 960×540, 9:16 2160×3840 → 540×960)
+        "resize_16x9_w": (960, int),
+        "resize_16x9_h": (540, int),
+        "resize_9x16_w": (540, int),
+        "resize_9x16_h": (960, int),
         "batch_watch_folder": (r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS", str),
         "batch_source_archive_dir": (
             r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
@@ -646,13 +654,18 @@ def get_ui_defaults(config=None):
         "tb_high_fps_floor": (160, int),
         "tb_scale_back_fps": (60, int),
         "tb_pipeline_ops": ("Frame Adjust,Export", str),
-        "tb_frames_quality": (98, int),
-        "tb_export_quality": (96, int),
+        "tb_frames_quality": (100, int),
+        "tb_export_quality": (100, int),
         "tb_export_max_width": (3840, int),
+        "gt_rife_mode": ("4x Frames", str),
+        "gt_rife_quality": (100, int),
+        "gt_export_quality": (100, int),
+        "gt_export_max_width": (3840, int),
+        "gt_rife_streaming": (True, bool),
         # Quality-first toolbox export (slower encode, sharper finals)
         "tb_export_preset": ("slow", str),
         "tb_prefer_nvenc": (True, bool),
-        "gt_group_size": (10, int),
+        "gt_group_size": (5, int),
         "gt_do_upscale": (True, bool),
         "gt_do_rife1": (True, bool),
         "gt_do_rife2": (True, bool),
@@ -814,6 +827,28 @@ def save_config(config):
                 f.write(f"{key}={value}\n")
     except Exception as e:
         log(f"Error saving config: {e}", message_type="error")
+
+
+def persist_orientation_resize(preset=None, w16=None, h16=None, w9=None, h9=None):
+    """Save 16:9 / 9:16 input caps (used at process time, not as a folder pre-pass)."""
+    cfg = load_config()
+    if preset is not None:
+        cfg["batch_resize_preset"] = str(preset)
+    def _num(val, fallback):
+        try:
+            n = int(float(val))
+            return max(16, n)
+        except (TypeError, ValueError):
+            return fallback
+    if w16 is not None:
+        cfg["resize_16x9_w"] = _num(w16, 960)
+    if h16 is not None:
+        cfg["resize_16x9_h"] = _num(h16, 540)
+    if w9 is not None:
+        cfg["resize_9x16_w"] = _num(w9, 540)
+    if h9 is not None:
+        cfg["resize_9x16_h"] = _num(h9, 960)
+    save_config(cfg)
 
 def log(message:str, message_type:str="normal"):
     if message_type == 'error':
@@ -2136,13 +2171,14 @@ def resize_input_image(image_path, max_width, scale=4, progress=gr.Progress(), m
     try:
         log(
             f"Resizing image {current_width}×{current_height} → {new_width}×{new_height} "
-            f"(center crop, aspect preserved)...",
+            f"(fit-scale LANCZOS, no crop)...",
             message_type="info",
         )
         progress(0.3, desc="Resizing input image...")
         
         img = Image.open(image_path).convert("RGB")
-        img_resized = center_crop_cover_pil(img, new_width, new_height)
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        img_resized = img.resize((int(new_width), int(new_height)), resample)
         
         # Generate output path in temp directory
         input_basename = os.path.splitext(os.path.basename(image_path))[0]
@@ -2842,6 +2878,15 @@ def _gt_upscale_one(video_path, *, mode, model_version, scale, color_fix, tiled_
     return out, extra_resized
 
 
+def _gt_rife_flags(mode):
+    m = str(mode or "4x Frames").strip().lower()
+    if m.startswith("off") or m.startswith("no"):
+        return False, False
+    if m.startswith("2"):
+        return True, False
+    return True, True
+
+
 def _gt_rife_one(src_path, *, frames_q, use_streaming):
     global toolbox_processor
     if toolbox_processor is None:
@@ -2914,6 +2959,11 @@ def run_group_therapy(
     do_rife1,
     do_rife2,
     do_export,
+    rife_mode=None,
+    rife_quality=None,
+    export_quality=None,
+    export_max_width=None,
+    rife_streaming=None,
     progress=gr.Progress(track_tqdm=True),
 ):
     wq = get_group_therapy_queue()
@@ -2954,6 +3004,11 @@ def run_group_therapy(
             do_rife1=do_rife1,
             do_rife2=do_rife2,
             do_export=do_export,
+            rife_mode=rife_mode,
+            rife_quality=rife_quality,
+            export_quality=export_quality,
+            export_max_width=export_max_width,
+            rife_streaming=rife_streaming,
             progress=progress,
         )
     finally:
@@ -2992,7 +3047,12 @@ def _run_group_therapy_body(
     do_rife1,
     do_rife2,
     do_export,
-    progress,
+    rife_mode=None,
+    rife_quality=None,
+    export_quality=None,
+    export_max_width=None,
+    rife_streaming=None,
+    progress=None,
 ):
     global toolbox_processor
     wq.clear_stop()
@@ -3001,7 +3061,9 @@ def _run_group_therapy_body(
     watch_folder = (watch_folder or ui.get("batch_watch_folder") or paths.get("watch") or "").strip()
     before_dir = (before_dir or ui.get("gt_before_dir") or ui.get("batch_source_archive_dir") or paths["pre_scaled"]).strip()
     after_dir = (after_dir or ui.get("gt_after_dir") or get_toolbox_output_dir()).strip()
-    group_size = max(1, int(group_size or ui.get("gt_group_size") or 10))
+    group_size = max(1, int(group_size or ui.get("gt_group_size") or 5))
+    if rife_mode is not None:
+        do_rife1, do_rife2 = _gt_rife_flags(rife_mode)
     stages = gt.selected_stages(
         do_upscale=bool(do_upscale),
         do_rife1=bool(do_rife1),
@@ -3009,10 +3071,19 @@ def _run_group_therapy_body(
         do_export=bool(do_export),
     )
     last_stage = stages[-1]
-    frames_q = int(ui.get("tb_frames_quality") or 98)
-    export_q = int(ui.get("tb_export_quality") or 96)
-    export_w = int(ui.get("tb_export_max_width") or 3840)
-    use_streaming = True if ui.get("tb_use_streaming") is None else bool(ui.get("tb_use_streaming"))
+    try:
+        frames_q = int(rife_quality if rife_quality is not None else (ui.get("gt_rife_quality") or ui.get("tb_frames_quality") or 100))
+    except (TypeError, ValueError):
+        frames_q = 100
+    try:
+        export_q = int(export_quality if export_quality is not None else (ui.get("gt_export_quality") or ui.get("tb_export_quality") or 100))
+    except (TypeError, ValueError):
+        export_q = 100
+    try:
+        export_w = int(export_max_width if export_max_width is not None else (ui.get("gt_export_max_width") or ui.get("tb_export_max_width") or 3840))
+    except (TypeError, ValueError):
+        export_w = 3840
+    use_streaming = bool(ui.get("gt_rife_streaming", True)) if rife_streaming is None else bool(rife_streaming)
     export_preset = (ui.get("tb_export_preset") or "slow").strip().lower()
     prefer_nvenc = True if ui.get("tb_prefer_nvenc") is None else bool(ui.get("tb_prefer_nvenc"))
 
@@ -3033,6 +3104,13 @@ def _run_group_therapy_body(
     cfg["gt_do_rife1"] = bool(do_rife1)
     cfg["gt_do_rife2"] = bool(do_rife2)
     cfg["gt_do_export"] = bool(do_export)
+    cfg["gt_rife_mode"] = "4x Frames" if do_rife2 else ("2x Frames" if do_rife1 else "Off")
+    cfg["gt_rife_quality"] = frames_q
+    cfg["gt_export_quality"] = export_q
+    cfg["gt_export_max_width"] = export_w
+    cfg["gt_rife_streaming"] = bool(use_streaming)
+    if batch_resize_preset is not None:
+        cfg["batch_resize_preset"] = str(batch_resize_preset)
     save_config(cfg)
 
     os.makedirs(before_dir, exist_ok=True)
@@ -3152,6 +3230,27 @@ def _run_group_therapy_body(
             wq.set_meta(gt_current_stage=stage)
             label = gt.STAGE_LABELS.get(stage, stage)
             log(f"— Group {gid}: {label} ({len(members)} files) —", message_type="info")
+            if stage == "upscale":
+                b16 = orientation_input_box(1920, 1080)
+                b9 = orientation_input_box(1080, 1920)
+                log(
+                    f"Group {gid}: downscale only this batch as each file runs "
+                    f"(16:9 {int(b16[0])}×{int(b16[1])}, 9:16 {int(b9[0])}×{int(b9[1])}; "
+                    f"fit-scale + color range — not the whole folder).",
+                    message_type="info",
+                )
+            if stage in ("rife1", "rife2"):
+                log(
+                    f"Group {gid}: RIFE {label} using Group Therapy settings "
+                    f"(quality {frames_q}, streaming={use_streaming}) — not Toolbox tab sliders.",
+                    message_type="info",
+                )
+            if stage == "export":
+                log(
+                    f"Group {gid}: export quality {export_q}, max width {export_w} "
+                    f"(Group Therapy stage 3 controls).",
+                    message_type="info",
+                )
             if stage in ("rife1", "rife2", "export"):
                 release_processing_vram()
 
@@ -4563,10 +4662,12 @@ def probe_color_range(video_path: str) -> str:
     return "pc" if "grok-video" in name else "pc"
 
 
-def hq_downscale_vf(new_w: int, new_h: int) -> str:
+def hq_downscale_vf(new_w: int, new_h: int, color_range: str = "pc") -> str:
     """Fit-scale to the already-computed size. Never cover-crop (that crushed edges + chroma)."""
+    rng = "full" if str(color_range).lower() in ("pc", "jpeg", "full") else "limited"
     return (
-        f"scale={int(new_w)}:{int(new_h)}:flags=lanczos+accurate_rnd+full_chroma_int,"
+        f"scale={int(new_w)}:{int(new_h)}:flags=lanczos+accurate_rnd+full_chroma_int"
+        f":in_range={rng}:out_range={rng},"
         "setsar=1"
     )
 
@@ -4598,8 +4699,8 @@ def _ffmpeg_scale_to(src_path: str, dest_path: str, new_w: int, new_h: int) -> O
         return None
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     nw, nh = int(new_w), int(new_h)
-    vf = hq_downscale_vf(nw, nh)
     rng = probe_color_range(src_path)
+    vf = hq_downscale_vf(nw, nh, rng)
     base = [
         "ffmpeg", "-y", "-i", src_path,
         "-vf", vf,
@@ -4682,52 +4783,21 @@ def hygiene_reclaim_sidecars(
     target_fps = int(round(scale_back_fps_to or 60))
 
     over4k = os.path.join(inbox, "Over4K")
-    if role != "watch":
-        # Toolbox inbox: Over4K holds real upscales that were wrongly recoded.
-        # Put the original back (overwrite the CRF-14 recode) — no scaling.
-        for src in _hygiene_video_files(over4k):
-            name = os.path.basename(src)
-            dest = os.path.join(inbox, name)
-            try:
-                os.replace(src, dest)
-                stats["reclaimed"] += 1
-                log(
-                    f"↩️  Restored original upscale from Over4K (no recode) → {name}",
-                    message_type="finish",
-                )
-            except Exception as e:
-                stats["errors"] += 1
-                log(f"Restore Over4K failed {name}: {e}", message_type="warning")
-    else:
-        for src in _hygiene_video_files(over4k):
-            name = os.path.basename(src)
-            dest = os.path.join(inbox, name)
-            if _inbox_has_file(inbox, name):
-                continue
-            w, h = probe_file_wh(src)
-            if w <= 0 or h <= 0:
-                continue
-            nw, nh, will = _target_hygiene_size(w, h, role=role, scale=scale)
-            try:
-                if will:
-                    if not _ffmpeg_scale_to(src, dest, nw, nh):
-                        stats["errors"] += 1
-                        continue
-                else:
-                    shutil.copy2(src, dest)
-                stats["reclaimed"] += 1
-                log(
-                    f"↩️  Reclaimed from Over4K → queue: {name}"
-                    + (
-                        f" ({w}×{h} → {nw}×{nh} 4K-safe so 4× stays UHD)"
-                        if will
-                        else ""
-                    ),
-                    message_type="finish",
-                )
-            except Exception as e:
-                stats["errors"] += 1
-                log(f"Reclaim Over4K failed {name}: {e}", message_type="warning")
+    # Never recode Over4K back into the inbox. Originals stay originals;
+    # downscale happens per file at process time (fit-scale + color range).
+    for src in _hygiene_video_files(over4k):
+        name = os.path.basename(src)
+        dest = os.path.join(inbox, name)
+        try:
+            os.replace(src, dest)
+            stats["reclaimed"] += 1
+            log(
+                f"↩️  Restored original from Over4K (no recode) → {name}",
+                message_type="finish",
+            )
+        except Exception as e:
+            stats["errors"] += 1
+            log(f"Restore Over4K failed {name}: {e}", message_type="warning")
 
     high = os.path.join(inbox, "HighFPS")
     playable = os.path.join(high, f"at_{target_fps}fps")
@@ -4793,9 +4863,7 @@ def hygiene_scan_folder(
     Rules:
       - no video stream → NoVideo\\
       - already 160+ FPS → HighFPS\\ + 60fps playable copy
-      - watch only: would exceed UHD after ×scale
-        → FlashVSR 4K-safe pre-downscale (lanczos cover + center crop, CRF 14).
-        Original archived in Over4K\\
+      - watch: do NOT downscale here (per-file at process time, 16:9 / 9:16 sizes)
       - toolbox: no size recode. Post-scale path is RIFE + export only.
     """
     stats = {"novideo": 0, "highfps": 0, "over4k": 0, "reclaimed": 0, "ok": 0, "errors": 0}
@@ -4836,14 +4904,8 @@ def hygiene_scan_folder(
                     stats["errors"] += 1
                 continue
 
-            if role == "watch":
-                nw, nh, will = _target_hygiene_size(w, h, role=role, scale=scale)
-                if will and (nw, nh) != (w, h):
-                    if downscale_replace_uhd(path, nw, nh):
-                        stats["over4k"] += 1
-                    else:
-                        stats["errors"] += 1
-                    continue
+            # Watch/intake: never downscale the whole folder first.
+            # Per-file (or per Group Therapy batch) resize happens at process time.
             stats["ok"] += 1
         except Exception as e:
             stats["errors"] += 1
@@ -5336,6 +5398,25 @@ def analyze_input_video(video_path):
 # UHD 4K frame limits (long edge / short edge)
 UHD_4K_LONG = 3840
 UHD_4K_SHORT = 2160
+# ¼ of those UHD frames — default FlashVSR *input* sizes at 4×
+QUARTER_4K_16X9 = (960, 540)
+QUARTER_4K_9X16 = (540, 960)
+
+
+def orientation_input_box(width, height):
+    """Per-orientation input cap from config (defaults = ¼ of UHD 4K)."""
+    cfg = load_config()
+    try:
+        w16 = max(16, int(cfg.get("resize_16x9_w") or QUARTER_4K_16X9[0]))
+        h16 = max(16, int(cfg.get("resize_16x9_h") or QUARTER_4K_16X9[1]))
+        w9 = max(16, int(cfg.get("resize_9x16_w") or QUARTER_4K_9X16[0]))
+        h9 = max(16, int(cfg.get("resize_9x16_h") or QUARTER_4K_9X16[1]))
+    except (TypeError, ValueError):
+        w16, h16 = QUARTER_4K_16X9
+        w9, h9 = QUARTER_4K_9X16
+    if int(width or 0) >= int(height or 0):
+        return float(w16), float(h16)
+    return float(w9), float(h9)
 
 
 def uhd_4k_output_limits(width, height):
@@ -5393,7 +5474,7 @@ def calculate_resize_dimensions(
     if mode_l in ("4k_safe", "4k-safe", "auto_4k") or (
         isinstance(max_width, str) and is_4k_safe_preset(max_width)
     ):
-        box_w, box_h = uhd_4k_input_limits(cw, ch, scale=scale or 4)
+        box_w, box_h = orientation_input_box(cw, ch)
     else:
         # Legacy width cap; when scale known, also never exceed 4K after upscale
         if max_width is None or max_width == "" or max_width == 0:
@@ -5516,9 +5597,10 @@ def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress(), m
         return video_path
     
     try:
+        rng = probe_color_range(video_path)
         log(
             f"Resizing video {current_width}×{current_height} → {new_width}×{new_height} "
-            f"(fit-scale, no crop, color-range preserved)...",
+            f"(fit-scale, no crop, color-range {rng}, CRF 12)...",
             message_type="info",
         )
         progress(0.1, desc="Resizing input video...")
@@ -5532,8 +5614,7 @@ def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress(), m
         
         # Fit to the 4K-safe size already computed (do NOT cover-crop).
         progress(0.3, desc="Running FFmpeg resize...")
-        vf = hq_downscale_vf(new_width, new_height)
-        rng = probe_color_range(video_path)
+        vf = hq_downscale_vf(new_width, new_height, rng)
         
         # High-quality intermediate: cover-crop + limited-range 4:2:0 was the
         # color-shift / blocky pre-downscale. Keep full chroma + tagged bt709.
@@ -6609,10 +6690,49 @@ def create_ui():
                                         "1920px",
                                     )
                                     else "4K-safe (auto)",
-                                    label="Pre-downscale (4K-safe)",
+                                    label="Downscale mode (per file as it runs)",
                                     info=TIPS["batch_resize"],
                                     interactive=True
                                 )
+                                gr.Markdown(
+                                    "16:9 and 9:16 sizes are **input** pixels (default = ¼ of UHD 4K). "
+                                    "4× those numbers = 3840×2160 / 2160×3840. "
+                                    "Whole-folder pre-downscale is off — Group Therapy downscales only the current batch."
+                                )
+                                with gr.Row():
+                                    resize_16x9_w = gr.Number(
+                                        value=int(ui.get("resize_16x9_w") or 960),
+                                        label="16:9 width",
+                                        precision=0,
+                                        minimum=16,
+                                        maximum=3840,
+                                        info="Default 960 (¼ of 3840)",
+                                    )
+                                    resize_16x9_h = gr.Number(
+                                        value=int(ui.get("resize_16x9_h") or 540),
+                                        label="16:9 height",
+                                        precision=0,
+                                        minimum=16,
+                                        maximum=2160,
+                                        info="Default 540 (¼ of 2160)",
+                                    )
+                                with gr.Row():
+                                    resize_9x16_w = gr.Number(
+                                        value=int(ui.get("resize_9x16_w") or 540),
+                                        label="9:16 width",
+                                        precision=0,
+                                        minimum=16,
+                                        maximum=2160,
+                                        info="Default 540 (¼ of 2160)",
+                                    )
+                                    resize_9x16_h = gr.Number(
+                                        value=int(ui.get("resize_9x16_h") or 960),
+                                        label="9:16 height",
+                                        precision=0,
+                                        minimum=16,
+                                        maximum=3840,
+                                        info="Default 960 (¼ of 3840)",
+                                    )
 
                                 gr.Markdown(
                                     '<span style="font-size: 0.9em; color: #555;">'
@@ -6673,12 +6793,48 @@ def create_ui():
                                         label="After (finals, flat)",
                                         info=TIPS["gt_after_dir"],
                                     )
-                                gr.Markdown("Stages for each group (in order):")
+                                gr.Markdown(
+                                    "Stages for each group. **RIFE / export sliders on this tab** are what Group Therapy uses "
+                                    "(Toolbox tab sliders do not apply here)."
+                                )
                                 with gr.Row():
                                     gt_do_upscale = gr.Checkbox(label="1 · Upscale", value=bool(ui.get("gt_do_upscale", True)))
-                                    gt_do_rife1 = gr.Checkbox(label="2 · RIFE 2×", value=bool(ui.get("gt_do_rife1", True)))
-                                    gt_do_rife2 = gr.Checkbox(label="3 · RIFE 2× again", value=bool(ui.get("gt_do_rife2", True)))
-                                    gt_do_export = gr.Checkbox(label="4 · Export / interpolation", value=bool(ui.get("gt_do_export", True)))
+                                    gt_do_export = gr.Checkbox(
+                                        label="3 · Export (After / Ready for CIV)",
+                                        value=bool(ui.get("gt_do_export", True)),
+                                    )
+                                _gt_rife_saved = str(ui.get("gt_rife_mode") or "4x Frames")
+                                if _gt_rife_saved not in ("Off", "2x Frames", "4x Frames"):
+                                    _gt_rife_saved = "4x Frames"
+                                gt_rife_mode = gr.Radio(
+                                    choices=["Off", "2x Frames", "4x Frames"],
+                                    value=_gt_rife_saved,
+                                    label="2 · RIFE stage",
+                                    info=TIPS["gt_rife_mode"],
+                                )
+                                with gr.Row():
+                                    gt_rife_quality = gr.Slider(
+                                        minimum=0, maximum=100, step=5,
+                                        value=int(ui.get("gt_rife_quality") or ui.get("tb_frames_quality") or 100),
+                                        label="RIFE encode quality",
+                                        info="Used only for Group Therapy interpolation passes (0–100).",
+                                    )
+                                    gt_rife_streaming = gr.Checkbox(
+                                        label="RIFE streaming (low memory)",
+                                        value=bool(ui.get("gt_rife_streaming", True)),
+                                    )
+                                with gr.Row():
+                                    gt_export_quality = gr.Slider(
+                                        minimum=0, maximum=100, step=4,
+                                        value=int(ui.get("gt_export_quality") or ui.get("tb_export_quality") or 100),
+                                        label="Export quality (stage 3)",
+                                        info="Group Therapy final encode into the After folder.",
+                                    )
+                                    gt_export_max_width = gr.Slider(
+                                        minimum=256, maximum=3840, step=64,
+                                        value=int(ui.get("gt_export_max_width") or ui.get("tb_export_max_width") or 3840),
+                                        label="Export max width",
+                                    )
                                 gt_queue_status = gr.HTML(value=get_group_therapy_queue().status_html())
                                 with gr.Row():
                                     gt_add_btn = gr.Button("➕ Scan original folder", size="sm")
@@ -6793,7 +6949,7 @@ def create_ui():
                                 chunk_duration_slider = gr.Slider(
                                     minimum=1,
                                     maximum=30,
-                                    step=0.5,
+                                    step=0.25,
                                     value=ui["chunk_duration"],
                                     label="Max Chunk Duration (seconds)",
                                     info=TIPS["chunk_duration"]
@@ -6953,7 +7109,10 @@ def create_ui():
                                     info="Start/Resume scans this folder for images. Upscales → Ready for CIV\\images; originals → Pre Scaled.",
                                 )
                                 gr.Markdown("---")
-                                gr.Markdown('<span style="font-size: 0.9em; color: #666;">📐 **Batch Resize Preset**</span>')
+                                gr.Markdown(
+                                    '<span style="font-size: 0.9em; color: #666;">📐 **Batch Resize** — '
+                                    "same 16:9 / 9:16 sizes as the Video Batch tab. Per image as it runs.</span>"
+                                )
                                 img_batch_resize_preset = gr.Dropdown(
                                     choices=[
                                         "4K-safe (auto)",
@@ -7962,6 +8121,8 @@ def create_ui():
             if watch_folder and str(watch_folder).strip():
                 cfg = load_config()
                 cfg["batch_watch_folder"] = str(watch_folder).strip()
+                if batch_resize_preset is not None:
+                    cfg["batch_resize_preset"] = str(batch_resize_preset)
                 save_config(cfg)
             last_video, queue_html = run_flashvsr_work_queue(
                 mode, model_version, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap,
@@ -7969,6 +8130,16 @@ def create_ui():
                 sparse_ratio, kv_ratio, local_range, batch_resize_preset, enable_chunks, chunk_duration
             )
             return last_video, last_video, None, queue_html, queue_html
+
+        def _persist_resize_sizes(preset, w16, h16, w9, h9):
+            persist_orientation_resize(preset, w16, h16, w9, h9)
+
+        for _comp in (batch_resize_preset, resize_16x9_w, resize_16x9_h, resize_9x16_w, resize_9x16_h):
+            _comp.change(
+                fn=_persist_resize_sizes,
+                inputs=[batch_resize_preset, resize_16x9_w, resize_16x9_h, resize_9x16_w, resize_9x16_h],
+                outputs=[],
+            )
 
         batch_add_queue_btn.click(
             fn=handle_queue_add,
@@ -8077,13 +8248,20 @@ def create_ui():
             mode, model_version, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap,
             unload_dit, dtype_str, seed, device, fps_override, quality, attention_mode,
             sparse_ratio, kv_ratio, local_range, batch_resize_preset, enable_chunks, chunk_duration,
-            group_size, watch_folder, before_dir, after_dir, do_upscale, do_rife1, do_rife2, do_export,
+            group_size, watch_folder, before_dir, after_dir, do_upscale, do_export,
+            rife_mode, rife_quality, rife_streaming, export_quality, export_max_width,
         ):
+            do_rife1, do_rife2 = _gt_rife_flags(rife_mode)
             last_video, queue_html = run_group_therapy(
                 mode, model_version, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap,
                 unload_dit, dtype_str, seed, device, fps_override, quality, attention_mode,
                 sparse_ratio, kv_ratio, local_range, batch_resize_preset, enable_chunks, chunk_duration,
                 group_size, watch_folder, before_dir, after_dir, do_upscale, do_rife1, do_rife2, do_export,
+                rife_mode=rife_mode,
+                rife_quality=rife_quality,
+                export_quality=export_quality,
+                export_max_width=export_max_width,
+                rife_streaming=rife_streaming,
             )
             return last_video, last_video, None, queue_html, queue_html
 
@@ -8113,7 +8291,8 @@ def create_ui():
                 sparse_ratio_slider, kv_ratio_slider, local_range_slider, batch_resize_preset,
                 enable_chunk_processing, chunk_duration_slider,
                 gt_group_size, gt_watch_folder, gt_before_dir, gt_after_dir,
-                gt_do_upscale, gt_do_rife1, gt_do_rife2, gt_do_export,
+                gt_do_upscale, gt_do_export,
+                gt_rife_mode, gt_rife_quality, gt_rife_streaming, gt_export_quality, gt_export_max_width,
             ],
             outputs=[video_output, output_file_path, video_slider_output, completion_status, gt_queue_status],
         ).then(

@@ -1,6 +1,6 @@
 # FlashVSR+ Pinokio — Custom Configuration & Code Changes
 
-**Last updated:** 2026-08-23  
+**Last updated:** 2026-08-25  
 **Install path:** `C:\pinokio\api\FlashVSR_plus_pinokio.git\app`  
 **Purpose:** Persistent record of customizations applied outside stock FlashVSR (survives app rollback/reinstall). Re-apply or merge these after updating the Pinokio launcher.
 
@@ -10,6 +10,8 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-08-25 | **GT RIFE/export on that tab:** Group Therapy has its own RIFE Off/2×/4× plus quality/width sliders (Toolbox sliders no longer silently ignored). Defaults: video/image quality **10**, chunk **10.25s**, tile **256**/overlap **32**, RIFE/export quality **100**. |
+| 2026-08-25 | **Per-file / per-batch downscale:** watch-folder hygiene no longer recodes the whole inbox first. Resize runs as each file is processed (Group Therapy: current batch only). Separate 16:9 (960×540) and 9:16 (540×960) input sizes = ¼ of UHD 4K. Fit-scale + in_range/out_range color, CRF 12, bt709. |
 | 2026-08-25 | **Fit-scale downscale (no cover-crop):** pre-resize used `increase`+`crop`, which chopped edges and smeared chroma (blocky + color shift). Now FIT to the 4K-safe size with `lanczos+accurate_rnd+full_chroma_int`, CRF 12, tagged bt709 + full (`pc`) range. Toolbox NVENC export: p6/hq, lower CQ, AQ on, same color tags. |
 | 2026-08-23 | **Toolbox does not pre-downscale:** Ready-for-Toolbox hygiene no longer recodes over-UHD upscales (that was FlashVSR intake work). Toolbox = RIFE + export only. Over4K originals are restored over the CRF-14 recodes. Video / image / Group Therapy skip already-upscaled files so they are not 4×'d again. |
 | 2026-08-21 | **Preserve auto-reapply:** Update / Install / Start run `env_guard.py reapply`. Custom files (Group Therapy, PID pairing, toolbox FPS/no-video, 4K-safe, `webui_config`) are restored if a stock pull/clone overwrote them. Stale snapshots without current markers cannot clobber live code. |

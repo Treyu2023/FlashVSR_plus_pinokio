@@ -3956,8 +3956,8 @@ def _run_flashvsr_work_queue_body(
         return None, wq.status_html(note)
 
     completed_dir = wq.set_fixed_completed_dir(handoff)
-    # Progress logs still under app outputs
-    log_root = os.path.join(get_output_dir(), "work_queue_video", f"run_{time.strftime('%Y%m%d_%H%M%S')}")
+    # Progress logs under app\\outputs\\queue_logs — never the media folder
+    log_root = os.path.join(get_queue_log_dir(), "work_queue_video", f"run_{time.strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(log_root, exist_ok=True)
     batch_output_dir = log_root
     all_paths = [it["path"] for it in wq.all_items()]
@@ -6563,6 +6563,59 @@ def open_folder(folder_path):
     except Exception as e:
         return f'<div style="padding: 1px; background-color: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 4px; color: #fca5a5;">❌ Error opening folder: {e}</div>'
 
+
+def _looks_like_queue_log_dir(path: str) -> bool:
+    """True for app\\outputs work-queue / json / txt status folders — not media."""
+    if not path:
+        return True
+    p = os.path.normpath(os.path.abspath(str(path))).lower()
+    parts = p.replace("/", "\\").split("\\")
+    if any(x.startswith("work_queue") for x in parts):
+        return True
+    if "queue_logs" in parts or "batch_queues" in parts:
+        return True
+    try:
+        if p == os.path.normpath(os.path.abspath(DEFAULT_OUTPUT_DIR)).lower():
+            return True
+        if p == os.path.normpath(os.path.abspath(TEMP_DIR)).lower():
+            return True
+        if p.startswith(os.path.normpath(os.path.abspath(TEMP_DIR)).lower() + os.sep):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def open_media_folder(file_or_dir=None, fallback=None, as_html=True):
+    """
+    Open Explorer at the actual videos/images, not queue JSON/TXT dirs.
+    If a just-saved file is passed, open that file's parent.
+    """
+    folder = None
+    raw = file_or_dir
+    if isinstance(raw, dict):
+        raw = raw.get("path") or raw.get("name") or ""
+    elif raw is not None and not isinstance(raw, (str, os.PathLike)):
+        raw = getattr(raw, "name", None) or str(raw)
+    raw = str(raw or "").strip()
+    if raw:
+        if os.path.isfile(raw):
+            folder = os.path.dirname(os.path.abspath(raw))
+        elif os.path.isdir(raw):
+            folder = os.path.abspath(raw)
+    if not folder or _looks_like_queue_log_dir(folder):
+        folder = fallback or get_output_dir()
+    if _looks_like_queue_log_dir(folder):
+        folder = get_workflow_paths().get("batch_upscale_handoff_dir") or get_output_dir()
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        pass
+    html = open_folder(folder)
+    if as_html:
+        return html
+    return re.sub(r"<[^>]+>", "", html).strip()
+
 def save_file(file_path):
     if file_path and os.path.exists(file_path):
         log(f"File saved to: {file_path}", message_type="finish")
@@ -8040,8 +8093,10 @@ def create_ui():
         )
         
         open_folder_button.click(
-            fn=lambda: open_folder(get_output_dir()), 
-            inputs=[], 
+            fn=lambda p: open_media_folder(
+                p, get_workflow_paths()["batch_upscale_handoff_dir"]
+            ),
+            inputs=[output_file_path],
             outputs=[save_status]
         ).then(
             fn=do_sleep,
@@ -8869,25 +8924,9 @@ def create_ui():
             show_progress="hidden"
         )
         
-        # Open folder button
-        def open_images_folder():
-            images_folder = os.path.join(get_output_dir(), "images")
-            os.makedirs(images_folder, exist_ok=True)
-            try:
-                if sys.platform == "win32":
-                    os.startfile(images_folder)
-                elif sys.platform == "darwin":
-                    subprocess.Popen(["open", images_folder])
-                else:
-                    subprocess.Popen(["xdg-open", images_folder])
-                return f'<div style="padding: 1px; background-color: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac;">✅ Opened folder: {images_folder}</div>'
-            except Exception as e:
-                return f'<div style="padding: 1px; background-color: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 4px; color: #fca5a5;">❌ Error opening folder: {e}</div>'
-
-
         img_open_folder_button.click(
-            fn=open_images_folder,
-            inputs=[],
+            fn=lambda p: open_media_folder(p, get_image_output_dir()),
+            inputs=[img_output_path],
             outputs=[img_save_status]
         ).then(
             fn=do_sleep,
@@ -8954,7 +8993,8 @@ def create_ui():
         # --- Toolbox Tab Handlers ---
         
         tb_open_folder_btn.click(
-            fn=toolbox_processor.open_output_folder, 
+            fn=lambda p: open_media_folder(p, get_toolbox_output_dir(), as_html=False),
+            inputs=[processed_video],
             outputs=[tb_status_message]
         )
         

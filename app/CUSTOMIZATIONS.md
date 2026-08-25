@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-08-25 | **Open Output Folder buttons:** Video → Ready for Toolbox (or last saved file). Image → Ready for CIV\\images. Toolbox → Ready for CIV. Never open `app\\outputs\\work_queue_*` JSON/TXT. Queue progress logs moved to `app\\outputs\\queue_logs`. |
 | 2026-08-25 | **HDR auto per file (no tagging):** Follow source is still TV/full range. HDR (PQ/HLG/DoVi/mastering metadata) is probed on each file and **hable-tonemapped to SDR 10-bit Rec.709** for FlashVSR (SDR model). 10-bit SDR stays 10-bit. 4K-safe auto (960×540 / 540×960) remains the 4090 OOM-safe max. |
 | 2026-08-25 | **Downscale quality knobs (4090 defaults):** Scale kernel **lanczos**, temp CRF **10**, color **Follow source**. Follow source copies TV/full from the file. Always full is range only. Per-file fit-scale; no whole-folder first pass. |
 | 2026-08-25 | **GT RIFE/export on that tab:** Group Therapy has its own RIFE Off/2×/4× plus quality/width sliders (Toolbox sliders no longer silently ignored). Defaults: video/image quality **10**, chunk **10.25s**, tile **256**/overlap **32**, RIFE/export quality **100**. |

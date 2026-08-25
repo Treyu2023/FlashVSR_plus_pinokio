@@ -59,7 +59,7 @@ CRITICAL = [
 
 # Strings that MUST appear in a live custom file. Missing ⇒ stock overwrite.
 MARKERS = {
-    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir", "no size recode", "accurate_rnd+full_chroma_int", "orientation_input_box", "_gt_rife_flags"),
+    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir", "no size recode", "accurate_rnd+full_chroma_int", "orientation_input_box", "_gt_rife_flags", "resolve_resize_encode"),
     "app/group_therapy.py": ("stamp_title_pid", "flatten_gt_pair_folders", "pid_token"),
     "app/flashvsr_work_queue.py": ("gt_pair_id", "drop_wrong_stage_pending"),
     "app/naming_utils.py": ("clean_original_stem", "step1_filename"),
@@ -78,7 +78,7 @@ MARKERS = {
 CONFIG_FILES = {"app/webui_config.bak"}
 
 # User pipeline paths — stock/empty config gets replaced; live custom config is kept.
-MARKERS["app/webui_config"] = ("gt_before_dir=", "gt_after_dir=", "batch_watch_folder=")
+MARKERS["app/webui_config"] = ("gt_before_dir=", "gt_after_dir=", "batch_watch_folder=", "resize_kernel=")
 
 SAFETENSORS_PIN = "safetensors~=0.6.0"
 

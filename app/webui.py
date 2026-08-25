@@ -156,8 +156,24 @@ TIPS = {
     "batch_resize": (
         "Downscale happens per file as it is processed (never the whole folder first). "
         "4K-safe uses separate 16:9 and 9:16 input sizes (default ¼ of UHD: 960×540 and 540×960). "
-        "Fit-scale + lanczos/full-chroma, CRF 12, tagged bt709 + source color range. "
+        "Fit-scale; kernel/CRF/color knobs below. Default 4090: lanczos, CRF 10, follow source. "
+        "Follow source = TV vs full range from the file; HDR (PQ/HLG) is kept 10-bit when present. "
+        "Full vs source is NOT HDR — that is only 16–235 vs 0–255. "
         "No Resize = leave source as-is (may exceed 4K after upscale)."
+    ),
+    "resize_kernel": (
+        "Scale kernel — how neighboring pixels blend when shrinking. "
+        "lanczos (default, 4090): sharpest / most detail. spline: similar, slightly smoother. "
+        "bicubic: faster and softer (more blur; avoid unless you want less ringing)."
+    ),
+    "resize_crf": (
+        "Temp encode quality after downscale (libx264). Lower = more bits kept. "
+        "10 (default, 4090): fattest temp file, least extra loss. 12 / 14 = smaller temps."
+    ),
+    "resize_color": (
+        "Color range. Follow source (default) copies TV (16–235) or full (0–255) from the file. "
+        "HDR (PQ/HLG + bt2020 10-bit) is kept when the source is HDR — that is separate from this knob. "
+        "Always full forces 0–255; only use if a source is tagged wrong and looks crushed."
     ),
     "autosave": (
         "Autosave Output — ON saves finished upscales automatically to the FlashVSR output folder. "
@@ -630,6 +646,10 @@ def get_ui_defaults(config=None):
         "resize_16x9_h": (540, int),
         "resize_9x16_w": (540, int),
         "resize_9x16_h": (960, int),
+        # 4090 optimum: sharpest kernel, fattest temp encode, follow source range (HDR pass-through)
+        "resize_kernel": ("lanczos", str),
+        "resize_crf": (10, int),
+        "resize_color": ("source", str),
         "batch_watch_folder": (r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS", str),
         "batch_source_archive_dir": (
             r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
@@ -829,25 +849,36 @@ def save_config(config):
         log(f"Error saving config: {e}", message_type="error")
 
 
-def persist_orientation_resize(preset=None, w16=None, h16=None, w9=None, h9=None):
-    """Save 16:9 / 9:16 input caps (used at process time, not as a folder pre-pass)."""
+def persist_orientation_resize(
+    preset=None, w16=None, h16=None, w9=None, h9=None,
+    kernel=None, crf=None, color=None,
+):
+    """Save 16:9 / 9:16 input caps + downscale quality knobs."""
     cfg = load_config()
     if preset is not None:
         cfg["batch_resize_preset"] = str(preset)
-    def _num(val, fallback):
+    def _num(val, fallback, lo=16, hi=3840):
         try:
             n = int(float(val))
-            return max(16, n)
+            return max(lo, min(hi, n))
         except (TypeError, ValueError):
             return fallback
     if w16 is not None:
         cfg["resize_16x9_w"] = _num(w16, 960)
     if h16 is not None:
-        cfg["resize_16x9_h"] = _num(h16, 540)
+        cfg["resize_16x9_h"] = _num(h16, 540, hi=2160)
     if w9 is not None:
-        cfg["resize_9x16_w"] = _num(w9, 540)
+        cfg["resize_9x16_w"] = _num(w9, 540, hi=2160)
     if h9 is not None:
         cfg["resize_9x16_h"] = _num(h9, 960)
+    k = str(kernel or "").strip().lower()
+    if k in ("lanczos", "spline", "bicubic"):
+        cfg["resize_kernel"] = k
+    if crf is not None:
+        cfg["resize_crf"] = _num(crf, 10, lo=10, hi=14)
+    c = str(color or "").strip().lower()
+    if c in ("source", "follow source", "full", "always full"):
+        cfg["resize_color"] = "full" if "full" in c and "follow" not in c else "source"
     save_config(cfg)
 
 def log(message:str, message_type:str="normal"):
@@ -4635,62 +4666,165 @@ def _target_hygiene_size(w: int, h: int, *, role: str, scale: int) -> tuple:
     return w, h, False
 
 
-def probe_color_range(video_path: str) -> str:
-    """Return ffmpeg color_range token: pc (full) or tv (limited). Default pc for Grok sources."""
+def probe_color_meta(video_path: str) -> dict:
+    """Range, HDR transfer, primaries. Full/TV is not HDR — HDR is PQ/HLG + 10-bit."""
+    meta = {
+        "range": "pc",
+        "primaries": "bt709",
+        "trc": "bt709",
+        "space": "bt709",
+        "hdr": False,
+        "pix_fmt": "yuv420p",
+        "bits": 8,
+    }
     if not video_path or not os.path.isfile(video_path):
-        return "pc"
+        return meta
     try:
         exe = "ffprobe"
         if toolbox_processor and getattr(toolbox_processor, "ffprobe_exe", None):
             exe = toolbox_processor.ffprobe_exe
-        out = subprocess.run(
+        raw = subprocess.run(
             [
                 exe, "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=color_range",
-                "-of", "default=noprint_wrappers=1:nokey=1",
+                "-show_entries",
+                "stream=color_range,color_space,color_primaries,color_transfer,pix_fmt,bits_per_raw_sample",
+                "-of", "json",
                 video_path,
             ],
             capture_output=True, text=True, timeout=12, check=False,
-        ).stdout.strip().lower()
-        if out in ("pc", "jpeg", "full"):
-            return "pc"
-        if out in ("tv", "mpeg", "limited"):
-            return "tv"
+        ).stdout
+        st = (json.loads(raw).get("streams") or [{}])[0]
+        cr = str(st.get("color_range") or "").strip().lower()
+        if cr in ("pc", "jpeg", "full"):
+            meta["range"] = "pc"
+        elif cr in ("tv", "mpeg", "limited"):
+            meta["range"] = "tv"
+        prim = str(st.get("color_primaries") or "").strip().lower()
+        trc = str(st.get("color_transfer") or "").strip().lower()
+        space = str(st.get("color_space") or "").strip().lower()
+        pix = str(st.get("pix_fmt") or "").strip().lower()
+        if prim:
+            meta["primaries"] = prim
+        if trc:
+            meta["trc"] = trc
+        if space:
+            meta["space"] = space
+        hdr = trc in ("smpte2084", "smpte428", "arib-std-b67") or "pq" in trc or "hlg" in trc
+        ten = "p10" in pix or "p12" in pix or str(st.get("bits_per_raw_sample") or "") in ("10", "12")
+        if hdr or (ten and prim in ("bt2020",)):
+            meta["hdr"] = True
+            meta["pix_fmt"] = "yuv420p10le"
+            meta["bits"] = 10
+            if not prim:
+                meta["primaries"] = "bt2020"
+            if space in ("", "unknown", "unspecified"):
+                meta["space"] = "bt2020nc"
+            if not trc:
+                meta["trc"] = "smpte2084"
     except Exception:
         pass
-    name = os.path.basename(video_path).lower()
-    return "pc" if "grok-video" in name else "pc"
+    return meta
 
 
-def hq_downscale_vf(new_w: int, new_h: int, color_range: str = "pc") -> str:
-    """Fit-scale to the already-computed size. Never cover-crop (that crushed edges + chroma)."""
+def probe_color_range(video_path: str) -> str:
+    return probe_color_meta(video_path).get("range") or "pc"
+
+
+def load_resize_quality():
+    cfg = load_config()
+    k = str(cfg.get("resize_kernel") or "lanczos").strip().lower()
+    if k not in ("lanczos", "spline", "bicubic"):
+        k = "lanczos"
+    try:
+        crf = int(float(cfg.get("resize_crf") or 10))
+    except (TypeError, ValueError):
+        crf = 10
+    crf = 10 if crf < 10 else (14 if crf > 14 else crf)
+    color = str(cfg.get("resize_color") or "source").strip().lower()
+    if "full" in color and "follow" not in color and "source" not in color:
+        color = "full"
+    else:
+        color = "source"
+    return {"kernel": k, "crf": crf, "color": color}
+
+
+def resolve_resize_encode(video_path: str) -> dict:
+    """Combine UI knobs with source HDR/range. Full/source is range only; HDR is separate."""
+    q = load_resize_quality()
+    meta = probe_color_meta(video_path)
+    rng = "pc" if q["color"] == "full" else meta["range"]
+    hdr = bool(meta.get("hdr"))
+    if hdr:
+        prim = meta.get("primaries") or "bt2020"
+        trc = meta.get("trc") or "smpte2084"
+        space = meta.get("space") or "bt2020nc"
+        if space in ("bt2020", "bt2020c"):
+            space = "bt2020nc"
+        pix = "yuv420p10le"
+        bits = 10
+    else:
+        prim, trc, space, pix, bits = "bt709", "bt709", "bt709", "yuv420p", 8
+    return {
+        "kernel": q["kernel"],
+        "crf": q["crf"],
+        "range": rng,
+        "hdr": hdr,
+        "primaries": prim,
+        "trc": trc,
+        "space": space,
+        "pix_fmt": pix,
+        "bits": bits,
+    }
+
+
+def hq_downscale_vf(new_w: int, new_h: int, color_range: str = "pc", kernel: str = "lanczos") -> str:
+    """Fit-scale. Never cover-crop. Kernel = how neighboring pixels blend."""
+    k = str(kernel or "lanczos").strip().lower()
+    if k not in ("lanczos", "spline", "bicubic"):
+        k = "lanczos"
     rng = "full" if str(color_range).lower() in ("pc", "jpeg", "full") else "limited"
     return (
-        f"scale={int(new_w)}:{int(new_h)}:flags=lanczos+accurate_rnd+full_chroma_int"
+        f"scale={int(new_w)}:{int(new_h)}:flags={k}+accurate_rnd+full_chroma_int"
         f":in_range={rng}:out_range={rng},"
         "setsar=1"
     )
 
 
-def hq_color_v_args(color_range: str = "pc", crf: int = 12) -> list:
-    rng = "pc" if str(color_range).lower() in ("pc", "jpeg", "full") else "tv"
-    return [
+def hq_color_v_args(enc: dict) -> list:
+    rng = "pc" if str(enc.get("range")).lower() in ("pc", "jpeg", "full") else "tv"
+    crf = int(enc.get("crf") or 10)
+    pix = enc.get("pix_fmt") or "yuv420p"
+    hdr = bool(enc.get("hdr") or "p10" in str(pix))
+    args = [
         "-c:v", "libx264",
         "-preset", "slow",
-        "-crf", str(int(crf)),
-        "-pix_fmt", "yuv420p",
-        "-colorspace", "bt709",
-        "-color_primaries", "bt709",
-        "-color_trc", "bt709",
+        "-crf", str(crf),
+    ]
+    if hdr:
+        args += ["-profile:v", "high10"]
+        if "p10" not in str(pix):
+            pix = "yuv420p10le"
+        space = str(enc.get("space") or "bt2020nc")
+        prim = str(enc.get("primaries") or "bt2020")
+        trc = str(enc.get("trc") or "smpte2084")
+    else:
+        space = str(enc.get("space") or "bt709")
+        prim = str(enc.get("primaries") or "bt709")
+        trc = str(enc.get("trc") or "bt709")
+    args += [
+        "-pix_fmt", pix,
+        "-colorspace", space,
+        "-color_primaries", prim,
+        "-color_trc", trc,
         "-color_range", rng,
     ]
+    return args
 
 
 def _ffmpeg_scale_to(src_path: str, dest_path: str, new_w: int, new_h: int) -> Optional[str]:
     """
-    4K-safe pre-downscale: FIT to the grid-aligned size (no cover-crop),
-    lanczos + full-chroma, preserve color range (Grok sources are full/pc).
-    CRF 12 slow — same filter as resize_input_video().
+    Per-file fit-scale downscale: kernel/CRF/color from config.
+    Follow-source keeps HDR 10-bit when the file is PQ/HLG.
     """
     if not src_path or not os.path.isfile(src_path):
         return None
@@ -4699,12 +4833,12 @@ def _ffmpeg_scale_to(src_path: str, dest_path: str, new_w: int, new_h: int) -> O
         return None
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     nw, nh = int(new_w), int(new_h)
-    rng = probe_color_range(src_path)
-    vf = hq_downscale_vf(nw, nh, rng)
+    enc = resolve_resize_encode(src_path)
+    vf = hq_downscale_vf(nw, nh, enc["range"], enc["kernel"])
     base = [
         "ffmpeg", "-y", "-i", src_path,
         "-vf", vf,
-        *hq_color_v_args(rng, crf=12),
+        *hq_color_v_args(enc),
         "-map", "0:v:0",
         "-map", "0:a:0?",
     ]
@@ -5597,10 +5731,11 @@ def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress(), m
         return video_path
     
     try:
-        rng = probe_color_range(video_path)
+        enc = resolve_resize_encode(video_path)
+        hdr_note = "HDR 10-bit pass-through" if enc.get("hdr") else f"SDR range {enc['range']}"
         log(
             f"Resizing video {current_width}×{current_height} → {new_width}×{new_height} "
-            f"(fit-scale, no crop, color-range {rng}, CRF 12)...",
+            f"(fit-scale, kernel {enc['kernel']}, CRF {enc['crf']}, {hdr_note})...",
             message_type="info",
         )
         progress(0.1, desc="Resizing input video...")
@@ -5613,15 +5748,14 @@ def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress(), m
         output_path = os.path.join(TEMP_DIR, output_filename)
         
         # Fit to the 4K-safe size already computed (do NOT cover-crop).
+        # Follow source: TV/full from the file; HDR stays 10-bit PQ/HLG when present.
         progress(0.3, desc="Running FFmpeg resize...")
-        vf = hq_downscale_vf(new_width, new_height, rng)
+        vf = hq_downscale_vf(new_width, new_height, enc["range"], enc["kernel"])
         
-        # High-quality intermediate: cover-crop + limited-range 4:2:0 was the
-        # color-shift / blocky pre-downscale. Keep full chroma + tagged bt709.
         ffmpeg_cmd = [
             'ffmpeg', '-y', '-i', video_path,
             '-vf', vf,
-            *hq_color_v_args(rng, crf=12),
+            *hq_color_v_args(enc),
             '-map', '0:v:0',  # Map video stream
             '-map', '0:a:0?',  # Map audio stream if it exists (? makes it optional)
             '-c:a', 'aac',
@@ -6732,6 +6866,39 @@ def create_ui():
                                         minimum=16,
                                         maximum=3840,
                                         info="Default 960 (¼ of 3840)",
+                                    )
+                                _rk = str(ui.get("resize_kernel") or "lanczos").strip().lower()
+                                if _rk not in ("lanczos", "spline", "bicubic"):
+                                    _rk = "lanczos"
+                                try:
+                                    _rc = int(float(ui.get("resize_crf") or 10))
+                                except (TypeError, ValueError):
+                                    _rc = 10
+                                if _rc not in (10, 12, 14):
+                                    _rc = 10
+                                _rcol = (
+                                    "Always full"
+                                    if str(ui.get("resize_color") or "").strip().lower() == "full"
+                                    else "Follow source"
+                                )
+                                with gr.Row():
+                                    resize_kernel = gr.Dropdown(
+                                        choices=["lanczos", "spline", "bicubic"],
+                                        value=_rk,
+                                        label="Scale kernel",
+                                        info=TIPS["resize_kernel"],
+                                    )
+                                    resize_crf = gr.Radio(
+                                        choices=[10, 12, 14],
+                                        value=_rc,
+                                        label="Temp CRF",
+                                        info=TIPS["resize_crf"],
+                                    )
+                                    resize_color = gr.Radio(
+                                        choices=["Follow source", "Always full"],
+                                        value=_rcol,
+                                        label="Color range",
+                                        info=TIPS["resize_color"],
                                     )
 
                                 gr.Markdown(
@@ -8131,13 +8298,19 @@ def create_ui():
             )
             return last_video, last_video, None, queue_html, queue_html
 
-        def _persist_resize_sizes(preset, w16, h16, w9, h9):
-            persist_orientation_resize(preset, w16, h16, w9, h9)
+        def _persist_resize_sizes(preset, w16, h16, w9, h9, kernel, crf, color):
+            persist_orientation_resize(preset, w16, h16, w9, h9, kernel, crf, color)
 
-        for _comp in (batch_resize_preset, resize_16x9_w, resize_16x9_h, resize_9x16_w, resize_9x16_h):
+        for _comp in (
+            batch_resize_preset, resize_16x9_w, resize_16x9_h, resize_9x16_w, resize_9x16_h,
+            resize_kernel, resize_crf, resize_color,
+        ):
             _comp.change(
                 fn=_persist_resize_sizes,
-                inputs=[batch_resize_preset, resize_16x9_w, resize_16x9_h, resize_9x16_w, resize_9x16_h],
+                inputs=[
+                    batch_resize_preset, resize_16x9_w, resize_16x9_h, resize_9x16_w, resize_9x16_h,
+                    resize_kernel, resize_crf, resize_color,
+                ],
                 outputs=[],
             )
 

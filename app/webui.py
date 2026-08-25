@@ -4503,6 +4503,7 @@ def quarantine_novideo_source(video_path: str) -> Optional[str]:
 
 _HYGIENE_SKIP_DIRS = {
     "novideo", "highfps", "over4k", "bin", "at_60fps", "done", "archive", "work",
+    "degraded", "matched", "unmatched",
 }
 
 
@@ -4535,11 +4536,60 @@ def _target_hygiene_size(w: int, h: int, *, role: str, scale: int) -> tuple:
     return w, h, False
 
 
+def probe_color_range(video_path: str) -> str:
+    """Return ffmpeg color_range token: pc (full) or tv (limited). Default pc for Grok sources."""
+    if not video_path or not os.path.isfile(video_path):
+        return "pc"
+    try:
+        exe = "ffprobe"
+        if toolbox_processor and getattr(toolbox_processor, "ffprobe_exe", None):
+            exe = toolbox_processor.ffprobe_exe
+        out = subprocess.run(
+            [
+                exe, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=color_range",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ],
+            capture_output=True, text=True, timeout=12, check=False,
+        ).stdout.strip().lower()
+        if out in ("pc", "jpeg", "full"):
+            return "pc"
+        if out in ("tv", "mpeg", "limited"):
+            return "tv"
+    except Exception:
+        pass
+    name = os.path.basename(video_path).lower()
+    return "pc" if "grok-video" in name else "pc"
+
+
+def hq_downscale_vf(new_w: int, new_h: int) -> str:
+    """Fit-scale to the already-computed size. Never cover-crop (that crushed edges + chroma)."""
+    return (
+        f"scale={int(new_w)}:{int(new_h)}:flags=lanczos+accurate_rnd+full_chroma_int,"
+        "setsar=1"
+    )
+
+
+def hq_color_v_args(color_range: str = "pc", crf: int = 12) -> list:
+    rng = "pc" if str(color_range).lower() in ("pc", "jpeg", "full") else "tv"
+    return [
+        "-c:v", "libx264",
+        "-preset", "slow",
+        "-crf", str(int(crf)),
+        "-pix_fmt", "yuv420p",
+        "-colorspace", "bt709",
+        "-color_primaries", "bt709",
+        "-color_trc", "bt709",
+        "-color_range", rng,
+    ]
+
+
 def _ffmpeg_scale_to(src_path: str, dest_path: str, new_w: int, new_h: int) -> Optional[str]:
     """
-    FlashVSR-style 4K-safe pre-downscale: cover the target box (no stretch),
-    center-crop to the grid-aligned size, high-quality intermediate (CRF 14 / slow).
-    Same filter as resize_input_video() so 4× stays inside UHD without crushing detail.
+    4K-safe pre-downscale: FIT to the grid-aligned size (no cover-crop),
+    lanczos + full-chroma, preserve color range (Grok sources are full/pc).
+    CRF 12 slow — same filter as resize_input_video().
     """
     if not src_path or not os.path.isfile(src_path):
         return None
@@ -4548,15 +4598,12 @@ def _ffmpeg_scale_to(src_path: str, dest_path: str, new_w: int, new_h: int) -> O
         return None
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     nw, nh = int(new_w), int(new_h)
-    vf = (
-        f"scale={nw}:{nh}:force_original_aspect_ratio=increase:flags=lanczos,"
-        f"crop={nw}:{nh}"
-    )
+    vf = hq_downscale_vf(nw, nh)
+    rng = probe_color_range(src_path)
     base = [
         "ffmpeg", "-y", "-i", src_path,
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "slow", "-crf", "14",
-        "-pix_fmt", "yuv420p",
+        *hq_color_v_args(rng, crf=12),
         "-map", "0:v:0",
         "-map", "0:a:0?",
     ]
@@ -4604,7 +4651,7 @@ def downscale_replace_uhd(src_path: str, new_w: int, new_h: int) -> Optional[str
         return None
     log(
         f"🖼 4K-safe pre-downscale {os.path.basename(src_path)} → {new_w}×{new_h} "
-        f"(cover+crop, CRF 14 — 4× stays UHD). Original in Over4K\\",
+        f"(fit-scale, CRF 12, color-range preserved — 4× stays UHD). Original in Over4K\\",
         message_type="finish",
     )
     return src_path
@@ -5471,7 +5518,7 @@ def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress(), m
     try:
         log(
             f"Resizing video {current_width}×{current_height} → {new_width}×{new_height} "
-            f"(center crop, aspect preserved)...",
+            f"(fit-scale, no crop, color-range preserved)...",
             message_type="info",
         )
         progress(0.1, desc="Resizing input video...")
@@ -5483,22 +5530,17 @@ def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress(), m
         output_filename = f"{input_basename}_resized_{new_width}x{new_height}_{timestamp}.mp4"
         output_path = os.path.join(TEMP_DIR, output_filename)
         
-        # Scale to cover target box (no stretch), then center-crop to aligned size
+        # Fit to the 4K-safe size already computed (do NOT cover-crop).
         progress(0.3, desc="Running FFmpeg resize...")
-        vf = (
-            f"scale={new_width}:{new_height}:force_original_aspect_ratio=increase:flags=lanczos,"
-            f"crop={new_width}:{new_height}"
-        )
+        vf = hq_downscale_vf(new_width, new_height)
+        rng = probe_color_range(video_path)
         
-        # Build FFmpeg command - use map to handle audio gracefully
-        # High-quality intermediate: soft pre-encode was compounding "lost detail" before FlashVSR.
+        # High-quality intermediate: cover-crop + limited-range 4:2:0 was the
+        # color-shift / blocky pre-downscale. Keep full chroma + tagged bt709.
         ffmpeg_cmd = [
             'ffmpeg', '-y', '-i', video_path,
             '-vf', vf,
-            '-c:v', 'libx264',
-            '-preset', 'slow',
-            '-crf', '14',
-            '-pix_fmt', 'yuv420p',
+            *hq_color_v_args(rng, crf=12),
             '-map', '0:v:0',  # Map video stream
             '-map', '0:a:0?',  # Map audio stream if it exists (? makes it optional)
             '-c:a', 'aac',

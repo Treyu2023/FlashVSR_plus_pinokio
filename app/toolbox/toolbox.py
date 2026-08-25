@@ -81,7 +81,12 @@ class ToolboxProcessor:
         # Quality slider 0-100 → intermediate CRF (keep high fidelity for re-encode)
         crf_final = int(35 - (output_quality / 100) * 20)
         crf_inter = max(10, min(crf_final, 14))  # never softer than final target
-        return ['-crf', str(crf_inter), '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-loglevel', 'error']
+        return [
+            '-crf', str(crf_inter), '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+            '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709',
+            '-color_range', 'pc',
+            '-loglevel', 'error',
+        ]
 
     def _export_video_args(self, quality: int, max_width: int, video_path: str):
         """
@@ -105,30 +110,46 @@ class ToolboxProcessor:
                 need_scale = False
         except Exception:
             need_scale = True
-        vf = f"scale='min({int(max_width)},iw)':-2:flags=lanczos" if need_scale else None
+        vf = (
+            f"scale='min({int(max_width)},iw)':-2:flags=lanczos+accurate_rnd+full_chroma_int"
+            if need_scale else None
+        )
+        color = [
+            "-colorspace", "bt709",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+            "-color_range", "pc",
+        ]
 
         if self.prefer_nvenc and self._nvenc_available():
-            # Map quality% → NVENC CQ (lower = better). Align near x264 CRF band.
-            cq = max(12, min(28, crf + 1))
-            # p5/p6 = high quality presets on modern NVENC (4090 etc.)
+            # Map quality% → NVENC CQ (lower = better). Slightly below x264 CRF
+            # so GPU encode does not add the blocky/chroma smear of CQ=CRF+1.
+            cq = max(10, min(26, crf - 2))
             args = [
                 "-c:v", "h264_nvenc",
-                "-preset", "p5",
+                "-preset", "p6",
+                "-tune", "hq",
                 "-rc", "vbr",
                 "-cq", str(cq),
                 "-b:v", "0",
                 "-profile:v", "high",
                 "-pix_fmt", "yuv420p",
+                "-spatial-aq", "1",
+                "-temporal-aq", "1",
+                "-aq-strength", "8",
+                "-rc-lookahead", "20",
+                *color,
             ]
-            return args, vf, f"h264_nvenc cq={cq}"
+            return args, vf, f"h264_nvenc cq={cq} p6 hq"
 
         args = [
             "-c:v", "libx264",
             "-preset", preset,
-            "-crf", str(crf),
+            "-crf", str(max(12, crf - 2)),
             "-pix_fmt", "yuv420p",
+            *color,
         ]
-        return args, vf, f"libx264 preset={preset} crf={crf}"
+        return args, vf, f"libx264 preset={preset} crf={max(12, crf - 2)}"
 
     def _probe_dims(self, video_path):
         if not self.has_ffmpeg:
@@ -1302,7 +1323,7 @@ class ToolboxProcessor:
             if export_format == "GIF": print(f"INFO: GIF format selected. Output will be saved to permanent folder: {output_path}")
 
             # Common video filter (may be None if already under max_width)
-            vf_scale = f"scale='min({max_width},iw)':-2:flags=lanczos"
+            vf_scale = f"scale='min({max_width},iw)':-2:flags=lanczos+accurate_rnd+full_chroma_int"
             
             if export_format == "MP4 (H.264)":
                 # CRF range: 0=lossless, 23=default, 51=worst

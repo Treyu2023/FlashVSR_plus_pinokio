@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-08-25 | **Fit-scale downscale (no cover-crop):** pre-resize used `increase`+`crop`, which chopped edges and smeared chroma (blocky + color shift). Now FIT to the 4K-safe size with `lanczos+accurate_rnd+full_chroma_int`, CRF 12, tagged bt709 + full (`pc`) range. Toolbox NVENC export: p6/hq, lower CQ, AQ on, same color tags. |
 | 2026-08-23 | **Toolbox does not pre-downscale:** Ready-for-Toolbox hygiene no longer recodes over-UHD upscales (that was FlashVSR intake work). Toolbox = RIFE + export only. Over4K originals are restored over the CRF-14 recodes. Video / image / Group Therapy skip already-upscaled files so they are not 4×'d again. |
 | 2026-08-21 | **Preserve auto-reapply:** Update / Install / Start run `env_guard.py reapply`. Custom files (Group Therapy, PID pairing, toolbox FPS/no-video, 4K-safe, `webui_config`) are restored if a stock pull/clone overwrote them. Stale snapshots without current markers cannot clobber live code. |
 | 2026-08-21 | **Group Therapy pairing:** no per-file `GT-<id>__name` folders. Before/After stay flat; pair id is `_PID_xxxxxxxx` at the end of the filename plus Title metadata (`PID_xxxxxxxx`). Media Center tags are not touched. Retro flatten remaps existing GT folders into the `9xxxxxxx` band so they cannot collide with new auto batches. |

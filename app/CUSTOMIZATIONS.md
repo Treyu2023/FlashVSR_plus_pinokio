@@ -10,7 +10,8 @@
 
 | Date | Summary |
 |------|---------|
-| 2026-08-25 | **Downscale quality knobs (4090 defaults):** Scale kernel **lanczos**, temp CRF **10**, color **Follow source**. Follow source copies TV/full from the file; HDR (PQ/HLG + bt2020) stays 10-bit when present. Always full is range only — it is not HDR. Per-file fit-scale; no whole-folder first pass. |
+| 2026-08-25 | **HDR auto per file (no tagging):** Follow source is still TV/full range. HDR (PQ/HLG/DoVi/mastering metadata) is probed on each file and **hable-tonemapped to SDR 10-bit Rec.709** for FlashVSR (SDR model). 10-bit SDR stays 10-bit. 4K-safe auto (960×540 / 540×960) remains the 4090 OOM-safe max. |
+| 2026-08-25 | **Downscale quality knobs (4090 defaults):** Scale kernel **lanczos**, temp CRF **10**, color **Follow source**. Follow source copies TV/full from the file. Always full is range only. Per-file fit-scale; no whole-folder first pass. |
 | 2026-08-25 | **GT RIFE/export on that tab:** Group Therapy has its own RIFE Off/2×/4× plus quality/width sliders (Toolbox sliders no longer silently ignored). Defaults: video/image quality **10**, chunk **10.25s**, tile **256**/overlap **32**, RIFE/export quality **100**. |
 | 2026-08-25 | **Per-file / per-batch downscale:** watch-folder hygiene no longer recodes the whole inbox first. Resize runs as each file is processed (Group Therapy: current batch only). Separate 16:9 (960×540) and 9:16 (540×960) input sizes = ¼ of UHD 4K. Fit-scale + in_range/out_range; kernel/CRF/color from UI (default lanczos / CRF 10 / follow source). |
 | 2026-08-25 | **Fit-scale downscale (no cover-crop):** pre-resize used `increase`+`crop`, which chopped edges and smeared chroma (blocky + color shift). Now FIT to the 4K-safe size with `lanczos+accurate_rnd+full_chroma_int`, CRF 12, tagged bt709 + full (`pc`) range. Toolbox NVENC export: p6/hq, lower CQ, AQ on, same color tags. |

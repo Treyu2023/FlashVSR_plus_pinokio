@@ -8,6 +8,7 @@ import argparse
 import gradio as gr
 from gradio import ImageSlider
 import re
+import json
 import math
 import uuid
 import torch
@@ -155,11 +156,11 @@ TIPS = {
     ),
     "batch_resize": (
         "Downscale happens per file as it is processed (never the whole folder first). "
-        "4K-safe uses separate 16:9 and 9:16 input sizes (default ¼ of UHD: 960×540 and 540×960). "
-        "Fit-scale; kernel/CRF/color knobs below. Default 4090: lanczos, CRF 10, follow source. "
-        "Follow source = TV vs full range from the file; HDR (PQ/HLG) is kept 10-bit when present. "
-        "Full vs source is NOT HDR — that is only 16–235 vs 0–255. "
-        "No Resize = leave source as-is (may exceed 4K after upscale)."
+        "4K-safe auto: 16:9 → 960×540, 9:16 → 540×960 (¼ of UHD). That is the 4090 OOM-safe max at 4×. "
+        "Fit-scale keeps the whole frame. Default: lanczos, CRF 10. "
+        "Color is auto per file (no tagging): TV vs full range, plus HDR PQ/HLG/DoVi → SDR 10-bit hable "
+        "so FlashVSR (SDR model) does not crush highlights. 10-bit SDR stays 10-bit. "
+        "No Resize = leave source as-is (may OOM after upscale)."
     ),
     "resize_kernel": (
         "Scale kernel — how neighboring pixels blend when shrinking. "
@@ -171,9 +172,9 @@ TIPS = {
         "10 (default, 4090): fattest temp file, least extra loss. 12 / 14 = smaller temps."
     ),
     "resize_color": (
-        "Color range. Follow source (default) copies TV (16–235) or full (0–255) from the file. "
-        "HDR (PQ/HLG + bt2020 10-bit) is kept when the source is HDR — that is separate from this knob. "
-        "Always full forces 0–255; only use if a source is tagged wrong and looks crushed."
+        "Color range only (TV 16–235 vs full 0–255). Follow source (default) copies the file. "
+        "HDR is always auto-detected on each file (PQ / HLG / Dolby Vision / mastering metadata) — "
+        "this knob does not turn HDR on or off. Always full forces 0–255 if a file is tagged wrong."
     ),
     "autosave": (
         "Autosave Output — ON saves finished upscales automatically to the FlashVSR output folder. "
@@ -816,13 +817,20 @@ def apply_batch_resize_preset(video_path, batch_resize_preset, scale=None, progr
         mode=mode,
     )
     if not will_resize:
-        out_w, out_h = int(current_width) * int(scale), int(current_height) * int(scale)
+        enc_check = resolve_resize_encode(video_path)
+        if not enc_check.get("hdr"):
+            out_w, out_h = int(current_width) * int(scale), int(current_height) * int(scale)
+            log(
+                f"Video {current_width}×{current_height} already 4K-safe at {scale}× "
+                f"(→ {out_w}×{out_h}) — no resize ({describe_resize_encode(enc_check)})",
+                message_type="info",
+            )
+            return video_path
         log(
-            f"Video {current_width}×{current_height} already 4K-safe at {scale}× "
-            f"(→ {out_w}×{out_h}) — no resize",
+            f"Video {current_width}×{current_height} already 4K-safe but "
+            f"{describe_resize_encode(enc_check)} — converting without shrinking",
             message_type="info",
         )
-        return video_path
     align = resize_align_step(scale)
     out_w, out_h = new_width * int(scale), new_height * int(scale)
     log(
@@ -4666,28 +4674,55 @@ def _target_hygiene_size(w: int, h: int, *, role: str, scale: int) -> tuple:
     return w, h, False
 
 
+def _ffprobe_exe() -> str:
+    if toolbox_processor and getattr(toolbox_processor, "ffprobe_exe", None):
+        return toolbox_processor.ffprobe_exe
+    return "ffprobe"
+
+
+_FFMPEG_ZSCALE = None
+
+
+def _ffmpeg_has_zscale() -> bool:
+    global _FFMPEG_ZSCALE
+    if _FFMPEG_ZSCALE is not None:
+        return _FFMPEG_ZSCALE
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-filters"],
+            capture_output=True, text=True, timeout=8, check=False,
+        ).stdout or ""
+        _FFMPEG_ZSCALE = bool(re.search(r"\bzscale\b", out))
+    except Exception:
+        _FFMPEG_ZSCALE = False
+    return _FFMPEG_ZSCALE
+
+
 def probe_color_meta(video_path: str) -> dict:
-    """Range, HDR transfer, primaries. Full/TV is not HDR — HDR is PQ/HLG + 10-bit."""
+    """
+    Per-file auto-detect. Does not tag or rewrite the original.
+    TV/full range is not HDR. HDR = PQ / HLG / Dolby Vision / mastering display.
+    """
     meta = {
         "range": "pc",
         "primaries": "bt709",
         "trc": "bt709",
         "space": "bt709",
         "hdr": False,
+        "hdr_kind": "",
         "pix_fmt": "yuv420p",
         "bits": 8,
     }
     if not video_path or not os.path.isfile(video_path):
         return meta
     try:
-        exe = "ffprobe"
-        if toolbox_processor and getattr(toolbox_processor, "ffprobe_exe", None):
-            exe = toolbox_processor.ffprobe_exe
         raw = subprocess.run(
             [
-                exe, "-v", "error", "-select_streams", "v:0",
+                _ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
                 "-show_entries",
-                "stream=color_range,color_space,color_primaries,color_transfer,pix_fmt,bits_per_raw_sample",
+                "stream=color_range,color_space,color_primaries,color_transfer,"
+                "pix_fmt,bits_per_raw_sample,codec_name,codec_tag_string,profile"
+                ":stream_side_data",
                 "-of", "json",
                 video_path,
             ],
@@ -4703,24 +4738,62 @@ def probe_color_meta(video_path: str) -> dict:
         trc = str(st.get("color_transfer") or "").strip().lower()
         space = str(st.get("color_space") or "").strip().lower()
         pix = str(st.get("pix_fmt") or "").strip().lower()
-        if prim:
+        codec = (
+            str(st.get("codec_name") or "")
+            + " "
+            + str(st.get("codec_tag_string") or "")
+            + " "
+            + str(st.get("profile") or "")
+        ).lower()
+        if prim and prim not in ("unknown", "unspecified"):
             meta["primaries"] = prim
-        if trc:
+        if trc and trc not in ("unknown", "unspecified"):
             meta["trc"] = trc
-        if space:
+        if space and space not in ("unknown", "unspecified"):
             meta["space"] = space
-        hdr = trc in ("smpte2084", "smpte428", "arib-std-b67") or "pq" in trc or "hlg" in trc
-        ten = "p10" in pix or "p12" in pix or str(st.get("bits_per_raw_sample") or "") in ("10", "12")
-        if hdr or (ten and prim in ("bt2020",)):
-            meta["hdr"] = True
-            meta["pix_fmt"] = "yuv420p10le"
+        ten = (
+            "p10" in pix
+            or "p12" in pix
+            or str(st.get("bits_per_raw_sample") or "") in ("10", "12")
+        )
+        if ten:
             meta["bits"] = 10
-            if not prim:
+            meta["pix_fmt"] = "yuv420p10le"
+        sides = st.get("side_data_list") or []
+        side_blob = " ".join(
+            str(s.get("side_data_type") or "").lower() for s in sides if isinstance(s, dict)
+        )
+        mastering = "mastering display" in side_blob or "content light" in side_blob
+        dovi = any(tok in codec for tok in ("dvhe", "dvh1", "dovi", "dolby vision", "dolbyvision"))
+        pq = trc in ("smpte2084", "smpte428") or "pq" in trc
+        hlg = trc in ("arib-std-b67",) or "hlg" in trc
+        bt2020 = prim in ("bt2020",) or space in ("bt2020", "bt2020nc", "bt2020c")
+        if pq:
+            meta["hdr"] = True
+            meta["hdr_kind"] = "pq"
+        elif hlg:
+            meta["hdr"] = True
+            meta["hdr_kind"] = "hlg"
+        elif dovi:
+            meta["hdr"] = True
+            meta["hdr_kind"] = "dovi"
+        elif mastering and (ten or bt2020):
+            meta["hdr"] = True
+            meta["hdr_kind"] = "pq"
+        elif ten and bt2020:
+            meta["hdr"] = True
+            meta["hdr_kind"] = "pq"
+        if meta["hdr"]:
+            meta["bits"] = 10
+            meta["pix_fmt"] = "yuv420p10le"
+            if meta["primaries"] == "bt709":
                 meta["primaries"] = "bt2020"
-            if space in ("", "unknown", "unspecified"):
+            if meta["space"] in ("bt709",):
                 meta["space"] = "bt2020nc"
-            if not trc:
+            if meta["trc"] == "bt709" and meta["hdr_kind"] != "hlg":
                 meta["trc"] = "smpte2084"
+            if meta["hdr_kind"] == "hlg" and meta["trc"] == "bt709":
+                meta["trc"] = "arib-std-b67"
     except Exception:
         pass
     return meta
@@ -4749,44 +4822,87 @@ def load_resize_quality():
 
 
 def resolve_resize_encode(video_path: str) -> dict:
-    """Combine UI knobs with source HDR/range. Full/source is range only; HDR is separate."""
+    """
+    Per-file encode plan. Follow-source = TV/full from the file.
+    HDR is always auto: FlashVSR is SDR, so PQ/HLG is hable-tonemapped to
+    10-bit bt709 for the temp (no sidecar tags on the original).
+    """
     q = load_resize_quality()
     meta = probe_color_meta(video_path)
     rng = "pc" if q["color"] == "full" else meta["range"]
     hdr = bool(meta.get("hdr"))
+    bits = 10 if hdr or int(meta.get("bits") or 8) >= 10 else 8
+    pix = "yuv420p10le" if bits >= 10 else "yuv420p"
     if hdr:
-        prim = meta.get("primaries") or "bt2020"
-        trc = meta.get("trc") or "smpte2084"
-        space = meta.get("space") or "bt2020nc"
-        if space in ("bt2020", "bt2020c"):
-            space = "bt2020nc"
-        pix = "yuv420p10le"
-        bits = 10
+        prim, trc, space = "bt709", "bt709", "bt709"
     else:
-        prim, trc, space, pix, bits = "bt709", "bt709", "bt709", "yuv420p", 8
+        prim = meta.get("primaries") or "bt709"
+        trc = meta.get("trc") or "bt709"
+        space = meta.get("space") or "bt709"
+        if prim in ("unknown", "unspecified", "", "bt2020"):
+            prim = "bt709"
+        if trc in ("unknown", "unspecified", ""):
+            trc = "bt709"
+        if space in ("unknown", "unspecified", "", "bt2020", "bt2020nc", "bt2020c"):
+            space = "bt709"
+    src_space = meta.get("space") or "bt2020nc"
+    if src_space in ("bt2020", "bt2020c"):
+        src_space = "bt2020nc"
     return {
         "kernel": q["kernel"],
         "crf": q["crf"],
         "range": rng,
         "hdr": hdr,
+        "hdr_kind": meta.get("hdr_kind") or "",
         "primaries": prim,
         "trc": trc,
         "space": space,
         "pix_fmt": pix,
         "bits": bits,
+        "src_primaries": meta.get("primaries") or "bt2020",
+        "src_trc": meta.get("trc") or "smpte2084",
+        "src_space": src_space,
     }
 
 
-def hq_downscale_vf(new_w: int, new_h: int, color_range: str = "pc", kernel: str = "lanczos") -> str:
-    """Fit-scale. Never cover-crop. Kernel = how neighboring pixels blend."""
-    k = str(kernel or "lanczos").strip().lower()
+def describe_resize_encode(enc: dict) -> str:
+    rng = "full" if str(enc.get("range")).lower() in ("pc", "jpeg", "full") else "tv"
+    if enc.get("hdr"):
+        kind = (enc.get("hdr_kind") or "pq").upper()
+        return f"HDR {kind} auto → SDR 10-bit (hable) · range {rng}"
+    bits = int(enc.get("bits") or 8)
+    return f"SDR {bits}-bit · range {rng}"
+
+
+def _range_word(color_range: str) -> str:
+    return "full" if str(color_range).lower() in ("pc", "jpeg", "full") else "limited"
+
+
+def hq_downscale_vf(new_w: int, new_h: int, enc: dict) -> str:
+    """Fit-scale. Never cover-crop. HDR → linear + hable + bt709 (model is SDR)."""
+    k = str((enc or {}).get("kernel") or "lanczos").strip().lower()
     if k not in ("lanczos", "spline", "bicubic"):
         k = "lanczos"
-    rng = "full" if str(color_range).lower() in ("pc", "jpeg", "full") else "limited"
+    nw, nh = int(new_w), int(new_h)
+    rng = _range_word((enc or {}).get("range"))
+    pix = (enc or {}).get("pix_fmt") or "yuv420p"
+    if enc and enc.get("hdr") and _ffmpeg_has_zscale():
+        src_trc = str(enc.get("src_trc") or "smpte2084").lower()
+        tin = "arib-std-b67" if ("hlg" in src_trc or "arib" in src_trc) else "smpte2084"
+        pin = str(enc.get("src_primaries") or "bt2020")
+        if pin not in ("bt2020",):
+            pin = "bt2020"
+        zf = "spline36" if k == "spline" else ("bicubic" if k == "bicubic" else "lanczos")
+        return (
+            f"zscale=w={nw}:h={nh}:filter={zf}:tin={tin}:min=bt2020nc:pin={pin}:rin={rng}:t=linear,"
+            f"tonemap=hable:desat=0,"
+            f"zscale=t=bt709:m=bt709:p=bt709:r={rng},"
+            f"format={pix},setsar=1"
+        )
     return (
-        f"scale={int(new_w)}:{int(new_h)}:flags={k}+accurate_rnd+full_chroma_int"
+        f"scale={nw}:{nh}:flags={k}+accurate_rnd+full_chroma_int"
         f":in_range={rng}:out_range={rng},"
-        "setsar=1"
+        f"format={pix},setsar=1"
     )
 
 
@@ -4794,23 +4910,19 @@ def hq_color_v_args(enc: dict) -> list:
     rng = "pc" if str(enc.get("range")).lower() in ("pc", "jpeg", "full") else "tv"
     crf = int(enc.get("crf") or 10)
     pix = enc.get("pix_fmt") or "yuv420p"
-    hdr = bool(enc.get("hdr") or "p10" in str(pix))
+    ten = int(enc.get("bits") or 8) >= 10 or "p10" in str(pix) or bool(enc.get("hdr"))
+    space = str(enc.get("space") or "bt709")
+    prim = str(enc.get("primaries") or "bt709")
+    trc = str(enc.get("trc") or "bt709")
     args = [
         "-c:v", "libx264",
         "-preset", "slow",
         "-crf", str(crf),
     ]
-    if hdr:
+    if ten:
         args += ["-profile:v", "high10"]
         if "p10" not in str(pix):
             pix = "yuv420p10le"
-        space = str(enc.get("space") or "bt2020nc")
-        prim = str(enc.get("primaries") or "bt2020")
-        trc = str(enc.get("trc") or "smpte2084")
-    else:
-        space = str(enc.get("space") or "bt709")
-        prim = str(enc.get("primaries") or "bt709")
-        trc = str(enc.get("trc") or "bt709")
     args += [
         "-pix_fmt", pix,
         "-colorspace", space,
@@ -4821,39 +4933,61 @@ def hq_color_v_args(enc: dict) -> list:
     return args
 
 
-def _ffmpeg_scale_to(src_path: str, dest_path: str, new_w: int, new_h: int) -> Optional[str]:
-    """
-    Per-file fit-scale downscale: kernel/CRF/color from config.
-    Follow-source keeps HDR 10-bit when the file is PQ/HLG.
-    """
-    if not src_path or not os.path.isfile(src_path):
-        return None
-    if not is_ffmpeg_available():
-        log("FFmpeg not available — cannot 4K-safe downscale", message_type="error")
-        return None
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    nw, nh = int(new_w), int(new_h)
-    enc = resolve_resize_encode(src_path)
-    vf = hq_downscale_vf(nw, nh, enc["range"], enc["kernel"])
-    base = [
-        "ffmpeg", "-y", "-i", src_path,
-        "-vf", vf,
-        *hq_color_v_args(enc),
-        "-map", "0:v:0",
-        "-map", "0:a:0?",
-    ]
-    cmd = base + ["-c:a", "aac", "-b:a", "256k", dest_path]
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=900)
-    except Exception as e:
-        log(f"4K-safe encode failed for {os.path.basename(src_path)}: {e}", message_type="error")
+def _run_downscale_ffmpeg(src_path: str, dest_path: str, new_w: int, new_h: int, enc: dict) -> bool:
+    attempts = [enc]
+    if enc.get("hdr"):
+        fallback = dict(enc)
+        fallback["hdr"] = False
+        fallback["bits"] = 10
+        fallback["pix_fmt"] = "yuv420p10le"
+        fallback["primaries"] = "bt709"
+        fallback["trc"] = "bt709"
+        fallback["space"] = "bt709"
+        attempts.append(fallback)
+    parent = os.path.dirname(dest_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    for i, e in enumerate(attempts):
+        vf = hq_downscale_vf(new_w, new_h, e)
+        cmd = [
+            "ffmpeg", "-y", "-i", src_path,
+            "-vf", vf,
+            *hq_color_v_args(e),
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-c:a", "aac", "-b:a", "256k",
+            dest_path,
+        ]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=900)
+        except Exception as ex:
+            log(f"Downscale encode error: {ex}", message_type="error")
+            continue
+        if r.returncode == 0 and os.path.isfile(dest_path) and os.path.getsize(dest_path) >= 1024:
+            return True
         if os.path.isfile(dest_path):
             try:
                 os.remove(dest_path)
             except OSError:
                 pass
+        tail = (r.stderr or "")[-400:].strip()
+        if i == 0 and enc.get("hdr"):
+            log(f"HDR tonemap failed, retrying 10-bit fit-scale: {tail}", message_type="warning")
+        else:
+            log(f"Downscale encode failed: {tail}", message_type="error")
+    return False
+
+
+def _ffmpeg_scale_to(src_path: str, dest_path: str, new_w: int, new_h: int) -> Optional[str]:
+    """Per-file fit-scale: kernel/CRF from UI; color/HDR auto-detected."""
+    if not src_path or not os.path.isfile(src_path):
         return None
-    if not os.path.isfile(dest_path) or os.path.getsize(dest_path) < 1024:
+    if not is_ffmpeg_available():
+        log("FFmpeg not available — cannot 4K-safe downscale", message_type="error")
+        return None
+    enc = resolve_resize_encode(src_path)
+    if not _run_downscale_ffmpeg(src_path, dest_path, int(new_w), int(new_h), enc):
+        log(f"4K-safe encode failed for {os.path.basename(src_path)}", message_type="error")
         return None
     return dest_path
 
@@ -4886,7 +5020,7 @@ def downscale_replace_uhd(src_path: str, new_w: int, new_h: int) -> Optional[str
         return None
     log(
         f"🖼 4K-safe pre-downscale {os.path.basename(src_path)} → {new_w}×{new_h} "
-        f"(fit-scale, CRF 12, color-range preserved — 4× stays UHD). Original in Over4K\\",
+        f"(fit-scale, kernel/CRF/color from UI — 4× stays UHD). Original in Over4K\\",
         message_type="finish",
     )
     return src_path
@@ -5723,8 +5857,21 @@ def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress(), m
     )
     
     if not will_resize:
-        log(f"Video is already {current_width}×{current_height}, no resize needed", message_type="info")
-        return video_path
+        enc_check = resolve_resize_encode(video_path)
+        if not enc_check.get("hdr"):
+            log(
+                f"Video is already {current_width}×{current_height}, no resize needed "
+                f"({describe_resize_encode(enc_check)})",
+                message_type="info",
+            )
+            return video_path
+        # Already 4K-safe but HDR — still convert to SDR 10-bit for the model.
+        new_width, new_height = current_width, current_height
+        log(
+            f"Video is already {current_width}×{current_height} (4K-safe) but "
+            f"{describe_resize_encode(enc_check)} — converting without shrinking",
+            message_type="info",
+        )
     
     if not is_ffmpeg_available():
         log("FFmpeg not available, cannot resize video", message_type="error")
@@ -5732,10 +5879,11 @@ def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress(), m
     
     try:
         enc = resolve_resize_encode(video_path)
-        hdr_note = "HDR 10-bit pass-through" if enc.get("hdr") else f"SDR range {enc['range']}"
+        orient = "16:9" if current_width >= current_height else "9:16"
         log(
             f"Resizing video {current_width}×{current_height} → {new_width}×{new_height} "
-            f"(fit-scale, kernel {enc['kernel']}, CRF {enc['crf']}, {hdr_note})...",
+            f"({orient} autoscale, kernel {enc['kernel']}, CRF {enc['crf']}, "
+            f"{describe_resize_encode(enc)})...",
             message_type="info",
         )
         progress(0.1, desc="Resizing input video...")
@@ -5748,28 +5896,11 @@ def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress(), m
         output_path = os.path.join(TEMP_DIR, output_filename)
         
         # Fit to the 4K-safe size already computed (do NOT cover-crop).
-        # Follow source: TV/full from the file; HDR stays 10-bit PQ/HLG when present.
+        # Color/HDR auto-detected per file — no tagging of the original.
         progress(0.3, desc="Running FFmpeg resize...")
-        vf = hq_downscale_vf(new_width, new_height, enc["range"], enc["kernel"])
-        
-        ffmpeg_cmd = [
-            'ffmpeg', '-y', '-i', video_path,
-            '-vf', vf,
-            *hq_color_v_args(enc),
-            '-map', '0:v:0',  # Map video stream
-            '-map', '0:a:0?',  # Map audio stream if it exists (? makes it optional)
-            '-c:a', 'aac',
-            '-b:a', '256k',
-            output_path
-        ]
-        
-        # Run FFmpeg and capture output
-        result = subprocess.run(
-            ffmpeg_cmd,
-            capture_output=True,
-            text=True,
-            check=True
-        )
+        if not _run_downscale_ffmpeg(video_path, output_path, new_width, new_height, enc):
+            log("FFmpeg error during resize", message_type="error")
+            return video_path
         
         progress(1.0, desc="Resize complete!")
         log(f"Video resized successfully: {output_path}", message_type="finish")
@@ -6900,6 +7031,11 @@ def create_ui():
                                         label="Color range",
                                         info=TIPS["resize_color"],
                                     )
+                                gr.Markdown(
+                                    "HDR is **auto-detected per file** (PQ / HLG / Dolby Vision / mastering metadata) — "
+                                    "no tagging. FlashVSR is SDR, so HDR is mapped to 10-bit Rec.709 for the temp. "
+                                    "4K-safe auto is the 4090 OOM-safe max (16:9 960×540, 9:16 540×960)."
+                                )
 
                                 gr.Markdown(
                                     '<span style="font-size: 0.9em; color: #555;">'

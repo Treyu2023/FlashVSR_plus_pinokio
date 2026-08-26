@@ -42,7 +42,13 @@ from toolbox.batch_queue import (
     write_live_batch_progress,
     write_batch_inputs_list,
 )
-from flashvsr_work_queue import FlashVSRWorkQueue, ExclusiveQueueLock, VIDEO_EXTS, IMAGE_EXTS
+from flashvsr_work_queue import (
+    FlashVSRWorkQueue,
+    ExclusiveQueueLock,
+    VIDEO_EXTS,
+    IMAGE_EXTS,
+    AddResult,
+)
 import group_therapy as gt
 from naming_utils import (
     upscale_video_filename,
@@ -276,6 +282,9 @@ TIPS = {
     "export_name": "Optional output filename stem (no extension). Empty = auto name from source + naming mode.",
     "theme": "UI theme — cosmetic only. Interstellar is saved as your preference; restart page after Apply.",
     "custom_theme": "Custom Gradio theme from Hugging Face Spaces (username/theme). Only used when Theme = Custom.",
+    "ui_font": "UI font for labels and buttons. Path boxes stay monospace so long Windows paths stay readable.",
+    "ui_font_size": "Base text size in pixels. Path boxes and monitors scale with this.",
+    "ui_scale": "Zoom the whole UI (80–150%). Use this if controls feel cramped. Paths still wrap to show the full string.",
     "naming_mode": (
         "Legacy setting (kept for compatibility). Real names are now 2-step:\n"
         "  Step 1 Upscale → name_4K_9x16_Upscaled.mp4\n"
@@ -290,7 +299,8 @@ TIPS = {
     "tb_inbox_folder": "Step 5 — Toolbox watches / picks from here (usually same as Step 3).",
     "gt_group_size": (
         "Group Therapy size — how many originals go through one full pipeline pass "
-        "before the next group starts. Default 5."
+        "before the next group starts. Groups run newest → oldest (in-progress group "
+        "finishes first). Default 5."
     ),
     "gt_before_dir": "Before folder (flat) — originals land here as name_PID_xxxxxxxx.mp4 (same id as After). Title metadata is also set to PID_xxxxxxxx; Media Center tags are not touched.",
     "gt_after_dir": "After folder (flat) — finals land here as name_PID_xxxxxxxx.mp4 (same id as Before). No per-file subfolders.",
@@ -413,8 +423,10 @@ def workflow_paths_html(config: Optional[dict] = None) -> str:
             f"<td style='padding:6px 10px;color:#7dd3fc;font-weight:700;white-space:nowrap;'>Step {num}</td>"
             f"<td style='padding:6px 10px;color:#e2e8f0;font-weight:600;'>{title}</td>"
             f"<td style='padding:6px 10px;color:#94a3b8;font-size:0.88em;'>{blurb}</td>"
-            f"<td style='padding:6px 10px;'><code style='color:#cbd5e1;background:#0b1220;"
-            f"padding:2px 6px;border-radius:4px;font-size:0.82em;'>{p}</code></td>"
+            f"<td style='padding:6px 10px;max-width:42em;'><code class='fvsr-path' "
+            f"style='color:#cbd5e1;background:#0b1220;padding:2px 6px;border-radius:4px;"
+            f"font-size:0.82em;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-all;"
+            f"display:inline-block;max-width:100%;user-select:all;'>{p}</code></td>"
             f"</tr>"
         )
     name_row = (
@@ -699,6 +711,9 @@ def get_ui_defaults(config=None):
             r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Post Scaling\Ready for CIV",
             str,
         ),
+        "ui_font": ("Segoe UI", str),
+        "ui_font_size": (14, int),
+        "ui_scale": (100, int),
     }
     defaults = {}
     for key, (fallback, typ) in specs.items():
@@ -3161,17 +3176,8 @@ def _run_group_therapy_body(
             "watch",
             hygiene_scan_folder(watch_folder, role="watch", scale=int(scale or 4)),
         )
-        added, skipped = wq.add_folder(watch_folder)
-        if added:
-            log(f"Group Therapy: added {added} from {watch_folder}", message_type="info")
-        elif not skipped:
-            log(f"Group Therapy: no new videos in {watch_folder}", message_type="info")
-        if skipped:
-            log(
-                f"Group Therapy: skipped {skipped} already-queued or already-upscaled "
-                f"(upscaled files belong on Toolbox)",
-                message_type="info",
-            )
+        scan = wq.add_folder(watch_folder)
+        _log_queue_scan("Group Therapy", watch_folder, scan, noun="video")
 
     dropped = wq.drop_wrong_stage_pending()
     if dropped:
@@ -3185,6 +3191,7 @@ def _run_group_therapy_body(
     if stuck:
         log(f"Re-queued {stuck} stuck Group Therapy job(s)", message_type="info")
     wq.requeue_failed()
+    wq.reorder_pending_newest_first()
     gt.assign_groups(wq, group_size)
     already = gt.mark_already_paired(wq, after_dir)
     if already:
@@ -3205,6 +3212,7 @@ def _run_group_therapy_body(
 
     log(
         f"Group Therapy: {len(groups)} group(s) × {group_size}  "
+        f"order=newest → oldest (in-progress group first)  "
         f"stages={' → '.join(gt.STAGE_LABELS[s] for s in stages)}  "
         f"before={before_dir}  after={after_dir}",
         message_type="info",
@@ -3877,21 +3885,8 @@ def _run_flashvsr_work_queue_body(
                 scale=int(scale or ui.get("scale") or 4),
             ),
         )
-        added, skipped = wq.add_folder(watch_folder)
-        if added:
-            log(
-                f"Watch folder: added {added} from {watch_folder}"
-                + (f" (skipped {skipped} already queued / already-upscaled)" if skipped else ""),
-                message_type="info",
-            )
-        elif skipped:
-            log(
-                f"Watch folder: {skipped} skipped (already queued or already-upscaled) "
-                f"({watch_folder})",
-                message_type="info",
-            )
-        else:
-            log(f"Watch folder empty or no new videos: {watch_folder}", message_type="info")
+        scan = wq.add_folder(watch_folder)
+        _log_queue_scan("Watch folder", watch_folder, scan, noun="video")
     elif watch_folder:
         log(f"Watch folder missing (create it or fix path): {watch_folder}", message_type="warning")
 
@@ -4256,11 +4251,8 @@ def _run_flashvsr_image_work_queue_body(
     handoff = (ui.get("img_upscale_handoff_dir") or paths["img_handoff"]).strip()
 
     if watch_folder and os.path.isdir(watch_folder):
-        added, skipped = wq.add_folder(watch_folder)
-        if added:
-            log(f"Image watch: added {added} from {watch_folder}", message_type="info")
-        elif not skipped:
-            log(f"Image watch: no new images in {watch_folder}", message_type="info")
+        scan = wq.add_folder(watch_folder)
+        _log_queue_scan("Image watch", watch_folder, scan, noun="image")
 
     dropped = wq.drop_wrong_stage_pending()
     if dropped:
@@ -5181,6 +5173,15 @@ def hygiene_scan_folder(
     return stats
 
 
+def _log_queue_scan(prefix: str, folder: str, result: AddResult, *, noun: str = "file") -> None:
+    """One log line: added vs already-queued vs copies vs already-upscaled vs sidecars."""
+    summary = result.summary(noun=noun)
+    if summary:
+        log(f"{prefix}: {summary}  ({folder})", message_type="info")
+        return
+    log(f"{prefix}: no new {noun}s in {folder}", message_type="info")
+
+
 def _log_hygiene(folder: str, role: str, stats: dict) -> None:
     if not any(stats.get(k) for k in ("novideo", "highfps", "over4k", "reclaimed", "errors")):
         return
@@ -5257,11 +5258,8 @@ def _run_toolbox_work_queue_body(wq, progress):
                 should_stop=wq.stop_requested,
             ),
         )
-        added, skipped = wq.add_folder(inbox)
-        if added:
-            log(f"Toolbox inbox: added {added} from {inbox}", message_type="info")
-        elif not skipped:
-            log(f"Toolbox inbox empty: {inbox}", message_type="info")
+        scan = wq.add_folder(inbox)
+        _log_queue_scan("Toolbox inbox", inbox, scan, noun="video")
     elif inbox:
         log(f"Toolbox inbox missing: {inbox}", message_type="warning")
 
@@ -6753,10 +6751,56 @@ HEAD_HTML = r"""
   if (document.body) start();
   else document.addEventListener('DOMContentLoaded', start);
 })();
+(function () {
+  var STACKS = {
+    "Segoe UI": "'Segoe UI', system-ui, sans-serif",
+    "Inter": "Inter, 'Segoe UI', system-ui, sans-serif",
+    "Arial": "Arial, Helvetica, sans-serif",
+    "Calibri": "Calibri, 'Segoe UI', sans-serif",
+    "Tahoma": "Tahoma, 'Segoe UI', sans-serif",
+    "Verdana": "Verdana, Geneva, sans-serif",
+    "Georgia": "Georgia, 'Times New Roman', serif",
+    "Times New Roman": "'Times New Roman', Times, serif",
+    "Consolas": "Consolas, 'Cascadia Mono', monospace",
+    "Cascadia Mono": "'Cascadia Mono', Consolas, monospace",
+    "Courier New": "'Courier New', Courier, monospace",
+    "system-ui": "system-ui, 'Segoe UI', sans-serif"
+  };
+  function stack(name) {
+    return STACKS[name] || ("'" + String(name || "Segoe UI") + "', system-ui, sans-serif");
+  }
+  window.fvsrApplyAppearance = function (font, size, scale) {
+    var root = document.documentElement;
+    root.style.setProperty("--fvsr-font", stack(font));
+    root.style.setProperty("--fvsr-font-size", (parseInt(size, 10) || 14) + "px");
+    root.style.setProperty("--fvsr-scale", String((parseInt(scale, 10) || 100) / 100));
+    try {
+      localStorage.setItem("fvsr-ui-font", String(font || "Segoe UI"));
+      localStorage.setItem("fvsr-ui-font-size", String(size || 14));
+      localStorage.setItem("fvsr-ui-scale", String(scale || 100));
+    } catch (e) {}
+  };
+  try {
+    var f = localStorage.getItem("fvsr-ui-font");
+    var s = localStorage.getItem("fvsr-ui-font-size");
+    var z = localStorage.getItem("fvsr-ui-scale");
+    if (f || s || z) window.fvsrApplyAppearance(f || "Segoe UI", s || 14, z || 100);
+  } catch (e) {}
+})();
 </script>
 """
 
-css = """
+CSS_BASE = """
+:root {
+    --fvsr-font: 'Segoe UI', system-ui, sans-serif;
+    --fvsr-font-size: 14px;
+    --fvsr-scale: 1;
+}
+.gradio-container {
+    font-family: var(--fvsr-font) !important;
+    font-size: var(--fvsr-font-size) !important;
+    zoom: var(--fvsr-scale);
+}
 .video-window {
     min-height: 300px !important;
     height: auto !important;
@@ -6787,7 +6831,7 @@ css = """
     background: linear-gradient(135deg, #0f1419 0%, #1a202c 100%) !important;
     color: #e2e8f0 !important;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35) !important;
-    resize: none !important;
+    resize: vertical !important;
     font-weight: 500 !important;
     caret-color: #7dd3fc !important;
 }
@@ -6822,6 +6866,34 @@ textarea, input[type="text"], input[type="number"], input[type="search"] {
 }
 textarea::placeholder, input::placeholder {
     color: #64748b !important;
+}
+
+/* Folder / file path fields — wrap so the whole Windows path is visible and selectable */
+.path-box textarea,
+.path-box input[type="text"] {
+    white-space: pre-wrap !important;
+    overflow-wrap: anywhere !important;
+    word-break: break-all !important;
+    overflow-x: auto !important;
+    overflow-y: auto !important;
+    min-height: 3.4em !important;
+    line-height: 1.4 !important;
+    font-family: Consolas, 'Cascadia Mono', 'Courier New', monospace !important;
+    font-size: 0.95em !important;
+    resize: vertical !important;
+    text-overflow: clip !important;
+}
+.path-box textarea:focus,
+.path-box input[type="text"]:focus {
+    white-space: pre-wrap !important;
+    overflow-x: auto !important;
+    text-overflow: clip !important;
+}
+code.fvsr-path {
+    white-space: pre-wrap !important;
+    overflow-wrap: anywhere !important;
+    word-break: break-all !important;
+    user-select: all;
 }
 
 /* Machine profile banner */
@@ -6874,7 +6946,83 @@ span[data-testid="block-info"]:hover {
 }
 #fvsr-tip-float.visible { display: block; }
 """
-    
+
+UI_FONT_CHOICES = [
+    "Segoe UI",
+    "Inter",
+    "Arial",
+    "Calibri",
+    "Tahoma",
+    "Verdana",
+    "Georgia",
+    "Times New Roman",
+    "Consolas",
+    "Cascadia Mono",
+    "Courier New",
+    "system-ui",
+]
+
+_UI_FONT_STACKS = {
+    "Segoe UI": "'Segoe UI', system-ui, sans-serif",
+    "Inter": "Inter, 'Segoe UI', system-ui, sans-serif",
+    "Arial": "Arial, Helvetica, sans-serif",
+    "Calibri": "Calibri, 'Segoe UI', sans-serif",
+    "Tahoma": "Tahoma, 'Segoe UI', sans-serif",
+    "Verdana": "Verdana, Geneva, sans-serif",
+    "Georgia": "Georgia, 'Times New Roman', serif",
+    "Times New Roman": "'Times New Roman', Times, serif",
+    "Consolas": "Consolas, 'Cascadia Mono', monospace",
+    "Cascadia Mono": "'Cascadia Mono', Consolas, monospace",
+    "Courier New": "'Courier New', Courier, monospace",
+    "system-ui": "system-ui, 'Segoe UI', sans-serif",
+}
+
+
+def _ui_appearance(config=None):
+    cfg = config or {}
+    font = str(cfg.get("ui_font") or "Segoe UI").strip() or "Segoe UI"
+    if font not in UI_FONT_CHOICES:
+        font = "Segoe UI"
+    try:
+        size = int(float(cfg.get("ui_font_size") or 14))
+    except (TypeError, ValueError):
+        size = 14
+    size = max(11, min(22, size))
+    try:
+        scale = int(float(cfg.get("ui_scale") or 100))
+    except (TypeError, ValueError):
+        scale = 100
+    scale = max(80, min(150, scale))
+    return font, size, scale
+
+
+def _appearance_css(config=None) -> str:
+    font, size, scale = _ui_appearance(config)
+    stack = _UI_FONT_STACKS.get(font, _UI_FONT_STACKS["Segoe UI"])
+    return (
+        ":root {"
+        f"--fvsr-font: {stack};"
+        f"--fvsr-font-size: {size}px;"
+        f"--fvsr-scale: {scale / 100};"
+        "}\n"
+    )
+
+
+def path_textbox(*args, **kwargs):
+    """Folder/file path field: wraps so the whole Windows path is visible and selectable."""
+    kwargs.setdefault("lines", 2)
+    kwargs.setdefault("max_lines", 8)
+    extra = kwargs.pop("elem_classes", None)
+    classes = ["path-box"]
+    if extra:
+        if isinstance(extra, str):
+            classes.append(extra)
+        else:
+            classes.extend(list(extra))
+    kwargs["elem_classes"] = classes
+    return gr.Textbox(*args, **kwargs)
+
+
 def create_ui():
     global toolbox_processor
 
@@ -6934,7 +7082,11 @@ def create_ui():
     # Combine all theme names for dropdown
     ALL_THEME_NAMES = list(BUILTIN_THEMES.keys()) + list(COMMUNITY_THEMES.keys()) + ["Custom"]
     
-    with gr.Blocks(css=css, theme=selected_theme, head=HEAD_HTML) as demo:
+    with gr.Blocks(
+        css=_appearance_css(config) + CSS_BASE,
+        theme=selected_theme,
+        head=HEAD_HTML,
+    ) as demo:
         output_file_path = gr.State(None)
         completion_status = gr.State(None)
 
@@ -6969,7 +7121,7 @@ def create_ui():
                                 gr.Markdown(
                                     "**Watch folder** (auto-scanned on Start / Resume) or paste another path:"
                                 )
-                                batch_folder_path = gr.Textbox(
+                                batch_folder_path = path_textbox(
                                     value=ui.get(
                                         "batch_watch_folder",
                                         r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS",
@@ -7112,17 +7264,18 @@ def create_ui():
                                 gr.Markdown(
                                     "**Group Therapy** — take **N** files from the original folder, "
                                     "run that group **start to finish** (upscale → RIFE → RIFE → export), "
-                                    "then the next N.\n\n"
+                                    "then the next N. Default order is **newest → oldest** "
+                                    "(a group already in progress finishes first).\n\n"
                                     "After each file finishes: **keep only the original + the end file**. "
                                     "Everything else (resized, `_Upscaled`, RIFE temps) is deleted.\n\n"
                                     "Each pair is tagged **`_PID_xxxxxxxx`** at the end of the filename "
                                     "(and Title metadata — not Media Center tags). "
                                     "Before and After stay **flat folders** so you can compare side by side."
                                 )
-                                gt_watch_folder = gr.Textbox(
+                                gt_watch_folder = path_textbox(
                                     value=ui.get("batch_watch_folder", r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS"),
                                     label="Original folder (intake)",
-                                    info="Files are pulled from here in newest-first groups.",
+                                    info="Newest files first, oldest last. In-progress group finishes before jumping to newer files.",
                                 )
                                 gt_group_size = gr.Slider(
                                     minimum=1,
@@ -7133,7 +7286,7 @@ def create_ui():
                                     info=TIPS["gt_group_size"],
                                 )
                                 with gr.Row():
-                                    gt_before_dir = gr.Textbox(
+                                    gt_before_dir = path_textbox(
                                         value=ui.get("gt_before_dir") or ui.get(
                                             "batch_source_archive_dir",
                                             r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
@@ -7141,7 +7294,7 @@ def create_ui():
                                         label="Before (originals, flat)",
                                         info=TIPS["gt_before_dir"],
                                     )
-                                    gt_after_dir = gr.Textbox(
+                                    gt_after_dir = path_textbox(
                                         value=ui.get("gt_after_dir") or ui.get(
                                             "toolbox_output_dir",
                                             r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Post Scaling\Ready for CIV",
@@ -7457,7 +7610,7 @@ def create_ui():
                                     height="200px",
                                 )
                                 gr.Markdown("**Watch folder** (same NEW DOWNLOADS as video — images auto-picked):")
-                                img_batch_folder_path = gr.Textbox(
+                                img_batch_folder_path = path_textbox(
                                     value=ui.get("batch_watch_folder", r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS"),
                                     placeholder=r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS",
                                     label="Watch / folder path",
@@ -7718,7 +7871,7 @@ def create_ui():
                                     height="300px",                            
                                 )
                                 gr.Markdown("**Or** specify a folder path containing videos:")
-                                tb_batch_folder_path = gr.Textbox(
+                                tb_batch_folder_path = path_textbox(
                                     placeholder="e.g., C:\\Users\\Videos\\batch",
                                     label="Folder Path",
                                     show_label=False
@@ -7751,7 +7904,7 @@ def create_ui():
                                     f"<code>{_tb_inbox_default}</code> "
                                     "→ Ready for CIV.</span>"
                                 )
-                                tb_inbox_path = gr.Textbox(
+                                tb_inbox_path = path_textbox(
                                     value=ui.get(
                                         "tb_inbox_folder",
                                         r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox",
@@ -7904,7 +8057,7 @@ def create_ui():
                         "4. FlashVSR batches also write `BATCH_PROGRESS.txt` + `REMAINING.txt` + `INPUTS.txt` in the batch folder"
                     )
                     with gr.Row():
-                        bq_source_folder = gr.Textbox(
+                        bq_source_folder = path_textbox(
                             label="Source folder (raw inputs)",
                             placeholder=r"D:\INPUTS\my_100_clips",
                             info="Folder of videos to process (not the outputs).",
@@ -7920,7 +8073,7 @@ def create_ui():
                             scale=1,
                         )
                     with gr.Row():
-                        bq_output_dirs = gr.Textbox(
+                        bq_output_dirs = path_textbox(
                             label="Output folders to scan (one per line)",
                             value="\n".join(
                                 [
@@ -7992,7 +8145,7 @@ def create_ui():
                         bq_requeue_fail_btn = gr.Button("♻️ Requeue FAILED", size="sm")
                         bq_rebuild_btn = gr.Button("🧩 Rebuild chunks", size="sm")
                     with gr.Row():
-                        bq_import_batch_dir = gr.Textbox(
+                        bq_import_batch_dir = path_textbox(
                             label="Import crashed FlashVSR batch folder",
                             placeholder=r"C:\pinokio\api\FlashVSR_plus_pinokio.git\app\outputs\batch_20260731_120000",
                             info="Folder with BATCH_PROGRESS.json + INPUTS.txt (written automatically now).",
@@ -8005,7 +8158,7 @@ def create_ui():
                         bq_open_active_btn = gr.Button("Open active queue folder", size="sm")
                         bq_open_work_btn = gr.Button("Open prepared work folder", size="sm")
                         bq_push_batch_btn = gr.Button("➡️ Push path → FlashVSR Batch folder", size="sm")
-                    bq_work_folder = gr.Textbox(
+                    bq_work_folder = path_textbox(
                         label="Prepared chunk folder (FlashVSR Batch → Folder Path)",
                         interactive=True,
                         info="Hardlinks/copies of only unfinished files. Copy this path or use Push button.",
@@ -8435,17 +8588,14 @@ def create_ui():
                     p = f if isinstance(f, str) else getattr(f, "name", None)
                     if p:
                         paths.append(p)
+            scan = AddResult()
             if folder_path and os.path.isdir(folder_path):
-                a, s = wq.add_folder(folder_path)
-            else:
-                a, s = 0, 0
+                scan = wq.add_folder(folder_path)
             if paths:
-                a2, s2 = wq.add_paths(paths)
-                a += a2
-                s += s2
-            note = f"Added {a} video(s)" + (f", skipped {s} already in queue" if s else "")
-            if a == 0 and s == 0:
-                note = "Nothing to add — upload files or set a folder path with videos."
+                scan = scan.merged(wq.add_paths(paths))
+            note = scan.summary(noun="video") or (
+                "Nothing to add — upload files or set a folder path with videos."
+            )
             return wq.status_html(note)
 
         def handle_queue_stop():
@@ -8583,12 +8733,13 @@ def create_ui():
                 cfg = load_config()
                 cfg["batch_watch_folder"] = watch
                 save_config(cfg)
-            a, s = wq.add_folder(watch) if watch and os.path.isdir(watch) else (0, 0)
+            scan = wq.add_folder(watch) if watch and os.path.isdir(watch) else AddResult()
             ui = get_ui_defaults()
+            wq.reorder_pending_newest_first()
             gt.assign_groups(wq, int(ui.get("gt_group_size") or 10))
-            note = f"Added {a} video(s)" + (f", skipped {s} already in queue" if s else "")
-            if a == 0 and s == 0:
-                note = "Nothing to add — set the original folder path."
+            note = scan.summary(noun="video") or (
+                "Nothing to add — set the original folder path."
+            )
             return wq.status_html(note)
 
         def _gt_q_stop():
@@ -8811,9 +8962,9 @@ def create_ui():
         # Image work queue handlers
         def handle_img_queue_add(batch_files, folder_path):
             wq = get_flashvsr_image_queue()
-            a, s = 0, 0
+            scan = AddResult()
             if folder_path and os.path.isdir(folder_path):
-                a, s = wq.add_folder(folder_path)
+                scan = wq.add_folder(folder_path)
             paths = []
             if batch_files:
                 for f in batch_files:
@@ -8821,12 +8972,10 @@ def create_ui():
                     if p:
                         paths.append(p)
             if paths:
-                a2, s2 = wq.add_paths(paths)
-                a += a2
-                s += s2
-            note = f"Added {a} image(s)" + (f", skipped {s} dupes" if s else "")
-            if a == 0 and s == 0:
-                note = "Nothing to add — drop images in the watch folder or upload."
+                scan = scan.merged(wq.add_paths(paths))
+            note = scan.summary(noun="image") or (
+                "Nothing to add — drop images in the watch folder or upload."
+            )
             return wq.status_html(note)
 
         def handle_img_batch_processing(
@@ -9168,10 +9317,8 @@ def create_ui():
                 cfg["tb_inbox_folder"] = str(inbox).strip()
                 save_config(cfg)
                 inbox = str(inbox).strip()
-            a, s = wq.add_folder(inbox) if inbox and os.path.isdir(inbox) else (0, 0)
-            note = f"Scanned inbox: +{a}" + (f", {s} already queued" if s else "")
-            if a == 0 and s == 0:
-                note = f"No new videos in inbox: {inbox}"
+            scan = wq.add_folder(inbox) if inbox and os.path.isdir(inbox) else AddResult()
+            note = scan.summary(noun="video") or f"No new videos in inbox: {inbox}"
             return wq.status_html(note)
 
         def handle_tb_queue_run(inbox):
@@ -9556,6 +9703,44 @@ def create_ui():
             
             apply_theme_btn = gr.Button("Apply Theme", size="sm", variant="primary")
 
+            _ui_font, _ui_size, _ui_scale = _ui_appearance(config)
+            gr.Markdown("### Font & size")
+            gr.Markdown(
+                "Change font, text size, and overall zoom without a theme reload. "
+                "Path boxes wrap so the **whole folder path stays visible** when you click or highlight."
+            )
+            with gr.Row():
+                ui_font = gr.Dropdown(
+                    choices=UI_FONT_CHOICES,
+                    value=_ui_font,
+                    label="Font",
+                    info=TIPS["ui_font"],
+                    scale=2,
+                )
+                ui_font_size = gr.Slider(
+                    minimum=11,
+                    maximum=22,
+                    step=1,
+                    value=_ui_size,
+                    label="Text size (px)",
+                    info=TIPS["ui_font_size"],
+                    scale=2,
+                )
+                ui_scale = gr.Slider(
+                    minimum=80,
+                    maximum=150,
+                    step=5,
+                    value=_ui_scale,
+                    label="UI zoom (%)",
+                    info=TIPS["ui_scale"],
+                    scale=2,
+                )
+            with gr.Row():
+                apply_ui_appearance_btn = gr.Button("Apply font & size", size="sm", variant="primary")
+                ui_appearance_status = gr.Textbox(
+                    label="Appearance status", interactive=False, show_label=False, scale=2
+                )
+
             gr.Markdown("### Process naming (2 steps only)")
             gr.HTML(
                 value=(
@@ -9588,42 +9773,42 @@ def create_ui():
             gr.Markdown("### Folders (selectable — your current D: paths are fine)")
             gr.HTML(value=workflow_paths_html(config))
             _wp = get_workflow_paths(config)
-            step1_watch = gr.Textbox(
+            step1_watch = path_textbox(
                 label="Intake / watch (new downloads)",
                 value=_wp["batch_watch_folder"],
                 info="Where new files land · queues scan on Start / Resume",
             )
-            step2_archive = gr.Textbox(
+            step2_archive = path_textbox(
                 label="Originals archive (pre-upscale sources for pairing)",
                 value=_wp["batch_source_archive_dir"],
                 info="Original sources moved here after upscale",
             )
-            step3_upscale = gr.Textbox(
+            step3_upscale = path_textbox(
                 label="Step 1 output — upscaled VIDEOS (Ready for Toolbox)",
                 value=_wp["batch_upscale_handoff_dir"],
                 info="Upscaled videos land here. After Step 2 they go into Bin\\ under this folder.",
             )
-            step4_images = gr.Textbox(
+            step4_images = path_textbox(
                 label="Step 1 output — upscaled IMAGES",
                 value=_wp["img_upscale_handoff_dir"],
                 info="Images skip toolbox interp · usually Ready for CIV\\images",
             )
-            step5_inbox = gr.Textbox(
+            step5_inbox = path_textbox(
                 label="Step 2 input — Toolbox inbox (usually = Ready for Toolbox)",
                 value=_wp["tb_inbox_folder"],
                 info="Toolbox reads Step‑1 videos from here",
             )
-            step6_final = gr.Textbox(
+            step6_final = path_textbox(
                 label="Step 2 output — Final / Ready for CIV",
                 value=_wp["toolbox_output_dir"],
                 info="Interp+export finals with _##fps in the name",
             )
-            gt_settings_before = gr.Textbox(
+            gt_settings_before = path_textbox(
                 label="Group Therapy — Before (originals, flat folder)",
                 value=str(config.get("gt_before_dir") or _wp["batch_source_archive_dir"]),
                 info="Originals stay in this folder with _PID_xxxxxxxx at the end of the filename (and Title metadata). Same id as After. No per-song subfolders.",
             )
-            gt_settings_after = gr.Textbox(
+            gt_settings_after = path_textbox(
                 label="Group Therapy — After (finals, flat folder)",
                 value=str(config.get("gt_after_dir") or _wp["toolbox_output_dir"]),
                 info="Finals stay in this folder with _PID_xxxxxxxx at the end of the filename (and Title metadata). Same id as Before. No per-song subfolders.",
@@ -9668,6 +9853,41 @@ def create_ui():
             inputs=[theme_dropdown, custom_theme_input],
             outputs=[theme_status]
         )
+
+        _APPEAR_JS = (
+            "(font, size, scale) => { "
+            "if (window.fvsrApplyAppearance) window.fvsrApplyAppearance(font, size, scale); "
+            "return [font, size, scale]; }"
+        )
+
+        def apply_ui_appearance(font, size, scale):
+            font, size, scale = _ui_appearance(
+                {"ui_font": font, "ui_font_size": size, "ui_scale": scale}
+            )
+            cfg = load_config()
+            cfg["ui_font"] = font
+            cfg["ui_font_size"] = size
+            cfg["ui_scale"] = scale
+            save_config(cfg)
+            return f"✅ Font {font} · {size}px · zoom {scale}% (saved). Paths wrap so the full string stays visible."
+
+        apply_ui_appearance_btn.click(
+            fn=apply_ui_appearance,
+            inputs=[ui_font, ui_font_size, ui_scale],
+            outputs=[ui_appearance_status],
+            js=_APPEAR_JS,
+        )
+        for _ctrl in (ui_font, ui_font_size, ui_scale):
+            _ctrl.change(
+                fn=None,
+                inputs=[ui_font, ui_font_size, ui_scale],
+                js=(
+                    "(font, size, scale) => { "
+                    "if (window.fvsrApplyAppearance) window.fvsrApplyAppearance(font, size, scale); }"
+                ),
+                show_progress="hidden",
+                queue=False,
+            )
 
         def apply_naming_mode(mode):
             mode = str(mode or "both").strip().lower()

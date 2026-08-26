@@ -15,7 +15,7 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".m4v", ".wmv", ".gif", ".ts", ".mts", ".m2ts"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}
@@ -53,6 +53,90 @@ def looks_like_upscaled_output(path: str) -> bool:
     """True if this file is already a FlashVSR / step-1 output (belongs on Toolbox)."""
     name = Path(path or "").name
     return bool(name) and bool(_UPSCALED_OUTPUT_RE.search(name))
+
+
+class AddResult:
+    """Scan/add outcome. Iterates as (added, skipped) for older call sites."""
+
+    __slots__ = (
+        "added",
+        "skipped",
+        "already_queued",
+        "already_upscaled",
+        "same_size_copy",
+        "sidecar",
+        "scanned",
+    )
+
+    def __init__(
+        self,
+        added: int = 0,
+        skipped: int = 0,
+        already_queued: int = 0,
+        already_upscaled: int = 0,
+        same_size_copy: int = 0,
+        sidecar: int = 0,
+        scanned: int = 0,
+    ) -> None:
+        self.added = int(added)
+        self.already_queued = int(already_queued)
+        self.already_upscaled = int(already_upscaled)
+        self.same_size_copy = int(same_size_copy)
+        self.sidecar = int(sidecar)
+        self.scanned = int(scanned)
+        self.skipped = int(
+            skipped
+            if skipped
+            else already_queued + already_upscaled + same_size_copy + sidecar
+        )
+
+    def __iter__(self) -> Iterator[int]:
+        yield self.added
+        yield self.skipped
+
+    def merged(self, other: "AddResult") -> "AddResult":
+        return AddResult(
+            added=self.added + other.added,
+            already_queued=self.already_queued + other.already_queued,
+            already_upscaled=self.already_upscaled + other.already_upscaled,
+            same_size_copy=self.same_size_copy + other.same_size_copy,
+            sidecar=self.sidecar + other.sidecar,
+            scanned=self.scanned + other.scanned,
+        )
+
+    def detail_bits(self) -> List[str]:
+        bits: List[str] = []
+        if self.already_queued:
+            bits.append(
+                f"{self.already_queued} already in this queue "
+                "(still waiting/running — not dropped)"
+            )
+        if self.same_size_copy:
+            bits.append(
+                f"{self.same_size_copy} same-size copies "
+                "(identical byte length as a queued file — usually a renamed duplicate)"
+            )
+        if self.already_upscaled:
+            bits.append(
+                f"{self.already_upscaled} already-upscaled names "
+                "(Toolbox / RIFE, not another 4× pass)"
+            )
+        if self.sidecar:
+            bits.append(
+                f"{self.sidecar} in sidecar folders "
+                "(Over4K / HighFPS / NoVideo / done / …)"
+            )
+        return bits
+
+    def summary(self, *, noun: str = "file") -> str:
+        parts: List[str] = []
+        if self.added:
+            plural = "s" if self.added != 1 else ""
+            parts.append(f"added {self.added} {noun}{plural}")
+        bits = self.detail_bits()
+        if bits:
+            parts.append("skipped: " + "; ".join(bits))
+        return " · ".join(parts)
 
 
 def _path_in_sidecar_dir(path: str) -> bool:
@@ -381,7 +465,7 @@ class FlashVSRWorkQueue:
     def stop_requested(self) -> bool:
         return self.stop_flag_path.is_file()
 
-    def add_paths(self, paths: Sequence[str]) -> Tuple[int, int]:
+    def add_paths(self, paths: Sequence[str]) -> AddResult:
         data = self.load()
         items = data.setdefault("items", [])
         existing = {_norm(it["path"]) for it in items if it.get("path")}
@@ -391,7 +475,11 @@ class FlashVSRWorkQueue:
             if sz > 0:
                 existing_sizes.add(sz)
         added = 0
-        skipped = 0
+        already_queued = 0
+        already_upscaled = 0
+        same_size_copy = 0
+        sidecar = 0
+        scanned = 0
         for p in paths:
             if not p:
                 continue
@@ -403,21 +491,22 @@ class FlashVSRWorkQueue:
                 continue
             if Path(ap).suffix.lower() not in self.extensions:
                 continue
+            scanned += 1
             if _path_in_sidecar_dir(ap):
-                skipped += 1
+                sidecar += 1
                 continue
             if self.name in _UPSCALE_QUEUES and looks_like_upscaled_output(ap):
                 # Already upscaled — Toolbox / RIFE+export, not another FlashVSR pass
-                skipped += 1
+                already_upscaled += 1
                 continue
             key = _norm(ap)
             if key in existing:
-                skipped += 1
+                already_queued += 1
                 continue
             sz = _file_size(ap)
             if sz > 0 and sz in existing_sizes:
                 # Same byte length as a file already queued / done — skip the copy
-                skipped += 1
+                same_size_copy += 1
                 continue
             items.append(
                 {
@@ -434,16 +523,25 @@ class FlashVSRWorkQueue:
             if sz > 0:
                 existing_sizes.add(sz)
             added += 1
+        skipped = already_queued + already_upscaled + same_size_copy + sidecar
         if added:
             self.save(data)
         else:
             self._write_status_txt(data)
-        return added, skipped
+        return AddResult(
+            added=added,
+            skipped=skipped,
+            already_queued=already_queued,
+            already_upscaled=already_upscaled,
+            same_size_copy=same_size_copy,
+            sidecar=sidecar,
+            scanned=scanned,
+        )
 
-    def add_folder(self, folder: str, *, recursive: bool = False) -> Tuple[int, int]:
+    def add_folder(self, folder: str, *, recursive: bool = False) -> AddResult:
         """Scan folder and enqueue files newest-first (mtime desc → oldest last)."""
         if not folder or not os.path.isdir(folder):
-            return 0, 0
+            return AddResult()
         found: List[Path] = []
         root = Path(folder)
         if recursive:

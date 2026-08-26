@@ -1,6 +1,6 @@
 # FlashVSR+ Pinokio — Custom Configuration & Code Changes
 
-**Last updated:** 2026-08-25  
+**Last updated:** 2026-08-26  
 **Install path:** `C:\pinokio\api\FlashVSR_plus_pinokio.git\app`  
 **Purpose:** Persistent record of customizations applied outside stock FlashVSR (survives app rollback/reinstall). Re-apply or merge these after updating the Pinokio launcher.
 
@@ -10,6 +10,8 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-08-26 | **UI font / zoom + full path boxes:** Settings → Font & size (font, px, 80–150% zoom). Path fields are multi-line, wrap, and stay selectable so long `D:\\OUTPUTS\\…` strings are not clipped to one line. |
+| 2026-08-26 | **Skip reasons split + GT newest-first:** Watch/GT/image/Toolbox scan logs list *already in queue* (still waiting — not dropped), *same-size copies*, *already-upscaled names*, and *sidecar folders* separately. Group Therapy packs unstarted files newest → oldest by source mtime; an in-progress group still finishes first. |
 | 2026-08-25 | **Open Output Folder buttons:** Video → Ready for Toolbox (or last saved file). Image → Ready for CIV\\images. Toolbox → Ready for CIV. Never open `app\\outputs\\work_queue_*` JSON/TXT. Queue progress logs moved to `app\\outputs\\queue_logs`. |
 | 2026-08-25 | **HDR auto per file (no tagging):** Follow source is still TV/full range. HDR (PQ/HLG/DoVi/mastering metadata) is probed on each file and **hable-tonemapped to SDR 10-bit Rec.709** for FlashVSR (SDR model). 10-bit SDR stays 10-bit. 4K-safe auto (960×540 / 540×960) remains the 4090 OOM-safe max. |
 | 2026-08-25 | **Downscale quality knobs (4090 defaults):** Scale kernel **lanczos**, temp CRF **10**, color **Follow source**. Follow source copies TV/full from the file. Always full is range only. Per-file fit-scale; no whole-folder first pass. |
@@ -42,9 +44,9 @@
 |------|--------|
 | `webui_config` | **Created** — user defaults (pipeline folders + Group Therapy) |
 | `naming_utils.py` | **Created** — output filename conventions |
-| `webui.py` | **Modified** — config, paths, Group Therapy, hygiene, 4K-safe, PID pairing; toolbox hygiene no longer recodes |
-| `group_therapy.py` | **Created** — grouped pipeline + flat `_PID_` pairing |
-| `flashvsr_work_queue.py` | **Modified** — size-dedupe, Group Therapy status, skip already-upscaled on video/image/group |
+| `webui.py` | **Modified** — config, paths, Group Therapy, hygiene, 4K-safe, PID pairing; skip-reason logs; path_textbox + UI font/zoom |
+| `group_therapy.py` | **Created** — grouped pipeline + flat `_PID_` pairing; unstarted groups packed newest→oldest |
+| `flashvsr_work_queue.py` | **Modified** — size-dedupe, Group Therapy status, skip already-upscaled, AddResult skip reasons |
 | `toolbox/toolbox.py` | **Modified** — FPS cap, no-video probe, HighFPS skip |
 | `src/pipelines/flashvsr_tiny_long.py` | **Modified** — refuse `output_path=None` (4k_safe mode bug) |
 | `../scripts/env_guard.py` | **Modified** — snapshot + **reapply after Update/Install/Start** |

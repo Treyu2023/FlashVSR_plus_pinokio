@@ -22,7 +22,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from flashvsr_work_queue import FlashVSRWorkQueue, VIDEO_EXTS
+from flashvsr_work_queue import FlashVSRWorkQueue, VIDEO_EXTS, _file_mtime
 
 _PAIR_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 _PAIR_FOLDER_RE = re.compile(r"^GT-([0-9a-f]{8})__", re.I)
@@ -231,37 +231,80 @@ def get_queue(app_dir: str) -> FlashVSRWorkQueue:
     )
 
 
+def item_in_progress(it: Dict[str, Any]) -> bool:
+    """True if this row has started a Group Therapy stage (keep its group together)."""
+    if it.get("status") == "running":
+        return True
+    st = str(it.get("gt_stage") or "").strip().lower()
+    if st in STAGES:
+        return True
+    for key in ("gt_upscale", "gt_rife1", "gt_rife2", "gt_export"):
+        p = (it.get(key) or "").strip()
+        if p and os.path.isfile(p):
+            return True
+    return False
+
+
 def assign_groups(wq: FlashVSRWorkQueue, group_size: int) -> int:
-    """Give pending items a stable gt_group (newest-first already in queue)."""
+    """
+    Pack unstarted pending files into groups newest → oldest by source mtime.
+
+    A group already mid-pipeline (any member running / has a stage output)
+    keeps its members so that batch can finish. Leftover unstarted rows are
+    regrouped so Start always works latest files first.
+    """
     group_size = max(1, int(group_size or 10))
     data = wq.load()
     items = list(data.get("items") or [])
     if not items:
         return 0
-    assigned = 0
-    counts: Dict[int, int] = {}
-    open_gid = 0
+
+    frozen_gids = set()
     for it in items:
+        if not item_in_progress(it):
+            continue
         try:
             g = int(it.get("gt_group") or 0)
         except (TypeError, ValueError):
             g = 0
-        if g <= 0:
-            continue
-        counts[g] = counts.get(g, 0) + 1
-        if g > open_gid:
-            open_gid = g
-    open_count = counts.get(open_gid, 0)
-    if open_gid and open_count >= group_size:
-        open_gid = 0
-        open_count = 0
+        if g > 0:
+            frozen_gids.add(g)
+
+    assigned = 0
+    unstarted: List[Dict[str, Any]] = []
     for it in items:
-        if it.get("gt_group"):
+        if it.get("status") == "done":
             continue
-        if it.get("status") not in ("pending", "failed", "running"):
+        try:
+            g = int(it.get("gt_group") or 0)
+        except (TypeError, ValueError):
+            g = 0
+        if g in frozen_gids:
+            if not it.get("gt_pair_id"):
+                ensure_pair_id(it)
+                it["gt_pair_folder"] = pair_folder_name(
+                    it["gt_pair_id"], it.get("path") or "clip"
+                )
+                assigned += 1
             continue
+        if it.get("status") not in ("pending", "failed"):
+            continue
+        it["gt_group"] = None
+        unstarted.append(it)
+
+    unstarted.sort(
+        key=lambda it: (
+            -_file_mtime(it.get("path") or ""),
+            str(it.get("path") or "").lower(),
+        )
+    )
+    next_gid = (max(frozen_gids) if frozen_gids else 0) + 1
+    open_gid = 0
+    open_count = 0
+    for it in unstarted:
         if not open_gid or open_count >= group_size:
-            open_gid = (open_gid or 0) + 1
+            open_gid = next_gid
+            next_gid += 1
             open_count = 0
         it["gt_group"] = open_gid
         it.setdefault("gt_stage", None)
@@ -269,22 +312,26 @@ def assign_groups(wq: FlashVSRWorkQueue, group_size: int) -> int:
         it["gt_pair_folder"] = pair_folder_name(it["gt_pair_id"], it.get("path") or "clip")
         open_count += 1
         assigned += 1
-    # Stamp pair IDs on any older rows that don't have one yet
+
     for it in items:
         if it.get("status") == "done":
             continue
         if not it.get("gt_pair_id"):
             ensure_pair_id(it)
-            it["gt_pair_folder"] = pair_folder_name(it["gt_pair_id"], it.get("path") or "clip")
+            it["gt_pair_folder"] = pair_folder_name(
+                it["gt_pair_id"], it.get("path") or "clip"
+            )
             assigned += 1
-    if assigned:
-        data["gt_group_size"] = group_size
-        wq.save(data)
+
+    data["gt_group_size"] = group_size
+    data["gt_sort"] = "mtime_desc"
+    wq.save(data)
     return assigned
 
 
 def ordered_groups(items: Sequence[Dict[str, Any]]) -> List[int]:
-    seen = []
+    """In-progress groups first, then unstarted groups newest → oldest."""
+    meta: Dict[int, Dict[str, Any]] = {}
     for it in items:
         if it.get("status") == "done":
             continue
@@ -292,9 +339,28 @@ def ordered_groups(items: Sequence[Dict[str, Any]]) -> List[int]:
             g = int(it.get("gt_group") or 0)
         except (TypeError, ValueError):
             g = 0
-        if g and g not in seen:
-            seen.append(g)
-    return seen
+        if not g:
+            continue
+        rec = meta.setdefault(g, {"running": False, "started": False, "mtime": 0.0})
+        if it.get("status") == "running" or item_in_progress(it):
+            rec["started"] = True
+        if it.get("status") == "running":
+            rec["running"] = True
+        rec["mtime"] = max(rec["mtime"], _file_mtime(it.get("path") or ""))
+
+    def _key(gid: int):
+        rec = meta[gid]
+        if rec["running"]:
+            bucket = 0
+        elif rec["started"]:
+            bucket = 1
+        else:
+            bucket = 2
+        if bucket == 2:
+            return (bucket, -rec["mtime"], gid)
+        return (bucket, gid)
+
+    return sorted(meta, key=_key)
 
 
 def group_members(items: Sequence[Dict[str, Any]], gid: int) -> List[Dict[str, Any]]:
@@ -306,6 +372,12 @@ def group_members(items: Sequence[Dict[str, Any]], gid: int) -> List[Dict[str, A
             g = 0
         if g == gid:
             out.append(it)
+    out.sort(
+        key=lambda it: (
+            -_file_mtime(it.get("path") or ""),
+            str(it.get("path") or "").lower(),
+        )
+    )
     return out
 
 

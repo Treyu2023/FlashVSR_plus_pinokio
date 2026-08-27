@@ -10,6 +10,9 @@ import numpy as np
 from einops import rearrange
 from PIL import Image
 from tqdm import tqdm
+from ..busy_heartbeat import HeartbeatTqdm, busy, BusySpan
+
+tqdm = HeartbeatTqdm
 import types
 import imageio
 # import pyfiglet
@@ -285,7 +288,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         frames = self.TCDecoder.decode_video(
             latents.transpose(1, 2), # TCDecoder 需要 (B, F, C, H, W)
             parallel=False, 
-            show_progress_bar=False, 
+            show_progress_bar=True, 
             cond=cond
         ).transpose(1, 2).mul_(2).sub_(1) # 转回 (B, C, F, H, W) 格式，范围 -1 to 1
         
@@ -383,6 +386,10 @@ class FlashVSRTinyLongPipeline(BasePipeline):
 
         process_total_num = (num_frames - 1) // 8 - 2
         is_stream = True
+        busy(
+            f"DiT stream {process_total_num} windows, {num_frames} frames, "
+            f"{width}x{height} — each window is a GPU step"
+        )
 
         if self.prompt_emb_posi['stats'] == "offload":
             self.init_cross_kv(context_tensor=self.prompt_emb_posi['context'])
@@ -400,7 +407,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         self.TCDecoder.clean_mem()
         try:
             with torch.no_grad():
-                for cur_process_idx in progress_bar_cmd(range(process_total_num)):
+                for cur_process_idx in progress_bar_cmd(range(process_total_num), desc="[FlashVSR] DiT stream"):
                     if cur_process_idx == 0:
                         pre_cache_k = [None] * len(self.dit.blocks)
                         pre_cache_v = [None] * len(self.dit.blocks)

@@ -4,6 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+try:
+    from ..busy_heartbeat import HeartbeatTqdm as tqdm
+except Exception:
+    pass
 
 CACHE_T = 2
 

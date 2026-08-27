@@ -10,6 +10,9 @@ import numpy as np
 from einops import rearrange
 from PIL import Image
 from tqdm import tqdm
+from ..busy_heartbeat import HeartbeatTqdm, busy, BusySpan
+
+tqdm = HeartbeatTqdm
 # import pyfiglet
 
 from ..models import ModelManager
@@ -371,6 +374,10 @@ class FlashVSRFullPipeline(BasePipeline):
 
         process_total_num = (num_frames - 1) // 8 - 2
         is_stream = True
+        busy(
+            f"DiT stream {process_total_num} windows, {num_frames} frames, "
+            f"{width}x{height} — each window is a GPU step"
+        )
         
         if self.prompt_emb_posi['stats'] == "offload":
             self.init_cross_kv(context_tensor=self.prompt_emb_posi['context'])
@@ -387,7 +394,7 @@ class FlashVSRFullPipeline(BasePipeline):
         LQ_cur_idx = 0
 
         with torch.no_grad():
-            for cur_process_idx in progress_bar_cmd(range(process_total_num)):
+            for cur_process_idx in progress_bar_cmd(range(process_total_num), desc="[FlashVSR] DiT stream"):
                 if cur_process_idx == 0:
                     pre_cache_k = [None] * len(self.dit.blocks)
                     pre_cache_v = [None] * len(self.dit.blocks)
@@ -453,29 +460,33 @@ class FlashVSRFullPipeline(BasePipeline):
                 self.dit.LQ_proj_in.clear_cache()
                 
             if unload_dit and hasattr(self, 'dit') and not next(self.dit.parameters()).is_cpu:
-                print("[FlashVSR] Offloading DiT to the CPU to free up VRAM...")
-                self.offload_model(keep_vae=True)
+                print("[FlashVSR] Offloading DiT to the CPU to free up VRAM...", flush=True)
+                with BusySpan("offloading DiT to CPU"):
+                    self.offload_model(keep_vae=True)
 
             latents = torch.cat(latents_total, dim=2)
             
             # Decode
-            print("[FlashVSR] Starting VAE decoding...")
-            frames = self.decode_video(latents, **tiler_kwargs)
+            print("[FlashVSR] Starting VAE decoding...", flush=True)
+            with BusySpan("VAE decoding", extra=f"{num_frames} frames {width}x{height}"):
+                frames = self.decode_video(latents, **tiler_kwargs)
             
             self.vae.clear_cache()
             if force_offload:
-                self.offload_model()
+                with BusySpan("offloading models"):
+                    self.offload_model()
 
             # 颜色校正（wavelet）
             try:
                 if color_fix:
-                    frames = self.ColorCorrector(
-                        frames.to(device=LQ_video.device),
-                        LQ_video[:, :, :frames.shape[2], :, :],
-                        clip_range=(-1, 1),
-                        chunk_size=16,
-                        method='adain'
-                    )
+                    with BusySpan("color correction"):
+                        frames = self.ColorCorrector(
+                            frames.to(device=LQ_video.device),
+                            LQ_video[:, :, :frames.shape[2], :, :],
+                            clip_range=(-1, 1),
+                            chunk_size=16,
+                            method='adain'
+                        )
             except:
                 pass
 

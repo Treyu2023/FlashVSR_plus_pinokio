@@ -18,10 +18,11 @@ module.exports = {
         venv: "env",                // Edit this to customize the venv folder path
         env: {
           PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,max_split_size_mb:512",
+          PYTHONUNBUFFERED: "1",
         },
         path: "app",                // Edit this to customize the path to start the shell from
         message: [
-          "python webui.py",        // Edit with your custom commands
+          "python -u webui.py",     // -u: unbuffered so Pinokio shows live heartbeats
         ],
         on: [{
           // The regular expression pattern to monitor.

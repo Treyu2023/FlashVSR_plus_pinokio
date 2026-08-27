@@ -2,8 +2,15 @@ import os
 
 # Must be set before torch is imported (reduces CUDA fragmentation OOMs on 24GB GPUs).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:512")
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
 import sys
+
+try:
+    sys.stdout.reconfigure(line_buffering=True, write_through=True)
+    sys.stderr.reconfigure(line_buffering=True, write_through=True)
+except Exception:
+    pass
 import argparse
 import gradio as gr
 from gradio import ImageSlider
@@ -27,6 +34,10 @@ from typing import Optional, Sequence, Tuple
 from PIL import Image
 from tqdm import tqdm
 from einops import rearrange
+from src.busy_heartbeat import HeartbeatTqdm, busy, BusySpan, WATCH, force_line_buffering
+
+force_line_buffering()
+tqdm = HeartbeatTqdm
 from huggingface_hub import snapshot_download
 from gradio_videoslider import VideoSlider
 
@@ -915,7 +926,12 @@ def log(message:str, message_type:str="normal"):
         message = '\033[1;33m' + message + '\033[m'
     else:
         message = message
-    print(f"{message}")
+    print(f"{message}", flush=True)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 def dummy_tqdm(iterable, *args, **kwargs):
     return iterable
@@ -1486,6 +1502,7 @@ def init_pipeline(mode, device, dtype, model_version="v1.0"):
         log(f"Initializing FlashVSR v1.0 ({mode} mode)", message_type='info')
     
     ckpt_path, vae_path, lq_path, tcd_path, prompt_path = [os.path.join(model_path, f) for f in ["diffusion_pytorch_model_streaming_dmd.safetensors", "Wan2.1_VAE.pth", "LQ_proj_in.ckpt", "TCDecoder.ckpt", "../posi_prompt.pth"]]
+    busy(f"loading weights for {mode} {model_version} (DiT/VAE to GPU — can sit here a minute)")
     mm = ModelManager(torch_dtype=dtype, device="cpu")
     if mode == "full":
         mm.load_models([ckpt_path, vae_path]); pipe = FlashVSRFullPipeline.from_model_manager(mm, device=device)
@@ -1498,6 +1515,7 @@ def init_pipeline(mode, device, dtype, model_version="v1.0"):
     pipe.denoising_model().LQ_proj_in = proj_class(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
     if os.path.exists(lq_path): pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(lq_path, map_location="cpu", weights_only=False), strict=True)
     pipe.to(device, dtype=dtype); pipe.enable_vram_management(); pipe.init_cross_kv(prompt_path=prompt_path); pipe.load_models_to_device(["dit", "vae"])
+    busy(f"pipeline ready ({mode} {model_version})")
     return pipe
 
 def is_cuda_oom(exc):
@@ -1720,6 +1738,13 @@ def run_flashvsr_single(
     _fps = original_fps if is_video(input_path) else fps_override
     if frames.shape[0] < 21: raise gr.Error(f"Input must have at least 21 frames, but got {frames.shape[0]} frames.")
     log("Video frames loaded successfully.", message_type="finish")
+    busy(
+        f"upscale {frames.shape[0]} frames {frames.shape[2]}x{frames.shape[1]} "
+        f"@ {scale}x — heartbeats every ~5–12s mean it is working, not stuck"
+    )
+    WATCH.start(
+        f"upscale {frames.shape[0]}f {frames.shape[2]}x{frames.shape[1]}"
+    )
 
     final_output_tensor = None
     profiles = oom_fallback_profiles(tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit)
@@ -1740,6 +1765,11 @@ def run_flashvsr_single(
                 f"tile={tile_size}/{tile_overlap})",
                 message_type="warning",
             )
+            busy(
+                f"OOM drop → '{profile['label']}' tile {tile_size}/{tile_overlap}. "
+                "Reloading the pipeline; this is slower, not frozen. Watch heartbeats."
+            )
+            WATCH.ping(f"OOM retry {profile['label']}")
             clean_vram()
             log_vram_status(f"retry-{attempt_idx}")
             # Hard CUDA OOMs often leave the context unusable; reloading the DiT
@@ -1751,6 +1781,7 @@ def run_flashvsr_single(
                     "Restart FlashVSR in Pinokio to reclaim stuck VRAM.",
                     message_type="error",
                 )
+                WATCH.stop()
                 raise gr.Error(oom_recovery_hint())
 
         log(
@@ -1773,6 +1804,10 @@ def run_flashvsr_single(
                 N, H, W, C = frames.shape
                 tile_coords = calculate_tile_coords(H, W, tile_size, tile_overlap)
                 num_tiles = len(tile_coords)
+                busy(
+                    f"{num_tiles} tiles on {W}x{H} (tile {tile_size}/{tile_overlap}, "
+                    f"{N} frames). Each tile is DiT then VAE — VAE is the quiet stretch."
+                )
                 progress(0.1, desc="Initializing model pipeline...")
                 pipe = init_pipeline(mode, _device, dtype, model_version=model_version)
 
@@ -1789,11 +1824,15 @@ def run_flashvsr_single(
                         temp_name = os.path.join(local_temp_dir, f"{i+1:05d}.mp4")
                         th, tw, F = get_input_params(input_tile, scale)
                         LQ_tile = input_tensor_generator(input_tile, _device, scale=scale, dtype=dtype)
-                        pipe(
-                            LQ_video=LQ_tile, num_frames=F, height=th, width=tw,
-                            topk_ratio=sparse_ratio*768*1280/(th*tw),
-                            quality=quality, output_path=temp_name, **pipe_kwargs
-                        )
+                        with BusySpan(
+                            f"tile {i+1}/{num_tiles} DiT+VAE",
+                            extra=f"{x2-x1}x{y2-y1} → {tw}x{th}",
+                        ):
+                            pipe(
+                                LQ_video=LQ_tile, num_frames=F, height=th, width=tw,
+                                topk_ratio=sparse_ratio*768*1280/(th*tw),
+                                quality=quality, output_path=temp_name, **pipe_kwargs
+                            )
                         temp_videos.append(temp_name)
                         del LQ_tile, input_tile
                         clean_vram()
@@ -1818,10 +1857,15 @@ def run_flashvsr_single(
 
                         LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
                         LQ_tile = LQ_tile.to(_device)
-                        output_tile_gpu = pipe(
-                            LQ_video=LQ_tile, num_frames=F, height=th, width=tw,
-                            topk_ratio=sparse_ratio*768*1280/(th*tw), **pipe_kwargs
-                        )
+                        with BusySpan(
+                            f"tile {i+1}/{num_tiles} DiT+VAE",
+                            extra=f"{tile_w_in}x{tile_h_in} → {tw}x{th}",
+                        ):
+                            output_tile_gpu = pipe(
+                                LQ_video=LQ_tile, num_frames=F, height=th, width=tw,
+                                topk_ratio=sparse_ratio*768*1280/(th*tw), **pipe_kwargs
+                            )
+                        busy(f"tile {i+1}/{num_tiles} stitching into canvas")
                         processed_tile_cpu = tensor2video(output_tile_gpu).cpu()
                         processed_tile_cpu = processed_tile_cpu[:num_aligned_frames]
 
@@ -1859,20 +1903,22 @@ def run_flashvsr_single(
                 if mode == "tiny-long":
                     progress(0.2, desc="Processing video...")
                     LQ = input_tensor_generator(frames, _device, scale=scale, dtype=dtype)
-                    pipe(
-                        LQ_video=LQ, num_frames=F, height=th, width=tw,
-                        topk_ratio=sparse_ratio*768*1280/(th*tw),
-                        output_path=temp_video_path, quality=quality, **pipe_kwargs
-                    )
+                    with BusySpan("untiled DiT+VAE", extra=f"{tw}x{th} {F} frames"):
+                        pipe(
+                            LQ_video=LQ, num_frames=F, height=th, width=tw,
+                            topk_ratio=sparse_ratio*768*1280/(th*tw),
+                            output_path=temp_video_path, quality=quality, **pipe_kwargs
+                        )
                 else:
                     progress(0.2, desc="Processing video...")
                     LQ, _, _, _ = prepare_input_tensor(frames, _device, scale=scale, dtype=dtype)
                     LQ = LQ.to(_device)
                     progress(0.3, desc="Running model inference...")
-                    video = pipe(
-                        LQ_video=LQ, num_frames=F, height=th, width=tw,
-                        topk_ratio=sparse_ratio*768*1280/(th*tw), **pipe_kwargs
-                    )
+                    with BusySpan("untiled DiT+VAE", extra=f"{tw}x{th} {F} frames"):
+                        video = pipe(
+                            LQ_video=LQ, num_frames=F, height=th, width=tw,
+                            topk_ratio=sparse_ratio*768*1280/(th*tw), **pipe_kwargs
+                        )
                     progress(0.8, desc="Converting output...")
                     final_output_tensor = tensor2video(video).cpu()
                     final_output_tensor = final_output_tensor[:frames.shape[0]]
@@ -1888,9 +1934,15 @@ def run_flashvsr_single(
                     f"Will retry with safer VRAM settings.",
                     message_type="warning",
                 )
+                busy(
+                    f"CUDA OOM on '{profile['label']}'. Dropping VRAM settings and retrying. "
+                    "If the next line takes a bit, it is releasing the pipeline."
+                )
                 continue
             if is_cuda_oom(e):
+                WATCH.stop()
                 raise gr.Error(oom_recovery_hint()) from e
+            WATCH.stop()
             raise
         finally:
             release_pipeline(pipe)
@@ -1906,6 +1958,7 @@ def run_flashvsr_single(
                     )
 
     if not success:
+        WATCH.stop()
         if last_err is not None and is_cuda_oom(last_err):
             raise gr.Error(oom_recovery_hint()) from last_err
         if last_err is not None:
@@ -1954,6 +2007,8 @@ def run_flashvsr_single(
         status_msg = '<div style="padding: 1px; background-color: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac;">✅ Processing complete! Use \'Save Output\' to save to outputs folder.</div>'
     
     progress(1, desc="Done!")
+    busy(f"upscale finished: {temp_output_path}")
+    WATCH.stop()
     
     # Always display the upscaled output video (not the comparison)
     # This makes the manual save button behavior consistent

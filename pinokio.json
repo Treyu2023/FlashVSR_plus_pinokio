@@ -1,0 +1,7 @@
+{
+  "title": "FlashVSR",
+  "description": "FlashVSR - Video and Image Upscaler: [Runs on 12GB vram, 32GB ram] Diffusion-Based Streaming Video Super-Resolution",
+  "plugin": {
+    "menu": []
+  }
+}

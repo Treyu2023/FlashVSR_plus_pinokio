@@ -41,6 +41,11 @@ CRITICAL = [
     "app/toolbox/rife_core.py",
     "app/toolbox/batch_queue.py",
     "app/src/pipelines/flashvsr_tiny_long.py",
+    "app/src/pipelines/flashvsr_tiny.py",
+    "app/src/pipelines/flashvsr_full.py",
+    "app/src/busy_heartbeat.py",
+    "app/src/models/TCDecoder.py",
+    "app/src/models/wan_video_vae.py",
     "app/requirements.txt",
     "app/Launch-FlashVSR-Plus.bat",
     "app/Launch-FlashVSR-Plus.ps1",
@@ -59,7 +64,9 @@ CRITICAL = [
 
 # Strings that MUST appear in a live custom file. Missing ⇒ stock overwrite.
 MARKERS = {
-    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir", "no size recode", "accurate_rnd+full_chroma_int", "orientation_input_box", "_gt_rife_flags", "resolve_resize_encode", "tonemap=hable", "open_media_folder", "_log_queue_scan", "def path_textbox"),
+    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir", "no size recode", "accurate_rnd+full_chroma_int", "orientation_input_box", "_gt_rife_flags", "resolve_resize_encode", "tonemap=hable", "open_media_folder", "_log_queue_scan", "def path_textbox", "HeartbeatTqdm"),
+    "app/src/busy_heartbeat.py": ("class HeartbeatTqdm", "still busy"),
+    "app/src/pipelines/flashvsr_tiny.py": ("BusySpan", "show_progress_bar=True"),
     "app/group_therapy.py": ("stamp_title_pid", "flatten_gt_pair_folders", "pid_token", "item_in_progress"),
     "app/flashvsr_work_queue.py": ("gt_pair_id", "drop_wrong_stage_pending", "class AddResult"),
     "app/naming_utils.py": ("clean_original_stem", "step1_filename"),
@@ -70,7 +77,7 @@ MARKERS = {
     "scripts/env_guard.py": ("def reapply", "source_is_good"),
     "update.js": ("env_guard.py reapply", "env_guard.py snapshot"),
     "install.js": ("env_guard.py reapply",),
-    "start.js": ("env_guard.py preflight",),
+    "start.js": ("env_guard.py preflight", "PYTHONUNBUFFERED"),
     "pinokio.js": ("AUTOMATICALLY reapply",),
 }
 

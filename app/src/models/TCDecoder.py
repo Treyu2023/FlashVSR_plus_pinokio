@@ -10,6 +10,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
+try:
+    from ..busy_heartbeat import HeartbeatTqdm as tqdm
+except Exception:
+    pass
 from collections import namedtuple
 from einops import rearrange
 import torch.nn.init as init

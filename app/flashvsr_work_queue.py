@@ -65,6 +65,7 @@ class AddResult:
         "already_upscaled",
         "same_size_copy",
         "sidecar",
+        "grok_id_dupes",
         "scanned",
     )
 
@@ -76,6 +77,7 @@ class AddResult:
         already_upscaled: int = 0,
         same_size_copy: int = 0,
         sidecar: int = 0,
+        grok_id_dupes: int = 0,
         scanned: int = 0,
     ) -> None:
         self.added = int(added)
@@ -83,11 +85,12 @@ class AddResult:
         self.already_upscaled = int(already_upscaled)
         self.same_size_copy = int(same_size_copy)
         self.sidecar = int(sidecar)
+        self.grok_id_dupes = int(grok_id_dupes)
         self.scanned = int(scanned)
         self.skipped = int(
             skipped
             if skipped
-            else already_queued + already_upscaled + same_size_copy + sidecar
+            else already_queued + already_upscaled + same_size_copy + sidecar + grok_id_dupes
         )
 
     def __iter__(self) -> Iterator[int]:
@@ -101,6 +104,7 @@ class AddResult:
             already_upscaled=self.already_upscaled + other.already_upscaled,
             same_size_copy=self.same_size_copy + other.same_size_copy,
             sidecar=self.sidecar + other.sidecar,
+            grok_id_dupes=self.grok_id_dupes + other.grok_id_dupes,
             scanned=self.scanned + other.scanned,
         )
 
@@ -125,6 +129,11 @@ class AddResult:
             bits.append(
                 f"{self.sidecar} in sidecar folders "
                 "(Over4K / HighFPS / NoVideo / done / …)"
+            )
+        if self.grok_id_dupes:
+            bits.append(
+                f"{self.grok_id_dupes} Grok-ID duplicates "
+                "(same unique ID + original size ±2.5%)"
             )
         return bits
 
@@ -479,7 +488,16 @@ class FlashVSRWorkQueue:
         already_upscaled = 0
         same_size_copy = 0
         sidecar = 0
+        grok_id_dupes = 0
         scanned = 0
+        grok_index = None
+        try:
+            from grok_id_index import load_index, match_file
+            grok_index = load_index(str(self.app_dir))
+            if not (grok_index.get("ids") or {}):
+                grok_index = None
+        except Exception:
+            grok_index = None
         for p in paths:
             if not p:
                 continue
@@ -508,6 +526,14 @@ class FlashVSRWorkQueue:
                 # Same byte length as a file already queued / done — skip the copy
                 same_size_copy += 1
                 continue
+            if grok_index is not None:
+                try:
+                    hit = match_file(ap, grok_index)
+                except Exception:
+                    hit = None
+                if hit:
+                    grok_id_dupes += 1
+                    continue
             items.append(
                 {
                     "path": ap,
@@ -523,7 +549,7 @@ class FlashVSRWorkQueue:
             if sz > 0:
                 existing_sizes.add(sz)
             added += 1
-        skipped = already_queued + already_upscaled + same_size_copy + sidecar
+        skipped = already_queued + already_upscaled + same_size_copy + sidecar + grok_id_dupes
         if added:
             self.save(data)
         else:
@@ -535,6 +561,7 @@ class FlashVSRWorkQueue:
             already_upscaled=already_upscaled,
             same_size_copy=same_size_copy,
             sidecar=sidecar,
+            grok_id_dupes=grok_id_dupes,
             scanned=scanned,
         )
 
@@ -767,6 +794,27 @@ class FlashVSRWorkQueue:
             stats["size_dupes"] += len(group) - 1
 
         items = size_kept + no_size
+
+        # --- Grok unique-ID + original-size ±2.5% (catalog from Scan outputs) ---
+        stats["grok_id_dupes"] = 0
+        try:
+            from grok_id_index import load_index, match_file
+            gidx = load_index(str(self.app_dir))
+            if gidx.get("ids"):
+                kept_g = []
+                for it in items:
+                    if it.get("status") == ST_RUNNING:
+                        kept_g.append(it)
+                        continue
+                    path = (it.get("path") or "").strip()
+                    hit = match_file(path, gidx) if path else None
+                    if hit and it.get("status") in (ST_PENDING, ST_FAILED):
+                        stats["grok_id_dupes"] += 1
+                        continue
+                    kept_g.append(it)
+                items = kept_g
+        except Exception:
+            pass
 
         # --- drop completed rows (after size-dedupe used them as winners) ---
         if remove_completed:

@@ -1,6 +1,6 @@
 # FlashVSR+ Pinokio — Custom Configuration & Code Changes
 
-**Last updated:** 2026-08-27  
+**Last updated:** 2026-08-29  
 **Install path:** `C:\pinokio\api\FlashVSR_plus_pinokio.git\app`  
 **Purpose:** Persistent record of customizations applied outside stock FlashVSR (survives app rollback/reinstall). Re-apply or merge these after updating the Pinokio launcher.
 
@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-08-29 | **Grok-ID duplicate screen:** Buttons on Batch Video — *Scan outputs* (programmed pipeline folders if the field is blank) and *Scan new downloads*. Catalogs `grok-video-UUID` / `GROK-##` / leading post IDs + original size. New files whose ID matches **and** size is within ±2.5% of the original are skipped from the queue. Log: `app/outputs/grok_id_index.json` + `queue_logs/grok_id_scan.jsonl`. User-run only. |
 | 2026-08-27 | **Terminal heartbeats:** Pinokio logs now get newline status every ~5s (tile/DiT/VAE) plus a 12s “still busy — not frozen” watchdog. tqdm `\r` bars were invisible in the log after OOM drop. Unbuffered `python -u` + `PYTHONUNBUFFERED=1`. |
 | 2026-08-26 | **UI font / zoom + full path boxes:** Settings → Font & size (font, px, 80–150% zoom). Path fields are multi-line, wrap, and stay selectable so long `D:\\OUTPUTS\\…` strings are not clipped to one line. |
 | 2026-08-26 | **Skip reasons split + GT newest-first:** Watch/GT/image/Toolbox scan logs list *already in queue* (still waiting — not dropped), *same-size copies*, *already-upscaled names*, and *sidecar folders* separately. Group Therapy packs unstarted files newest → oldest by source mtime; an in-progress group still finishes first. |
@@ -44,6 +45,7 @@
 | File | Action |
 |------|--------|
 | `webui_config` | **Created** — user defaults (pipeline folders + Group Therapy) |
+| `grok_id_index.py` | **Created** — Grok unique-ID catalog + ±2.5% original-size duplicate screen |
 | `naming_utils.py` | **Created** — output filename conventions |
 | `webui.py` | **Modified** — config, paths, Group Therapy, hygiene, 4K-safe, PID pairing; skip-reason logs; path_textbox + UI font/zoom; busy heartbeats |
 | `src/busy_heartbeat.py` | **Created** — newline tqdm snapshots + 12s still-busy watchdog for Pinokio logs |

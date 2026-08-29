@@ -60,6 +60,7 @@ from flashvsr_work_queue import (
     IMAGE_EXTS,
     AddResult,
 )
+import grok_id_index
 import group_therapy as gt
 from naming_utils import (
     upscale_video_filename,
@@ -421,6 +422,73 @@ def get_queue_log_dir():
     log_root = os.path.join(DEFAULT_OUTPUT_DIR, "queue_logs")
     os.makedirs(log_root, exist_ok=True)
     return log_root
+
+
+def programmed_output_scan_roots(extra_folder: str = "") -> list:
+    """Folders to catalog for Grok-ID screening. Blank extra → pipeline outputs."""
+    extra = str(extra_folder or "").strip()
+    if extra:
+        return [(os.path.normpath(extra), False)]
+    wp = get_workflow_paths()
+    cfg = load_config()
+    pairs = [
+        (wp.get("batch_source_archive_dir"), True),
+        (str(cfg.get("gt_before_dir") or wp.get("batch_source_archive_dir") or ""), True),
+        (wp.get("batch_upscale_handoff_dir"), False),
+        (wp.get("img_upscale_handoff_dir"), False),
+        (wp.get("tb_inbox_folder"), False),
+        (wp.get("toolbox_output_dir"), False),
+        (str(cfg.get("gt_after_dir") or wp.get("toolbox_output_dir") or ""), False),
+    ]
+    out = []
+    seen = set()
+    for folder, as_orig in pairs:
+        if not folder:
+            continue
+        key = os.path.normcase(os.path.abspath(os.path.normpath(folder)))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((folder, as_orig))
+    return out
+
+
+def handle_scan_grok_outputs(extra_folder: str = ""):
+    roots = programmed_output_scan_roots(extra_folder)
+    if not roots:
+        html = (
+            "<div style='padding:10px;color:#fbbf24;'>No output folders to scan. "
+            "Save pipeline folders in Settings first, or paste a folder above.</div>"
+        )
+        log("Grok-ID output scan: no folders", message_type="warning")
+        return html
+    summary = grok_id_index.scan_roots(ROOT_DIR, roots, kind="scan_outputs")
+    log(
+        f"Grok-ID output scan: {summary.get('files', 0)} files · "
+        f"{summary.get('ids_total', 0)} unique IDs → {summary.get('index')}",
+        message_type="info",
+    )
+    return grok_id_index.html_scan_report(summary)
+
+
+def handle_screen_grok_downloads(watch_folder: str = ""):
+    folder = str(watch_folder or "").strip()
+    if not folder:
+        folder = get_workflow_paths().get("batch_watch_folder") or ""
+    if not folder or not os.path.isdir(folder):
+        html = (
+            "<div style='padding:10px;color:#fbbf24;'>Intake folder missing. "
+            "Set Watch / folder path or Settings → Intake / watch.</div>"
+        )
+        log(f"Grok-ID download screen: folder missing ({folder})", message_type="warning")
+        return html
+    summary = grok_id_index.screen_folder(ROOT_DIR, folder)
+    log(
+        f"Grok-ID new-downloads screen: scanned {summary.get('scanned', 0)} · "
+        f"dupes {summary.get('dupes', 0)} · new {summary.get('fresh', 0)} ({folder})",
+        message_type="info",
+    )
+    return grok_id_index.html_scan_report(summary)
 
 
 def workflow_paths_html(config: Optional[dict] = None) -> str:
@@ -3985,11 +4053,12 @@ def _run_flashvsr_work_queue_body(
         requeue_failed=True,
         remove_missing=False,
     )
-    if pf.get("dupes") or pf.get("size_dupes") or pf.get("completed_removed") or pf.get("failed_requeued"):
+    if pf.get("dupes") or pf.get("size_dupes") or pf.get("completed_removed") or pf.get("failed_requeued") or pf.get("grok_id_dupes"):
         log(
             "🧹 Step 1 preflight: "
             f"{pf.get('dupes', 0)} path duplicate(s) removed, "
             f"{pf.get('size_dupes', 0)} same-size duplicate(s) skipped, "
+            f"{pf.get('grok_id_dupes', 0)} Grok-ID duplicate(s) skipped, "
             f"{pf.get('completed_removed', 0)} already-complete removed from queue, "
             f"{pf.get('failed_requeued', 0)} failed re-queued · "
             f"{pf.get('pending', 0)} pending left",
@@ -7306,6 +7375,21 @@ def create_ui():
                                 flashvsr_queue_status = gr.HTML(
                                     value=get_flashvsr_work_queue().status_html()
                                 )
+                                gr.Markdown(
+                                    "**Grok-ID duplicate screen** (you run these — not automatic). "
+                                    "Catalog unique `grok-video-…` / `GROK-##` / leading post IDs, then skip new "
+                                    "downloads whose ID matches **and** size is within **±2.5%** of the original."
+                                )
+                                grok_output_scan_folder = path_textbox(
+                                    value="",
+                                    label="Scan outputs folder (leave blank = programmed pipeline outputs)",
+                                    info="Blank uses originals archive + Ready for Toolbox + Ready for CIV + images. Fill to scan one extra/other folder instead.",
+                                    placeholder="(programmed outputs)",
+                                )
+                                with gr.Row():
+                                    grok_scan_outputs_btn = gr.Button("📇 Scan outputs (build ID log)", size="sm")
+                                    grok_screen_downloads_btn = gr.Button("🔍 Scan new downloads (flag dupes)", size="sm")
+                                grok_id_status = gr.HTML(value="")
                                 with gr.Row():
                                     batch_add_queue_btn = gr.Button("➕ Add to Queue", size="sm")
                                     batch_run_button = gr.Button("▶️ Start / Resume Queue", variant="primary", size="sm")
@@ -8710,6 +8794,16 @@ def create_ui():
                 outputs=[],
             )
 
+        grok_scan_outputs_btn.click(
+            fn=handle_scan_grok_outputs,
+            inputs=[grok_output_scan_folder],
+            outputs=[grok_id_status],
+        )
+        grok_screen_downloads_btn.click(
+            fn=handle_screen_grok_downloads,
+            inputs=[batch_folder_path],
+            outputs=[grok_id_status],
+        )
         batch_add_queue_btn.click(
             fn=handle_queue_add,
             inputs=[flashvsr_batch_input_files, batch_folder_path],

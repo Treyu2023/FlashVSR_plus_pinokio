@@ -346,10 +346,14 @@ def html_scan_report(summary: Dict[str, Any]) -> str:
         n = int(summary.get("dupes") or 0)
         if n > 40:
             more = f"<div style='color:#94a3b8;font-size:0.85em;'>…and {n - 40} more (see { _esc(summary.get('log')) })</div>"
+        empty_rows = (
+            '<tr><td colspan=3 style="color:#86efac;padding:6px;">'
+            "No ID+size duplicates in this folder.</td></tr>"
+        )
         table = (
             f"<table style='width:100%;border-collapse:collapse;margin-top:8px;font-size:0.88em;'>"
             f"<tr><th align=left>File</th><th align=left>ID</th><th align=left>Why</th></tr>"
-            f"{rows or '<tr><td colspan=3 style=\"color:#86efac;padding:6px;\">No ID+size duplicates in this folder.</td></tr>'}"
+            f"{rows or empty_rows}"
             f"</table>{more}"
         )
         return (

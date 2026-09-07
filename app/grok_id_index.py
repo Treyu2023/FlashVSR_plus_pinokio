@@ -108,6 +108,105 @@ def append_scan_log(app_dir: str, rec: Dict[str, Any]) -> None:
         pass
 
 
+_CHROME_COPY_RE = re.compile(r"\((\d+)\)")
+
+
+def chrome_copy_rank(name: str) -> Tuple[int, int]:
+    """Prefer the unnumbered download over Chrome ``(1)`` / ``_(27)_`` copies."""
+    stem = Path(str(name or "")).stem
+    nums = [int(n) for n in _CHROME_COPY_RE.findall(stem)]
+    if nums:
+        return (1, nums[0])
+    return (0, 0)
+
+
+def primary_grok_id(name: str) -> Optional[str]:
+    ids = extract_grok_ids(name)
+    return ids[0] if ids else None
+
+
+def pick_canonical_path(paths: Sequence[str]) -> str:
+    """Keep the original download name; drop ``(N)`` copies of the same Grok ID."""
+    ranked = [str(p) for p in paths if p]
+    if not ranked:
+        return ""
+    return min(
+        ranked,
+        key=lambda p: (chrome_copy_rank(Path(p).name), Path(p).name.lower()),
+    )
+
+
+def grok_ids_in_folder(folder: str) -> Dict[str, str]:
+    """Map grok-id → one existing file in folder (canonical name preferred). Fast: names only."""
+    found: Dict[str, str] = {}
+    ranks: Dict[str, Tuple[int, int]] = {}
+    if not folder or not os.path.isdir(folder):
+        return found
+    try:
+        for p in Path(folder).iterdir():
+            if not p.is_file() or p.suffix.lower() not in MEDIA_EXTS:
+                continue
+            ids = extract_grok_ids(p.name)
+            if not ids:
+                continue
+            rank = chrome_copy_rank(p.name)
+            ap = str(p)
+            for gid in ids:
+                prev = ranks.get(gid)
+                if prev is None or rank < prev:
+                    found[gid] = ap
+                    ranks[gid] = rank
+    except OSError:
+        pass
+    return found
+
+
+def grok_ids_from_paths(paths: Iterable[str]) -> Dict[str, str]:
+    found: Dict[str, str] = {}
+    ranks: Dict[str, Tuple[int, int]] = {}
+    for raw in paths:
+        if not raw:
+            continue
+        name = Path(str(raw)).name
+        ids = extract_grok_ids(name)
+        if not ids:
+            continue
+        rank = chrome_copy_rank(name)
+        for gid in ids:
+            prev = ranks.get(gid)
+            if prev is None or rank < prev:
+                found[gid] = str(raw)
+                ranks[gid] = rank
+    return found
+
+
+def first_matching_id(name: str, known: Dict[str, Any]) -> Optional[str]:
+    if not known:
+        return None
+    for gid in extract_grok_ids(name):
+        if gid in known:
+            return gid
+    return None
+
+
+def record_completed(
+    app_dir: str,
+    *,
+    original_path: str = "",
+    output_path: str = "",
+) -> List[str]:
+    """Stamp the on-disk catalog when a pair settles so later Chrome copies skip."""
+    index = load_index(app_dir)
+    recorded: List[str] = []
+    if original_path and os.path.isfile(original_path):
+        recorded.extend(record_file(index, original_path, as_original=True))
+    if output_path and os.path.isfile(output_path):
+        recorded.extend(record_file(index, output_path, as_original=False))
+    if recorded:
+        save_index(app_dir, index)
+    return recorded
+
+
 def extract_grok_ids(name: str) -> List[str]:
     """Unique ID strings from a filename (order preserved, lowercased)."""
     stem = Path(str(name or "")).name

@@ -3299,7 +3299,10 @@ def _run_group_therapy_body(
             "watch",
             hygiene_scan_folder(watch_folder, role="watch", scale=int(scale or 4)),
         )
-        scan = wq.add_folder(watch_folder)
+        scan = wq.add_folder(
+            watch_folder,
+            known_id_folders=[before_dir, after_dir],
+        )
         _log_queue_scan("Group Therapy", watch_folder, scan, noun="video")
 
     dropped = wq.drop_wrong_stage_pending()
@@ -3315,7 +3318,7 @@ def _run_group_therapy_body(
         log(f"Re-queued {stuck} stuck Group Therapy job(s)", message_type="info")
     wq.requeue_failed()
     wq.reorder_pending_newest_first()
-    gt.assign_groups(wq, group_size)
+    gt.assign_groups(wq, group_size, after_dir=after_dir)
     already = gt.mark_already_paired(wq, after_dir)
     if already:
         log(f"Group Therapy: skipped {already} already-paired file(s)", message_type="info")
@@ -3463,7 +3466,7 @@ def _run_group_therapy_body(
                     desc=f"Group {gid} · {label} · {f_i + 1}/{len(members)} · {os.path.basename(path)}",
                 )
                 wq.set_item_status(path, "running")
-                pair_id = gt.ensure_pair_id(item)
+                pair_id = gt.ensure_pair_id(item, after_dir=after_dir)
                 pair_folder = item.get("gt_pair_folder") or gt.pair_folder_name(pair_id, path)
                 wq.update_item(
                     path,
@@ -3555,7 +3558,7 @@ def _run_group_therapy_body(
                                 fps=fps_est,
                                 ext=Path(out).suffix or ".mp4",
                             )
-                            pid = pair_id or gt.ensure_pair_id(item)
+                            pid = pair_id or gt.ensure_pair_id(item, after_dir=after_dir)
                             pid_name = gt.with_pid_name(out, pid)
                             pid_dest = os.path.join(os.path.dirname(out), os.path.basename(pid_name))
                             if os.path.normcase(out) != os.path.normcase(pid_dest):
@@ -4008,7 +4011,10 @@ def _run_flashvsr_work_queue_body(
                 scale=int(scale or ui.get("scale") or 4),
             ),
         )
-        scan = wq.add_folder(watch_folder)
+        scan = wq.add_folder(
+            watch_folder,
+            known_id_folders=[source_archive, handoff, paths.get("ready_civ", "")],
+        )
         _log_queue_scan("Watch folder", watch_folder, scan, noun="video")
     elif watch_folder:
         log(f"Watch folder missing (create it or fix path): {watch_folder}", message_type="warning")
@@ -4375,7 +4381,10 @@ def _run_flashvsr_image_work_queue_body(
     handoff = (ui.get("img_upscale_handoff_dir") or paths["img_handoff"]).strip()
 
     if watch_folder and os.path.isdir(watch_folder):
-        scan = wq.add_folder(watch_folder)
+        scan = wq.add_folder(
+            watch_folder,
+            known_id_folders=[source_archive, handoff],
+        )
         _log_queue_scan("Image watch", watch_folder, scan, noun="image")
 
     dropped = wq.drop_wrong_stage_pending()

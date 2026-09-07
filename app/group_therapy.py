@@ -108,7 +108,7 @@ def pair_folder_name(pair_id: str, path_or_name: str) -> str:
     return pid_token(pair_id)
 
 
-def ensure_pair_id(it: Dict[str, Any]) -> str:
+def ensure_pair_id(it: Dict[str, Any], after_dir: str = "") -> str:
     raw = str(it.get("gt_pair_id") or "").strip().lower()
     if _PAIR_ID_RE.match(raw):
         it["gt_pair_id"] = raw
@@ -118,6 +118,16 @@ def ensure_pair_id(it: Dict[str, Any]) -> str:
         if pid:
             it["gt_pair_id"] = pid
             return pid
+    # Reuse the PID already stamped on an After file for this Grok/Imagine UUID
+    # so a Chrome (N) copy does not mint a second pair and double-export.
+    if after_dir:
+        existing = find_existing_pair(after_dir, it)
+        if existing:
+            pid = pair_id_from_name(existing)
+            if pid:
+                it["gt_pair_id"] = pid
+                it["gt_after"] = existing
+                return pid
     pid = make_pair_id()
     it["gt_pair_id"] = pid
     return pid
@@ -245,7 +255,7 @@ def item_in_progress(it: Dict[str, Any]) -> bool:
     return False
 
 
-def assign_groups(wq: FlashVSRWorkQueue, group_size: int) -> int:
+def assign_groups(wq: FlashVSRWorkQueue, group_size: int, after_dir: str = "") -> int:
     """
     Pack unstarted pending files into groups newest → oldest by source mtime.
 
@@ -281,7 +291,7 @@ def assign_groups(wq: FlashVSRWorkQueue, group_size: int) -> int:
             g = 0
         if g in frozen_gids:
             if not it.get("gt_pair_id"):
-                ensure_pair_id(it)
+                ensure_pair_id(it, after_dir=after_dir)
                 it["gt_pair_folder"] = pair_folder_name(
                     it["gt_pair_id"], it.get("path") or "clip"
                 )
@@ -308,7 +318,7 @@ def assign_groups(wq: FlashVSRWorkQueue, group_size: int) -> int:
             open_count = 0
         it["gt_group"] = open_gid
         it.setdefault("gt_stage", None)
-        ensure_pair_id(it)
+        ensure_pair_id(it, after_dir=after_dir)
         it["gt_pair_folder"] = pair_folder_name(it["gt_pair_id"], it.get("path") or "clip")
         open_count += 1
         assigned += 1
@@ -317,7 +327,7 @@ def assign_groups(wq: FlashVSRWorkQueue, group_size: int) -> int:
         if it.get("status") == "done":
             continue
         if not it.get("gt_pair_id"):
-            ensure_pair_id(it)
+            ensure_pair_id(it, after_dir=after_dir)
             it["gt_pair_folder"] = pair_folder_name(
                 it["gt_pair_id"], it.get("path") or "clip"
             )
@@ -542,6 +552,15 @@ def settle_pair(
     for p in extra_temps or []:
         if _safe_delete(p, keep=keep):
             deleted += 1
+    try:
+        from grok_id_index import record_completed
+        record_completed(
+            str(Path(__file__).resolve().parent),
+            original_path=before_path,
+            output_path=after_path,
+        )
+    except Exception:
+        pass
     return before_path, after_path, deleted
 
 
@@ -671,7 +690,7 @@ def _pid_search_tokens(pid: str, mapping: Optional[Dict[str, str]] = None) -> Li
 
 
 def find_existing_pair(after_dir: str, it: Dict[str, Any]) -> Optional[str]:
-    """If this item already has a finished After file (PID in name), return it."""
+    """If this item already has a finished After file (PID or Grok-ID in name), return it."""
     if not after_dir or not os.path.isdir(after_dir):
         return None
     pid = str(it.get("gt_pair_id") or "").strip().lower()
@@ -679,6 +698,13 @@ def find_existing_pair(after_dir: str, it: Dict[str, Any]) -> Optional[str]:
         pid = pair_id_from_name(it.get("path") or "") or ""
     mapping = load_retro_pid_map(after_dir)
     tokens = _pid_search_tokens(pid, mapping)
+    grok_ids = []
+    try:
+        from grok_id_index import extract_grok_ids
+        grok_ids = extract_grok_ids(it.get("path") or "")
+    except Exception:
+        grok_ids = []
+    grok_hit = None
     try:
         for f in Path(after_dir).iterdir():
             if not f.is_file() or f.suffix.lower() not in VIDEO_EXTS:
@@ -686,6 +712,15 @@ def find_existing_pair(after_dir: str, it: Dict[str, Any]) -> Optional[str]:
             stem = f.stem.lower()
             if any(tok in stem for tok in tokens):
                 return str(f)
+            if grok_ids:
+                try:
+                    from grok_id_index import extract_grok_ids as _ex
+                    if any(g in _ex(f.name) for g in grok_ids):
+                        grok_hit = grok_hit or str(f)
+                except Exception:
+                    pass
+        if grok_hit:
+            return grok_hit
         # Legacy per-file folders (pre-flatten)
         check_ids = [pid] if pid else []
         if pid in mapping:
@@ -714,12 +749,15 @@ def mark_already_paired(wq: FlashVSRWorkQueue, after_dir: str) -> int:
         path = it.get("path") or ""
         if not path:
             continue
+        pid = it.get("gt_pair_id") or pair_id_from_name(after_p) or ""
+        if pid:
+            it["gt_pair_id"] = pid
         wq.update_item(
             path,
             gt_after=after_p,
             gt_export=after_p,
-            gt_pair_folder=it.get("gt_pair_folder"),
-            gt_pair_id=it.get("gt_pair_id"),
+            gt_pair_folder=it.get("gt_pair_folder") or (pid_token(pid) if pid else None),
+            gt_pair_id=pid or it.get("gt_pair_id"),
         )
         wq.set_item_status(path, "done", output=after_p)
         n += 1

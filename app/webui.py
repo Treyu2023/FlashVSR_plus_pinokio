@@ -3317,6 +3317,27 @@ def _run_group_therapy_body(
     if stuck:
         log(f"Re-queued {stuck} stuck Group Therapy job(s)", message_type="info")
     wq.requeue_failed()
+
+    def _gt_complete(path: str):
+        return gt.find_existing_pair(after_dir, {"path": path})
+
+    pf = wq.preflight_before_start(
+        find_output=_gt_complete,
+        remove_completed=True,
+        requeue_failed=False,
+        remove_missing=False,
+    )
+    if pf.get("dupes") or pf.get("size_dupes") or pf.get("completed_removed") or pf.get("grok_id_dupes"):
+        log(
+            "🧹 Group Therapy preflight: "
+            f"{pf.get('dupes', 0)} path duplicate(s), "
+            f"{pf.get('size_dupes', 0)} same-size, "
+            f"{pf.get('grok_id_dupes', 0)} Grok-ID Chrome copies skipped, "
+            f"{pf.get('completed_removed', 0)} already in After · "
+            f"{pf.get('pending', 0)} pending left",
+            message_type="info",
+        )
+
     wq.reorder_pending_newest_first()
     gt.assign_groups(wq, group_size, after_dir=after_dir)
     already = gt.mark_already_paired(wq, after_dir)
@@ -3728,10 +3749,10 @@ def find_matching_deliverable(
     """
     Find an existing handoff/export for a source whose inbox path is gone.
 
-    Matching is intentionally strict so siblings like ``…019f8889…`` vs
-    ``…019f8883…`` or chunk ``(3)`` vs ``(5)`` do not share a hit:
-    - require the Grok/video UUID (full or truncated for export names)
-    - prefer full stem / variant number when present
+    Matching is strict on Grok/video UUID so siblings like ``…019f8889…`` vs
+    ``…019f8883…`` do not share a hit. Chrome ``(N)`` copies of the *same*
+    UUID are the same clip — a Ready-for-CIV file with ``_(27)_`` counts as
+    done for inbox ``(1)``. Variant number is a preference, not a reject.
     """
     stem = Path(source_path or "").stem
     if not stem or len(stem) < 8:
@@ -3797,25 +3818,14 @@ def find_matching_deliverable(
                     score += best
 
                 if variant:
-                    # Prefer the same chunk index; reject clear other (N) variants
+                    # Chrome ``(N)`` copies of the same grok-video UUID are the
+                    # same clip — prefer the matching index but do not reject
+                    # _(27)_ After files when the inbox copy is ``(1)``.
                     other = re.search(r"\((\d+)\)", fn)
-                    if other and other.group(1) != variant:
-                        continue
-                    has_var = bool(
-                        re.search(
-                            rf"(?:\({re.escape(variant)}\)|"
-                            rf"(?:^|[\s_]){re.escape(variant)}(?=_resized|_upscaled|_exported|[\s_\.]|$))",
-                            fn,
-                        )
-                    )
-                    if has_var:
+                    if other and other.group(1) == variant:
                         score += 250
                     elif prefer_exported:
-                        # Toolbox export names often drop the chunk index — UUID is enough
                         score += 10
-                    else:
-                        # Video/image handoff should keep chunk identity when present
-                        continue
 
             if prefer_exported and "_exported" in fn.lower():
                 score += 500

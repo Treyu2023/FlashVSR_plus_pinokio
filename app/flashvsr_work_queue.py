@@ -48,6 +48,10 @@ _UPSCALED_OUTPUT_RE = re.compile(
 # Queues that run FlashVSR upscale (not RIFE/export)
 _UPSCALE_QUEUES = {"video", "image", "group"}
 
+# Ignore Chrome still-writing downloads and empty stubs
+_MIN_QUEUE_BYTES = 32 * 1024
+_RECENT_WRITE_SEC = 20.0
+
 
 def looks_like_upscaled_output(path: str) -> bool:
     """True if this file is already a FlashVSR / step-1 output (belongs on Toolbox)."""
@@ -544,6 +548,16 @@ class FlashVSRWorkQueue:
             if Path(ap).suffix.lower() not in self.extensions:
                 continue
             scanned += 1
+            sz = _file_size(ap)
+            if sz < _MIN_QUEUE_BYTES:
+                # Empty / still-open Chrome download — pick up on the next Start
+                continue
+            try:
+                age = time.time() - os.path.getmtime(ap)
+            except OSError:
+                age = 999
+            if age < _RECENT_WRITE_SEC:
+                continue
             if _path_in_sidecar_dir(ap):
                 sidecar += 1
                 continue
@@ -555,7 +569,6 @@ class FlashVSRWorkQueue:
             if key in existing:
                 already_queued += 1
                 continue
-            sz = _file_size(ap)
             if sz > 0 and sz in existing_sizes:
                 # Same byte length as a file already queued / done — skip the copy
                 same_size_copy += 1

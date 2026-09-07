@@ -689,7 +689,22 @@ def _pid_search_tokens(pid: str, mapping: Optional[Dict[str, str]] = None) -> Li
     return tokens
 
 
-def find_existing_pair(after_dir: str, it: Dict[str, Any]) -> Optional[str]:
+_MIN_AFTER_BYTES = 64 * 1024
+
+
+def _file_big_enough(path: str, min_bytes: int = _MIN_AFTER_BYTES) -> bool:
+    try:
+        return bool(path) and os.path.isfile(path) and os.path.getsize(path) >= int(min_bytes)
+    except OSError:
+        return False
+
+
+def find_existing_pair(
+    after_dir: str,
+    it: Dict[str, Any],
+    *,
+    id_map: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
     """If this item already has a finished After file (PID or Grok-ID in name), return it."""
     if not after_dir or not os.path.isdir(after_dir):
         return None
@@ -700,27 +715,26 @@ def find_existing_pair(after_dir: str, it: Dict[str, Any]) -> Optional[str]:
     tokens = _pid_search_tokens(pid, mapping)
     grok_ids = []
     try:
-        from grok_id_index import extract_grok_ids
+        from grok_id_index import extract_grok_ids, grok_ids_in_folder
         grok_ids = extract_grok_ids(it.get("path") or "")
+        if id_map is None and grok_ids:
+            id_map = grok_ids_in_folder(after_dir)
     except Exception:
         grok_ids = []
-    grok_hit = None
+    if grok_ids and id_map:
+        for gid in grok_ids:
+            hit = id_map.get(gid)
+            if hit and _file_big_enough(hit):
+                return hit
     try:
         for f in Path(after_dir).iterdir():
             if not f.is_file() or f.suffix.lower() not in VIDEO_EXTS:
                 continue
+            if not _file_big_enough(str(f)):
+                continue
             stem = f.stem.lower()
             if any(tok in stem for tok in tokens):
                 return str(f)
-            if grok_ids:
-                try:
-                    from grok_id_index import extract_grok_ids as _ex
-                    if any(g in _ex(f.name) for g in grok_ids):
-                        grok_hit = grok_hit or str(f)
-                except Exception:
-                    pass
-        if grok_hit:
-            return grok_hit
         # Legacy per-file folders (pre-flatten)
         check_ids = [pid] if pid else []
         if pid in mapping:
@@ -730,7 +744,7 @@ def find_existing_pair(after_dir: str, it: Dict[str, Any]) -> Optional[str]:
             for d in Path(after_dir).iterdir():
                 if d.is_dir() and d.name.lower().startswith(prefix):
                     hit = pair_video_in(str(d))
-                    if hit:
+                    if hit and _file_big_enough(hit):
                         return hit
     except OSError:
         pass
@@ -738,12 +752,18 @@ def find_existing_pair(after_dir: str, it: Dict[str, Any]) -> Optional[str]:
 
 
 def mark_already_paired(wq: FlashVSRWorkQueue, after_dir: str) -> int:
-    """Mark queue rows done when their After file already exists (PID in the name)."""
+    """Mark queue rows done when their After file already exists (PID or Grok-ID)."""
     n = 0
+    id_map = None
+    try:
+        from grok_id_index import grok_ids_in_folder
+        id_map = grok_ids_in_folder(after_dir)
+    except Exception:
+        id_map = None
     for it in list(wq.all_items()):
         if it.get("status") == "done":
             continue
-        after_p = find_existing_pair(after_dir, it)
+        after_p = find_existing_pair(after_dir, it, id_map=id_map)
         if not after_p:
             continue
         path = it.get("path") or ""

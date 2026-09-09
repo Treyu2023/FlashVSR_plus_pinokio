@@ -111,18 +111,38 @@ def append_scan_log(app_dir: str, rec: Dict[str, Any]) -> None:
 _CHROME_COPY_RE = re.compile(r"\((\d+)\)")
 
 
+def chrome_copy_number(name: str) -> int:
+    """Chrome / After version index: 0 = unnumbered, else first ``(N)`` / ``_(N)_``."""
+    nums = [int(n) for n in _CHROME_COPY_RE.findall(Path(str(name or "")).stem)]
+    return nums[0] if nums else 0
+
+
 def chrome_copy_rank(name: str) -> Tuple[int, int]:
     """Prefer the unnumbered download over Chrome ``(1)`` / ``_(27)_`` copies."""
-    stem = Path(str(name or "")).stem
-    nums = [int(n) for n in _CHROME_COPY_RE.findall(stem)]
-    if nums:
-        return (1, nums[0])
+    n = chrome_copy_number(name)
+    if n:
+        return (1, n)
     return (0, 0)
 
 
 def primary_grok_id(name: str) -> Optional[str]:
     ids = extract_grok_ids(name)
     return ids[0] if ids else None
+
+
+def version_key(name: str) -> Optional[Tuple[str, int]]:
+    """
+    Imagine tile identity for queue skip / already-done.
+
+    Grok Imagine reuses one ``grok-video-UUID`` across takes. Chrome then saves
+    them as ``uuid.mp4``, ``uuid (1).mp4``, ``uuid (2).mp4`` with *different*
+    byte sizes. UUID alone is not a clip. UUID + ``(N)`` is one take.
+    Same-size copies of that take are still duplicates (caller size-dedupes).
+    """
+    gid = primary_grok_id(name)
+    if not gid:
+        return None
+    return (gid, chrome_copy_number(name))
 
 
 def pick_canonical_path(paths: Sequence[str]) -> str:
@@ -186,6 +206,59 @@ def first_matching_id(name: str, known: Dict[str, Any]) -> Optional[str]:
     for gid in extract_grok_ids(name):
         if gid in known:
             return gid
+    return None
+
+
+def version_keys_in_folder(folder: str) -> Dict[Tuple[str, int], str]:
+    """Map (grok-id, Chrome N) → one existing file. Distinct Imagine takes stay distinct."""
+    found: Dict[Tuple[str, int], str] = {}
+    ranks: Dict[Tuple[str, int], Tuple[int, int]] = {}
+    if not folder or not os.path.isdir(folder):
+        return found
+    try:
+        for p in Path(folder).iterdir():
+            if not p.is_file() or p.suffix.lower() not in MEDIA_EXTS:
+                continue
+            vk = version_key(p.name)
+            if not vk:
+                continue
+            rank = chrome_copy_rank(p.name)
+            prev = ranks.get(vk)
+            if prev is None or rank < prev:
+                found[vk] = str(p)
+                ranks[vk] = rank
+    except OSError:
+        pass
+    return found
+
+
+def version_keys_from_paths(paths: Iterable[str]) -> Dict[Tuple[str, int], str]:
+    found: Dict[Tuple[str, int], str] = {}
+    ranks: Dict[Tuple[str, int], Tuple[int, int]] = {}
+    for raw in paths:
+        if not raw:
+            continue
+        name = Path(str(raw)).name
+        vk = version_key(name)
+        if not vk:
+            continue
+        rank = chrome_copy_rank(name)
+        prev = ranks.get(vk)
+        if prev is None or rank < prev:
+            found[vk] = str(raw)
+            ranks[vk] = rank
+    return found
+
+
+def first_matching_version(
+    name: str, known: Dict[Tuple[str, int], str]
+) -> Optional[Tuple[str, int]]:
+    """Hit only when the same UUID *and* the same Chrome (N) is already known."""
+    if not known:
+        return None
+    vk = version_key(name)
+    if vk and vk in known:
+        return vk
     return None
 
 

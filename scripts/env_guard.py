@@ -65,12 +65,12 @@ CRITICAL = [
 
 # Strings that MUST appear in a live custom file. Missing ⇒ stock overwrite.
 MARKERS = {
-    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir", "no size recode", "accurate_rnd+full_chroma_int", "orientation_input_box", "_gt_rife_flags", "resolve_resize_encode", "tonemap=hable", "open_media_folder", "_log_queue_scan", "def path_textbox", "HeartbeatTqdm", "handle_scan_grok_outputs"),
-    "app/grok_id_index.py": ("extract_grok_ids", "SIZE_TOLERANCE", "screen_folder"),
+    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir", "no size recode", "accurate_rnd+full_chroma_int", "orientation_input_box", "_gt_rife_flags", "resolve_resize_encode", "tonemap=hable", "open_media_folder", "_log_queue_scan", "def path_textbox", "HeartbeatTqdm", "handle_scan_grok_outputs", "chrome_copy_number"),
+    "app/grok_id_index.py": ("extract_grok_ids", "SIZE_TOLERANCE", "screen_folder", "def version_key"),
     "app/src/busy_heartbeat.py": ("class HeartbeatTqdm", "still busy"),
     "app/src/pipelines/flashvsr_tiny.py": ("BusySpan", "show_progress_bar=True"),
-    "app/group_therapy.py": ("stamp_title_pid", "flatten_gt_pair_folders", "pid_token", "item_in_progress"),
-    "app/flashvsr_work_queue.py": ("gt_pair_id", "drop_wrong_stage_pending", "class AddResult", "grok_id_dupes"),
+    "app/group_therapy.py": ("stamp_title_pid", "flatten_gt_pair_folders", "pid_token", "item_in_progress", "version_keys_in_folder"),
+    "app/flashvsr_work_queue.py": ("gt_pair_id", "drop_wrong_stage_pending", "class AddResult", "grok_id_dupes", "first_matching_version"),
     "app/naming_utils.py": ("clean_original_stem", "step1_filename"),
     "app/toolbox/toolbox.py": ("_choose_interp_factor", "_has_video_stream"),
     "app/src/pipelines/flashvsr_tiny_long.py": (

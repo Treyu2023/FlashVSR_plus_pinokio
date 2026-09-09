@@ -137,7 +137,8 @@ class AddResult:
         if self.grok_id_dupes:
             bits.append(
                 f"{self.grok_id_dupes} Grok-ID duplicates "
-                "(same grok-video UUID — Chrome (N) copies or already in After/Before)"
+                "(same grok-video UUID + Chrome (N) version already queued/in After, "
+                "or catalog size match — different (N) sizes are other Imagine takes)"
             )
         return bits
 
@@ -502,36 +503,35 @@ class FlashVSRWorkQueue:
         grok_index = None
         try:
             from grok_id_index import (
-                first_matching_id,
-                grok_ids_from_paths,
-                grok_ids_in_folder,
+                first_matching_version,
                 load_index,
                 match_file,
                 pick_canonical_path,
-                primary_grok_id,
+                version_key,
+                version_keys_from_paths,
+                version_keys_in_folder,
             )
             grok_index = load_index(str(self.app_dir))
             if not (grok_index.get("ids") or {}):
                 grok_index = None
         except Exception:
-            first_matching_id = None  # type: ignore
-            grok_ids_from_paths = None  # type: ignore
-            grok_ids_in_folder = None  # type: ignore
+            first_matching_version = None  # type: ignore
             match_file = None  # type: ignore
             pick_canonical_path = None  # type: ignore
-            primary_grok_id = None  # type: ignore
+            version_key = None  # type: ignore
+            version_keys_from_paths = None  # type: ignore
+            version_keys_in_folder = None  # type: ignore
             grok_index = None
 
-        known_ids: Dict[str, str] = {}
+        known_versions: Dict[Tuple[str, int], str] = {}
         try:
-            if grok_ids_from_paths:
-                known_ids.update(grok_ids_from_paths(it.get("path") or "" for it in items))
-            if grok_ids_in_folder:
+            if version_keys_from_paths:
+                known_versions.update(
+                    version_keys_from_paths(it.get("path") or "" for it in items)
+                )
+            if version_keys_in_folder:
                 for folder in known_id_folders or ():
-                    known_ids.update(grok_ids_in_folder(str(folder or "")))
-            if grok_index:
-                for gid in (grok_index.get("ids") or {}):
-                    known_ids.setdefault(str(gid).lower(), "")
+                    known_versions.update(version_keys_in_folder(str(folder or "")))
         except Exception:
             pass
 
@@ -570,7 +570,8 @@ class FlashVSRWorkQueue:
                 already_queued += 1
                 continue
             if sz > 0 and sz in existing_sizes:
-                # Same byte length as a file already queued / done — skip the copy
+                # Same byte length as a file already queued / done / accepted
+                # this scan — skip the copy (true Chrome re-download).
                 same_size_copy += 1
                 continue
             if grok_index is not None and match_file is not None:
@@ -581,31 +582,33 @@ class FlashVSRWorkQueue:
                 if hit:
                     grok_id_dupes += 1
                     continue
-            if first_matching_id is not None:
-                gid = first_matching_id(Path(ap).name, known_ids)
-                if gid:
+            if first_matching_version is not None:
+                vk = first_matching_version(Path(ap).name, known_versions)
+                if vk:
                     grok_id_dupes += 1
                     continue
             candidates.append(ap)
+            if sz > 0:
+                existing_sizes.add(sz)
 
-        # One Grok/Imagine UUID → one job, even when Chrome saved (1)/(2)/… copies
-        # of different byte sizes in the same watch-folder drop.
-        if primary_grok_id and pick_canonical_path and candidates:
-            by_id: Dict[str, List[str]] = {}
+        # One Imagine take (UUID + Chrome (N)) → one job. Different (N) with
+        # different byte sizes are other takes of the same tile — queue each.
+        if version_key and pick_canonical_path and candidates:
+            by_ver: Dict[Tuple[str, int], List[str]] = {}
             no_id: List[str] = []
             for ap in candidates:
-                gid = primary_grok_id(Path(ap).name) or ""
-                if gid:
-                    by_id.setdefault(gid, []).append(ap)
+                vk = version_key(Path(ap).name)
+                if vk:
+                    by_ver.setdefault(vk, []).append(ap)
                 else:
                     no_id.append(ap)
             keep: List[str] = list(no_id)
-            for gid, group in by_id.items():
+            for vk, group in by_ver.items():
                 winner = pick_canonical_path(group)
                 keep.append(winner)
                 extras = [p for p in group if _norm(p) != _norm(winner)]
                 grok_id_dupes += len(extras)
-                known_ids[gid] = winner
+                known_versions[vk] = winner
             candidates = keep
 
         for ap in candidates:
@@ -877,42 +880,49 @@ class FlashVSRWorkQueue:
 
         items = size_kept + no_size
 
-        # --- Grok unique-ID: one Imagine UUID → one job (Chrome (N) copies) ---
+        # --- Grok unique-ID: one Imagine take (UUID + Chrome N) → one job ---
         stats["grok_id_dupes"] = 0
         try:
-            from grok_id_index import load_index, match_file, pick_canonical_path, primary_grok_id
+            from grok_id_index import load_index, match_file, pick_canonical_path, version_key
             gidx = load_index(str(self.app_dir))
-            by_id: Dict[str, List[Dict[str, Any]]] = {}
+            by_ver: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
             leftover: List[Dict[str, Any]] = []
             for it in items:
                 path = (it.get("path") or "").strip()
-                gid = primary_grok_id(Path(path).name) if path else None
-                if gid:
-                    by_id.setdefault(gid, []).append(it)
+                vk = version_key(Path(path).name) if path else None
+                if vk:
+                    by_ver.setdefault(vk, []).append(it)
                 else:
                     leftover.append(it)
             kept_g: List[Dict[str, Any]] = list(leftover)
-            for gid, group in by_id.items():
+            for vk, group in by_ver.items():
                 running = [it for it in group if it.get("status") == ST_RUNNING]
                 done = [it for it in group if it.get("status") == ST_DONE]
-                catalog_hit = False
-                if gidx.get("ids"):
-                    for it in group:
-                        path = (it.get("path") or "").strip()
-                        if path and match_file(path, gidx) and it.get("status") in (ST_PENDING, ST_FAILED):
-                            catalog_hit = True
-                            break
                 if running or done:
                     kept_g.extend(running or done[:1])
                     stats["grok_id_dupes"] += len(group) - len(running or done[:1])
                     continue
-                if catalog_hit:
-                    stats["grok_id_dupes"] += len(group)
+                survivors: List[Dict[str, Any]] = []
+                for it in group:
+                    path = (it.get("path") or "").strip()
+                    if (
+                        gidx.get("ids")
+                        and path
+                        and match_file(path, gidx)
+                        and it.get("status") in (ST_PENDING, ST_FAILED)
+                    ):
+                        stats["grok_id_dupes"] += 1
+                        continue
+                    survivors.append(it)
+                if not survivors:
                     continue
-                winner_path = pick_canonical_path([it.get("path") or "" for it in group])
-                winner = next((it for it in group if _norm(it.get("path") or "") == _norm(winner_path)), group[0])
+                winner_path = pick_canonical_path([it.get("path") or "" for it in survivors])
+                winner = next(
+                    (it for it in survivors if _norm(it.get("path") or "") == _norm(winner_path)),
+                    survivors[0],
+                )
                 kept_g.append(winner)
-                stats["grok_id_dupes"] += len(group) - 1
+                stats["grok_id_dupes"] += len(survivors) - 1
             items = kept_g
         except Exception:
             pass

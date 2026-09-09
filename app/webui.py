@@ -3332,7 +3332,7 @@ def _run_group_therapy_body(
             "🧹 Group Therapy preflight: "
             f"{pf.get('dupes', 0)} path duplicate(s), "
             f"{pf.get('size_dupes', 0)} same-size, "
-            f"{pf.get('grok_id_dupes', 0)} Grok-ID Chrome copies skipped, "
+            f"{pf.get('grok_id_dupes', 0)} same UUID+(N) skipped, "
             f"{pf.get('completed_removed', 0)} already in After · "
             f"{pf.get('pending', 0)} pending left",
             message_type="info",
@@ -3750,9 +3750,9 @@ def find_matching_deliverable(
     Find an existing handoff/export for a source whose inbox path is gone.
 
     Matching is strict on Grok/video UUID so siblings like ``…019f8889…`` vs
-    ``…019f8883…`` do not share a hit. Chrome ``(N)`` copies of the *same*
-    UUID are the same clip — a Ready-for-CIV file with ``_(27)_`` counts as
-    done for inbox ``(1)``. Variant number is a preference, not a reject.
+    ``…019f8883…`` do not share a hit. Chrome ``(N)`` is a *version index*:
+    inbox ``uuid (3).mp4`` is not done just because After has ``uuid_(4)_``.
+    Unnumbered inbox matches After files with no ``(N)`` token.
     """
     stem = Path(source_path or "").stem
     if not stem or len(stem) < 8:
@@ -3763,14 +3763,12 @@ def find_matching_deliverable(
         re.I,
     )
     uuids = uuid_re.findall(stem)
-    variant = None
-    vm = re.search(r"\((\d+)\)", stem)
-    if vm:
-        variant = vm.group(1)
-    else:
-        vm = re.search(r"(?:^|[\s_])(\d+)(?=_resized|_upscaled|$)", stem)
-        if vm:
-            variant = vm.group(1)
+    src_n = 0
+    try:
+        src_n = grok_id_index.chrome_copy_number(stem)
+    except Exception:
+        vm = re.search(r"\((\d+)\)", stem)
+        src_n = int(vm.group(1)) if vm else 0
 
     media_ext = {
         ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v",
@@ -3789,6 +3787,14 @@ def find_matching_deliverable(
         for fn in names:
             ext = os.path.splitext(fn)[1].lower()
             if ext not in media_ext:
+                continue
+            try:
+                other_n = grok_id_index.chrome_copy_number(fn)
+            except Exception:
+                om = re.search(r"\((\d+)\)", fn)
+                other_n = int(om.group(1)) if om else 0
+            # Same tile UUID with a different Chrome (N) is another Imagine take.
+            if uuids and other_n != src_n:
                 continue
             score = 0
             if stem in fn:
@@ -3816,16 +3822,6 @@ def find_matching_deliverable(
                     if best < 40:
                         continue
                     score += best
-
-                if variant:
-                    # Chrome ``(N)`` copies of the same grok-video UUID are the
-                    # same clip — prefer the matching index but do not reject
-                    # _(27)_ After files when the inbox copy is ``(1)``.
-                    other = re.search(r"\((\d+)\)", fn)
-                    if other and other.group(1) == variant:
-                        score += 250
-                    elif prefer_exported:
-                        score += 10
 
             if prefer_exported and "_exported" in fn.lower():
                 score += 500
@@ -4074,7 +4070,7 @@ def _run_flashvsr_work_queue_body(
             "🧹 Step 1 preflight: "
             f"{pf.get('dupes', 0)} path duplicate(s) removed, "
             f"{pf.get('size_dupes', 0)} same-size duplicate(s) skipped, "
-            f"{pf.get('grok_id_dupes', 0)} Grok-ID duplicate(s) skipped, "
+            f"{pf.get('grok_id_dupes', 0)} same UUID+(N) skipped, "
             f"{pf.get('completed_removed', 0)} already-complete removed from queue, "
             f"{pf.get('failed_requeued', 0)} failed re-queued · "
             f"{pf.get('pending', 0)} pending left",

@@ -1,6 +1,6 @@
 # FlashVSR+ Pinokio — Custom Configuration & Code Changes
 
-**Last updated:** 2026-08-29  
+**Last updated:** 2026-09-09  
 **Install path:** `C:\pinokio\api\FlashVSR_plus_pinokio.git\app`  
 **Purpose:** Persistent record of customizations applied outside stock FlashVSR (survives app rollback/reinstall). Re-apply or merge these after updating the Pinokio launcher.
 
@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-09-09 | **Imagine `(N)` takes are distinct jobs:** Grok Imagine reuses one `grok-video-UUID` across versions; Chrome names them `(1)`/`(2)` with different byte sizes. Queue skip / Group Therapy preflight / deliverable match now key on UUID **+ Chrome (N)**, and still skip true same-size re-downloads (±2.5% catalog). A clip already in After no longer zeros the rest of NEW DOWNLOADS. |
 | 2026-09-07 | **Chrome `(N)` copies no longer get a new PID:** queue add + preflight keep one file per `grok-video-UUID` (prefer the unnumbered name). After/Before/handoff folders are scanned live so a clip already in Ready for CIV is skipped even if `grok_id_index.json` was never built. Group Therapy now runs the same preflight (was video-queue only). Deliverable match treats UUID as identity — `(1)` inbox vs `_(27)_` After is the same clip. Tiny/still-writing downloads are ignored. Existing After PID is reused on retry. |
 | 2026-08-29 | **Grok-ID duplicate screen:** Buttons on Batch Video — *Scan outputs* (programmed pipeline folders if the field is blank) and *Scan new downloads*. Catalogs `grok-video-UUID` / `GROK-##` / leading post IDs + original size. New files whose ID matches **and** size is within ±2.5% of the original are skipped from the queue. Log: `app/outputs/grok_id_index.json` + `queue_logs/grok_id_scan.jsonl`. User-run only. |
 | 2026-08-27 | **Terminal heartbeats:** Pinokio logs now get newline status every ~5s (tile/DiT/VAE) plus a 12s “still busy — not frozen” watchdog. tqdm `\r` bars were invisible in the log after OOM drop. Unbuffered `python -u` + `PYTHONUNBUFFERED=1`. |

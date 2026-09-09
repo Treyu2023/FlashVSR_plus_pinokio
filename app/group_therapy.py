@@ -703,9 +703,9 @@ def find_existing_pair(
     after_dir: str,
     it: Dict[str, Any],
     *,
-    id_map: Optional[Dict[str, str]] = None,
+    id_map: Optional[Dict[Any, str]] = None,
 ) -> Optional[str]:
-    """If this item already has a finished After file (PID or Grok-ID in name), return it."""
+    """If this item already has a finished After file (PID or same UUID+(N)), return it."""
     if not after_dir or not os.path.isdir(after_dir):
         return None
     pid = str(it.get("gt_pair_id") or "").strip().lower()
@@ -713,19 +713,18 @@ def find_existing_pair(
         pid = pair_id_from_name(it.get("path") or "") or ""
     mapping = load_retro_pid_map(after_dir)
     tokens = _pid_search_tokens(pid, mapping)
-    grok_ids = []
+    vk = None
     try:
-        from grok_id_index import extract_grok_ids, grok_ids_in_folder
-        grok_ids = extract_grok_ids(it.get("path") or "")
-        if id_map is None and grok_ids:
-            id_map = grok_ids_in_folder(after_dir)
+        from grok_id_index import version_key, version_keys_in_folder
+        vk = version_key(it.get("path") or "")
+        if id_map is None and vk:
+            id_map = version_keys_in_folder(after_dir)
     except Exception:
-        grok_ids = []
-    if grok_ids and id_map:
-        for gid in grok_ids:
-            hit = id_map.get(gid)
-            if hit and _file_big_enough(hit):
-                return hit
+        vk = None
+    if vk and id_map:
+        hit = id_map.get(vk)
+        if hit and _file_big_enough(hit):
+            return hit
     try:
         for f in Path(after_dir).iterdir():
             if not f.is_file() or f.suffix.lower() not in VIDEO_EXTS:
@@ -756,8 +755,8 @@ def mark_already_paired(wq: FlashVSRWorkQueue, after_dir: str) -> int:
     n = 0
     id_map = None
     try:
-        from grok_id_index import grok_ids_in_folder
-        id_map = grok_ids_in_folder(after_dir)
+        from grok_id_index import version_keys_in_folder
+        id_map = version_keys_in_folder(after_dir)
     except Exception:
         id_map = None
     for it in list(wq.all_items()):

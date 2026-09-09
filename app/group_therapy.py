@@ -22,7 +22,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from flashvsr_work_queue import FlashVSRWorkQueue, VIDEO_EXTS, _file_mtime
+from flashvsr_work_queue import (
+    FlashVSRWorkQueue,
+    VIDEO_EXTS,
+    _file_mtime,
+    looks_like_upscaled_output,
+)
 
 _PAIR_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 _PAIR_FOLDER_RE = re.compile(r"^GT-([0-9a-f]{8})__", re.I)
@@ -748,6 +753,160 @@ def find_existing_pair(
     except OSError:
         pass
     return None
+
+
+def reclaim_watch_folder(
+    watch_dir: str,
+    before_dir: str,
+    after_dir: str,
+) -> Dict[str, int]:
+    """
+    Watch/Downloads may only hold unprocessed originals.
+
+    If After already has this Imagine take (UUID + Chrome N):
+      - Before already has it → delete the inbox copy
+      - else move the original into Before, reusing the After PID
+    Same-size Chrome re-downloads of an archived original are deleted.
+    Leftover upscaled/RIFE names in the inbox are deleted (intermediates).
+    """
+    stats = {
+        "scanned": 0,
+        "moved_before": 0,
+        "deleted_already_paired": 0,
+        "deleted_same_size": 0,
+        "deleted_intermediate": 0,
+        "kept_unprocessed": 0,
+    }
+    if not watch_dir or not os.path.isdir(watch_dir):
+        return stats
+    os.makedirs(before_dir, exist_ok=True)
+    os.makedirs(after_dir, exist_ok=True)
+
+    after_map: Dict[Any, str] = {}
+    before_map: Dict[Any, str] = {}
+    try:
+        from grok_id_index import version_key, version_keys_in_folder
+        after_map = version_keys_in_folder(after_dir)
+        before_map = version_keys_in_folder(before_dir)
+    except Exception:
+        version_key = None  # type: ignore
+
+    before_sizes: set = set()
+    try:
+        for p in Path(before_dir).iterdir():
+            if p.is_file() and p.suffix.lower() in VIDEO_EXTS:
+                try:
+                    sz = p.stat().st_size
+                except OSError:
+                    sz = 0
+                if sz > 0:
+                    before_sizes.add(sz)
+    except OSError:
+        pass
+
+    kept: List[str] = []
+    try:
+        files = [p for p in Path(watch_dir).iterdir() if p.is_file()]
+    except OSError:
+        return stats
+
+    for p in files:
+        if p.suffix.lower() not in VIDEO_EXTS:
+            continue
+        stats["scanned"] += 1
+        ap = str(p)
+        vk = None
+        if version_key:
+            try:
+                vk = version_key(p.name)
+            except Exception:
+                vk = None
+
+        if looks_like_upscaled_output(ap):
+            try:
+                os.remove(ap)
+                stats["deleted_intermediate"] += 1
+            except OSError:
+                pass
+            continue
+
+        if vk and vk in after_map:
+            after_p = after_map[vk]
+            if vk in before_map:
+                try:
+                    os.remove(ap)
+                    stats["deleted_already_paired"] += 1
+                except OSError:
+                    pass
+                continue
+            pid = pair_id_from_name(after_p) or make_pair_id()
+            try:
+                dest_name = with_pid_name(ap, pid)
+                dest = os.path.join(before_dir, dest_name)
+                if os.path.isfile(dest):
+                    dest = unique_pid_dest(before_dir, dest_name)
+                shutil.move(ap, dest)
+                stamp_title_pid(dest, pid)
+                before_map[vk] = dest
+                try:
+                    before_sizes.add(os.path.getsize(dest))
+                except OSError:
+                    pass
+                stats["moved_before"] += 1
+            except OSError:
+                kept.append(ap)
+            continue
+
+        try:
+            sz = p.stat().st_size
+        except OSError:
+            sz = 0
+        if sz > 0 and sz in before_sizes:
+            try:
+                os.remove(ap)
+                stats["deleted_same_size"] += 1
+            except OSError:
+                pass
+            continue
+        kept.append(ap)
+
+    # Same-byte extras still in the inbox (true Chrome re-downloads of unprocessed takes)
+    by_size: Dict[int, List[str]] = {}
+    for ap in kept:
+        try:
+            sz = os.path.getsize(ap)
+        except OSError:
+            sz = 0
+        if sz > 0:
+            by_size.setdefault(sz, []).append(ap)
+    still: List[str] = []
+    for sz, group in by_size.items():
+        if len(group) == 1:
+            still.append(group[0])
+            continue
+        try:
+            from grok_id_index import pick_canonical_path
+            winner = pick_canonical_path(group)
+        except Exception:
+            winner = group[0]
+        still.append(winner)
+        for extra in group:
+            if os.path.normcase(extra) == os.path.normcase(winner):
+                continue
+            try:
+                os.remove(extra)
+                stats["deleted_same_size"] += 1
+            except OSError:
+                pass
+    for ap in kept:
+        try:
+            sz = os.path.getsize(ap)
+        except OSError:
+            sz = 0
+        if sz <= 0:
+            still.append(ap)
+    stats["kept_unprocessed"] = len({os.path.normcase(p) for p in still if os.path.isfile(p)})
+    return stats
 
 
 def mark_already_paired(wq: FlashVSRWorkQueue, after_dir: str) -> int:

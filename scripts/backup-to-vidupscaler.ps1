@@ -21,7 +21,8 @@ if (-not (Test-Path (Join-Path $Source 'app\webui.py'))) {
     throw "Source missing app\webui.py: $Source"
 }
 if (-not (Test-Path $Dest)) {
-    throw "Dest missing: $Dest"
+    Write-Host "VIDUpscaler folder is gone (retired milestone). Backup is git remote 'mine'."
+    exit 0
 }
 
 $stamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'

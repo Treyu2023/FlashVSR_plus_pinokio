@@ -3294,6 +3294,23 @@ def _run_group_therapy_body(
     os.makedirs(after_dir, exist_ok=True)
 
     if watch_folder and os.path.isdir(watch_folder):
+        rec = gt.reclaim_watch_folder(watch_folder, before_dir, after_dir)
+        moved = rec.get("moved_before", 0)
+        dropped = (
+            rec.get("deleted_already_paired", 0)
+            + rec.get("deleted_same_size", 0)
+            + rec.get("deleted_intermediate", 0)
+        )
+        if moved or dropped:
+            log(
+                "🧹 Watch reclaim: "
+                f"{moved} original(s) → Pre Scaled, "
+                f"{dropped} already-done/duplicate/intermediate deleted, "
+                f"{rec.get('kept_unprocessed', 0)} unprocessed left in Downloads",
+                message_type="info",
+            )
+
+    if watch_folder and os.path.isdir(watch_folder):
         _log_hygiene(
             watch_folder,
             "watch",

@@ -3338,6 +3338,17 @@ def _run_group_therapy_body(
     def _gt_complete(path: str):
         return gt.find_existing_pair(after_dir, {"path": path})
 
+    n_check = sum(1 for it in wq.all_items() if it.get("status") != "done")
+    log(
+        f"Group Therapy: indexing After ({after_dir}) once for {n_check} queued file(s)…",
+        message_type="info",
+    )
+    after_index = gt.get_after_lookup(after_dir)
+    log(
+        f"Group Therapy: After index ready — {after_index.get('count', 0)} final(s). Preflight…",
+        message_type="info",
+    )
+
     pf = wq.preflight_before_start(
         find_output=_gt_complete,
         remove_completed=True,

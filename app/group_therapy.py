@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -696,12 +697,104 @@ def _pid_search_tokens(pid: str, mapping: Optional[Dict[str, str]] = None) -> Li
 
 _MIN_AFTER_BYTES = 64 * 1024
 
+# Start/Resume used to re-scan After (thousands of videos) once per queued file.
+# Index the folder once; invalidate when the directory listing changes.
+_AFTER_LOOKUP: Dict[str, Tuple[frozenset, Dict[str, Any]]] = {}
+
 
 def _file_big_enough(path: str, min_bytes: int = _MIN_AFTER_BYTES) -> bool:
     try:
         return bool(path) and os.path.isfile(path) and os.path.getsize(path) >= int(min_bytes)
     except OSError:
         return False
+
+
+def _after_name_set(after_dir: str) -> frozenset:
+    try:
+        return frozenset(os.listdir(after_dir))
+    except OSError:
+        return frozenset()
+
+
+def _empty_after_lookup() -> Dict[str, Any]:
+    return {
+        "by_vk": {},
+        "by_pid": {},
+        "files": [],
+        "legacy_dirs": [],
+        "mapping": {},
+        "count": 0,
+    }
+
+
+def build_after_lookup(after_dir: str) -> Dict[str, Any]:
+    """One pass over After: version keys, PID tokens, stems, leftover GT- folders."""
+    lookup = _empty_after_lookup()
+    if not after_dir or not os.path.isdir(after_dir):
+        return lookup
+    lookup["mapping"] = load_retro_pid_map(after_dir)
+    try:
+        from grok_id_index import version_key as _version_key
+    except Exception:
+        _version_key = None  # type: ignore
+    root = Path(after_dir)
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return lookup
+    by_vk: Dict[Any, str] = {}
+    by_pid: Dict[str, str] = {}
+    files: List[Tuple[str, str]] = []
+    legacy_dirs: List[Path] = []
+    for f in entries:
+        try:
+            is_dir = f.is_dir()
+        except OSError:
+            continue
+        if is_dir:
+            if f.name.lower().startswith("gt-"):
+                legacy_dirs.append(f)
+            continue
+        if f.suffix.lower() not in VIDEO_EXTS:
+            continue
+        try:
+            sz = f.stat().st_size
+        except OSError:
+            continue
+        if sz < _MIN_AFTER_BYTES:
+            continue
+        path = str(f)
+        files.append((path, f.stem.lower()))
+        pid = pair_id_from_name(path)
+        if pid and pid not in by_pid:
+            by_pid[pid] = path
+        if _version_key:
+            try:
+                vk = _version_key(f.name)
+            except Exception:
+                vk = None
+            if vk and vk not in by_vk:
+                by_vk[vk] = path
+    lookup["by_vk"] = by_vk
+    lookup["by_pid"] = by_pid
+    lookup["files"] = files
+    lookup["legacy_dirs"] = legacy_dirs
+    lookup["count"] = len(files)
+    return lookup
+
+
+def get_after_lookup(after_dir: str, *, force: bool = False) -> Dict[str, Any]:
+    """Cached After index. Rebuilds when the directory listing changes."""
+    if not after_dir or not os.path.isdir(after_dir):
+        return _empty_after_lookup()
+    key = os.path.normcase(os.path.abspath(after_dir))
+    names = _after_name_set(after_dir)
+    hit = _AFTER_LOOKUP.get(key)
+    if not force and hit and hit[0] == names:
+        return hit[1]
+    lookup = build_after_lookup(after_dir)
+    _AFTER_LOOKUP[key] = (names, lookup)
+    return lookup
 
 
 def find_existing_pair(
@@ -713,45 +806,45 @@ def find_existing_pair(
     """If this item already has a finished After file (PID or same UUID+(N)), return it."""
     if not after_dir or not os.path.isdir(after_dir):
         return None
+    lookup = get_after_lookup(after_dir)
     pid = str(it.get("gt_pair_id") or "").strip().lower()
     if not _PAIR_ID_RE.match(pid):
         pid = pair_id_from_name(it.get("path") or "") or ""
-    mapping = load_retro_pid_map(after_dir)
+    mapping = lookup.get("mapping") or {}
     tokens = _pid_search_tokens(pid, mapping)
     vk = None
     try:
-        from grok_id_index import version_key, version_keys_in_folder
+        from grok_id_index import version_key
         vk = version_key(it.get("path") or "")
-        if id_map is None and vk:
-            id_map = version_keys_in_folder(after_dir)
     except Exception:
         vk = None
-    if vk and id_map:
-        hit = id_map.get(vk)
+    vk_map = id_map if id_map is not None else lookup.get("by_vk") or {}
+    if vk and vk_map:
+        hit = vk_map.get(vk)
         if hit and _file_big_enough(hit):
             return hit
-    try:
-        for f in Path(after_dir).iterdir():
-            if not f.is_file() or f.suffix.lower() not in VIDEO_EXTS:
-                continue
-            if not _file_big_enough(str(f)):
-                continue
-            stem = f.stem.lower()
-            if any(tok in stem for tok in tokens):
-                return str(f)
-        # Legacy per-file folders (pre-flatten)
-        check_ids = [pid] if pid else []
-        if pid in mapping:
-            check_ids.append(mapping[pid])
-        for cid in check_ids:
-            prefix = f"gt-{cid}__"
-            for d in Path(after_dir).iterdir():
+    for tok in tokens:
+        pid8 = tok[5:] if tok.startswith("_pid_") else tok
+        hit = (lookup.get("by_pid") or {}).get(pid8)
+        if hit and _file_big_enough(hit):
+            return hit
+    if tokens:
+        for path, stem in lookup.get("files") or []:
+            if any(tok in stem for tok in tokens) and _file_big_enough(path):
+                return path
+    check_ids = [pid] if pid else []
+    if pid in mapping:
+        check_ids.append(mapping[pid])
+    for cid in check_ids:
+        prefix = f"gt-{cid}__"
+        for d in lookup.get("legacy_dirs") or []:
+            try:
                 if d.is_dir() and d.name.lower().startswith(prefix):
                     hit = pair_video_in(str(d))
                     if hit and _file_big_enough(hit):
                         return hit
-    except OSError:
-        pass
+            except OSError:
+                continue
     return None
 
 
@@ -911,14 +1004,12 @@ def reclaim_watch_folder(
 
 def mark_already_paired(wq: FlashVSRWorkQueue, after_dir: str) -> int:
     """Mark queue rows done when their After file already exists (PID or Grok-ID)."""
+    lookup = get_after_lookup(after_dir)
+    id_map = lookup.get("by_vk") or None
+    data = wq.load()
     n = 0
-    id_map = None
-    try:
-        from grok_id_index import version_keys_in_folder
-        id_map = version_keys_in_folder(after_dir)
-    except Exception:
-        id_map = None
-    for it in list(wq.all_items()):
+    now = datetime.now().isoformat(timespec="seconds")
+    for it in data.get("items") or []:
         if it.get("status") == "done":
             continue
         after_p = find_existing_pair(after_dir, it, id_map=id_map)
@@ -930,15 +1021,16 @@ def mark_already_paired(wq: FlashVSRWorkQueue, after_dir: str) -> int:
         pid = it.get("gt_pair_id") or pair_id_from_name(after_p) or ""
         if pid:
             it["gt_pair_id"] = pid
-        wq.update_item(
-            path,
-            gt_after=after_p,
-            gt_export=after_p,
-            gt_pair_folder=it.get("gt_pair_folder") or (pid_token(pid) if pid else None),
-            gt_pair_id=pid or it.get("gt_pair_id"),
-        )
-        wq.set_item_status(path, "done", output=after_p)
+        it["gt_after"] = after_p
+        it["gt_export"] = after_p
+        it["gt_pair_folder"] = it.get("gt_pair_folder") or (pid_token(pid) if pid else None)
+        it["status"] = "done"
+        it["output"] = after_p
+        it["error"] = None
+        it["finished"] = now
         n += 1
+    if n:
+        wq.save(data)
     return n
 
 

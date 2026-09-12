@@ -46,7 +46,9 @@ Reapply **never** copies a stale snapshot that lacks current markers (e.g. `with
 
 **FlashVSR+ is the only install.** The old VIDUpscaler milestone copy is retired; recover from `git push/pull mine` and `local-preserve`.
 
-Critical files in each snapshot: `webui.py`, `flashvsr_work_queue.py`, toolbox modules, `webui_config`, launcher `*.js`, `requirements.txt`, etc.
+Critical files in each snapshot: `webui.py`, `gpu_headroom.py`, `group_therapy.py`, `flashvsr_work_queue.py`, toolbox modules, `webui_config`, launcher `*.js`, `requirements.txt`, etc.
+
+Verified 2026-09-12: live + `local-preserve/latest` + `mine/main` all carry Group Therapy After-index (`get_after_lookup`) and Multitask GPU cap (`gpu_headroom.py` / `apply_saved_gpu_headroom`). Stale Aug snapshots fail those markers and are skipped.
 
 ## Manual commands
 

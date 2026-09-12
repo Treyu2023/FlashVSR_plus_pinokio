@@ -1,6 +1,6 @@
 # FlashVSR+ Pinokio — Custom Configuration & Code Changes
 
-**Last updated:** 2026-09-09  
+**Last updated:** 2026-09-12  
 **Install path:** `C:\pinokio\api\FlashVSR_plus_pinokio.git\app`  
 **Purpose:** Persistent record of customizations applied outside stock FlashVSR (survives app rollback/reinstall). Re-apply or merge these after updating the Pinokio launcher.
 
@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-09-12 | **Multitask GPU cap:** Settings + GPU-monitor toggle caps 4090 power (default 90%) and Below-Normal CPU; off restores full watts. `app/gpu_headroom.py`. **Group Therapy Start:** After folder indexed once (`get_after_lookup`) so preflight is seconds not minutes. Both are env_guard CRITICAL + markers so Update/Reset reapply cannot drop them. |
 | 2026-09-09 | **Watch reclaim:** already-delivered takes leave NEW DOWNLOADS — original → Pre Scaled (reuse After PID), extras/intermediates deleted. Inbox keeps unprocessed only. Imagine `(N)` takes are distinct jobs (UUID + Chrome N). VIDUpscaler milestone copy retired; git `mine` is the backup. |
 | 2026-09-07 | **Chrome `(N)` copies no longer get a new PID:** queue add + preflight keep one file per `grok-video-UUID` (prefer the unnumbered name). After/Before/handoff folders are scanned live so a clip already in Ready for CIV is skipped even if `grok_id_index.json` was never built. Group Therapy now runs the same preflight (was video-queue only). Deliverable match treats UUID as identity — `(1)` inbox vs `_(27)_` After is the same clip. Tiny/still-writing downloads are ignored. Existing After PID is reused on retry. |
 | 2026-08-29 | **Grok-ID duplicate screen:** Buttons on Batch Video — *Scan outputs* (programmed pipeline folders if the field is blank) and *Scan new downloads*. Catalogs `grok-video-UUID` / `GROK-##` / leading post IDs + original size. New files whose ID matches **and** size is within ±2.5% of the original are skipped from the queue. Log: `app/outputs/grok_id_index.json` + `queue_logs/grok_id_scan.jsonl`. User-run only. |

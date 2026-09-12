@@ -50,7 +50,7 @@ module.exports = {
     {
       method: "notify",
       params: {
-        html: "Update complete. Custom FlashVSR files reapplied (Group Therapy, PID pairing, toolbox). safetensors verified. Click Start."
+        html: "Update complete. Custom FlashVSR files reapplied (Group Therapy, PID pairing, GPU cap, toolbox). safetensors verified. Click Start."
       }
     }
   ]

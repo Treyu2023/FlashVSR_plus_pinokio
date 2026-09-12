@@ -71,14 +71,14 @@ MARKERS = {
     "app/grok_id_index.py": ("extract_grok_ids", "SIZE_TOLERANCE", "screen_folder", "def version_key"),
     "app/src/busy_heartbeat.py": ("class HeartbeatTqdm", "still busy"),
     "app/src/pipelines/flashvsr_tiny.py": ("BusySpan", "show_progress_bar=True"),
-    "app/group_therapy.py": ("stamp_title_pid", "flatten_gt_pair_folders", "pid_token", "item_in_progress", "version_keys_in_folder", "reclaim_watch_folder"),
+    "app/group_therapy.py": ("stamp_title_pid", "flatten_gt_pair_folders", "pid_token", "item_in_progress", "version_keys_in_folder", "reclaim_watch_folder", "get_after_lookup"),
     "app/flashvsr_work_queue.py": ("gt_pair_id", "drop_wrong_stage_pending", "class AddResult", "grok_id_dupes", "first_matching_version"),
     "app/naming_utils.py": ("clean_original_stem", "step1_filename"),
     "app/toolbox/toolbox.py": ("_choose_interp_factor", "_has_video_stream"),
     "app/src/pipelines/flashvsr_tiny_long.py": (
         "tiny-long pipeline requires output_path",
     ),
-    "scripts/env_guard.py": ("def reapply", "source_is_good"),
+    "scripts/env_guard.py": ("def reapply", "source_is_good", "app/gpu_headroom.py"),
     "update.js": ("env_guard.py reapply", "env_guard.py snapshot"),
     "install.js": ("env_guard.py reapply",),
     "start.js": ("env_guard.py preflight", "PYTHONUNBUFFERED"),
@@ -89,7 +89,7 @@ MARKERS = {
 CONFIG_FILES = {"app/webui_config.bak"}
 
 # User pipeline paths — stock/empty config gets replaced; live custom config is kept.
-MARKERS["app/webui_config"] = ("gt_before_dir=", "gt_after_dir=", "batch_watch_folder=", "resize_kernel=")
+MARKERS["app/webui_config"] = ("gt_before_dir=", "gt_after_dir=", "batch_watch_folder=", "resize_kernel=", "gpu_multitask=")
 
 SAFETENSORS_PIN = "safetensors~=0.6.0"
 
@@ -512,7 +512,7 @@ def preflight() -> int:
 
 
 def post_update() -> int:
-    """After git pull + pip: overlay custom files, restore config, verify safetensors."""
+    """After git pull + pip: restore missing/stock-overwritten custom files, verify safetensors."""
     reapply(force=False)
     restore_webui_config_if_missing()
     if safetensors_ok():

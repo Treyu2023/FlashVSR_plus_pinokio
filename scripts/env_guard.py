@@ -31,6 +31,7 @@ OFFLINE_BACKUPS = Path(r"C:\pinokio\backups\FlashVSR_plus_pinokio")
 # Snapshot before pull; reapply after pull/clone. Markers detect stock overwrite.
 CRITICAL = [
     "app/webui.py",
+    "app/gpu_headroom.py",
     "app/group_therapy.py",
     "app/flashvsr_work_queue.py",
     "app/naming_utils.py",
@@ -65,7 +66,8 @@ CRITICAL = [
 
 # Strings that MUST appear in a live custom file. Missing ⇒ stock overwrite.
 MARKERS = {
-    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir", "no size recode", "accurate_rnd+full_chroma_int", "orientation_input_box", "_gt_rife_flags", "resolve_resize_encode", "tonemap=hable", "open_media_folder", "_log_queue_scan", "def path_textbox", "HeartbeatTqdm", "handle_scan_grok_outputs", "chrome_copy_number"),
+    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir", "no size recode", "accurate_rnd+full_chroma_int", "orientation_input_box", "_gt_rife_flags", "resolve_resize_encode", "tonemap=hable", "open_media_folder", "_log_queue_scan", "def path_textbox", "HeartbeatTqdm", "handle_scan_grok_outputs", "chrome_copy_number", "apply_saved_gpu_headroom"),
+    "app/gpu_headroom.py": ("apply_gpu_headroom", "nvidia-smi", "Below-Normal"),
     "app/grok_id_index.py": ("extract_grok_ids", "SIZE_TOLERANCE", "screen_folder", "def version_key"),
     "app/src/busy_heartbeat.py": ("class HeartbeatTqdm", "still busy"),
     "app/src/pipelines/flashvsr_tiny.py": ("BusySpan", "show_progress_bar=True"),

@@ -62,6 +62,7 @@ from flashvsr_work_queue import (
 )
 import grok_id_index
 import group_therapy as gt
+import gpu_headroom
 from naming_utils import (
     upscale_video_filename,
     upscale_image_filename,
@@ -297,6 +298,17 @@ TIPS = {
     "ui_font": "UI font for labels and buttons. Path boxes stay monospace so long Windows paths stay readable.",
     "ui_font_size": "Base text size in pixels. Path boxes and monitors scale with this.",
     "ui_scale": "Zoom the whole UI (80–150%). Use this if controls feel cramped. Paths still wrap to show the full string.",
+    "gpu_multitask": (
+        "Multitask GPU cap — ON leaves headroom for Windows/Chrome while FlashVSR runs. "
+        "Caps the 4090 power limit to the % below (same idea as Afterburner) and drops FlashVSR "
+        "to Below-Normal CPU priority. OFF = full 4090 + Normal priority (faster jobs). "
+        "Applies immediately. Restores full power when you turn it off or close FlashVSR. "
+        "Task Manager can still show ~99% GPU — the card uses the watts it is allowed."
+    ),
+    "gpu_cap_pct": (
+        "GPU power cap while Multitask is ON. 90% of this 4090's full limit (~463 W → ~417 W). "
+        "70% is gentler on the desktop, slower jobs. 100% is the same as turning the toggle off."
+    ),
     "naming_mode": (
         "Legacy setting (kept for compatibility). Real names are now 2-step:\n"
         "  Step 1 Upscale → name_4K_9x16_Upscaled.mp4\n"
@@ -793,6 +805,8 @@ def get_ui_defaults(config=None):
         "ui_font": ("Segoe UI", str),
         "ui_font_size": (14, int),
         "ui_scale": (100, int),
+        "gpu_multitask": (False, bool),
+        "gpu_cap_pct": (90, int),
     }
     defaults = {}
     for key, (fallback, typ) in specs.items():
@@ -949,6 +963,33 @@ def save_config(config):
                 f.write(f"{key}={value}\n")
     except Exception as e:
         log(f"Error saving config: {e}", message_type="error")
+
+
+def apply_saved_gpu_headroom(enabled=None, pct=None) -> str:
+    """Persist + apply the multitask GPU cap. Call from the toggle and before jobs."""
+    cfg = load_config()
+    if enabled is None:
+        raw = cfg.get("gpu_multitask", False)
+        enabled = raw if isinstance(raw, bool) else str(raw).lower() == "true"
+    if pct is None:
+        try:
+            pct = int(float(cfg.get("gpu_cap_pct") or 90))
+        except (TypeError, ValueError):
+            pct = 90
+    try:
+        pct = int(float(pct))
+    except (TypeError, ValueError):
+        pct = 90
+    pct = max(70, min(100, pct))
+    cfg["gpu_multitask"] = bool(enabled)
+    cfg["gpu_cap_pct"] = pct
+    msg = gpu_headroom.apply_gpu_headroom(bool(enabled), pct)
+    full = gpu_headroom.full_power_w()
+    if full:
+        cfg["gpu_full_power_w"] = round(float(full), 2)
+    save_config(cfg)
+    log(msg, message_type="info")
+    return msg
 
 
 def persist_orientation_resize(
@@ -1770,6 +1811,7 @@ def run_flashvsr_single(
     if not input_path:
         log("No input video provided.", message_type='warning')
         return None, None, None
+    apply_saved_gpu_headroom()
     mode = normalize_pipeline_mode(mode)
 
     # --- Parameter Preparation ---
@@ -2554,6 +2596,7 @@ def run_flashvsr_image(
     progress=gr.Progress(track_tqdm=True)
 ):
     """Process a single image by duplicating it 21 times and extracting the middle frame from output."""
+    apply_saved_gpu_headroom()
     if not image_path:
         log("No input image provided.", message_type='warning')
         return None, None, None, gr.update(visible=False)
@@ -3232,6 +3275,7 @@ def _run_group_therapy_body(
     progress=None,
 ):
     global toolbox_processor
+    apply_saved_gpu_headroom()
     wq.clear_stop()
     ui = get_ui_defaults()
     paths = ensure_workflow_dirs(ui)
@@ -3983,6 +4027,7 @@ def run_flashvsr_work_queue(
     progress=gr.Progress(track_tqdm=True),
 ):
     """Process pending items on the persistent work queue (start / resume). Soft-stop between files."""
+    apply_saved_gpu_headroom()
     wq = get_flashvsr_work_queue()
     lock = get_exclusive_queue_lock()
     ok, lock_msg = lock.try_acquire("video")
@@ -4366,6 +4411,7 @@ def run_flashvsr_image_work_queue(
     progress=gr.Progress(track_tqdm=True),
 ):
     """Image upscale queue: watch NEW DOWNLOADS → Ready for CIV/images; originals → Pre Scaled."""
+    apply_saved_gpu_headroom()
     wq = get_flashvsr_image_queue()
     lock = get_exclusive_queue_lock()
     ok, lock_msg = lock.try_acquire("image")
@@ -4591,6 +4637,7 @@ def run_toolbox_work_queue(progress=gr.Progress(track_tqdm=True)):
     Post-upscale pipeline: scan Ready for Toolbox inbox,
     Frame Adjust 4x + Export → Ready for CIV.
     """
+    apply_saved_gpu_headroom()
     wq = get_toolbox_work_queue()
     lock = get_exclusive_queue_lock()
     ok, lock_msg = lock.try_acquire("toolbox")
@@ -7689,6 +7736,28 @@ def create_ui():
                                     show_label=False,
                                     elem_classes="monitor-box cpu-monitor"
                                 )
+                        with gr.Row():
+                            gpu_multitask = gr.Checkbox(
+                                label="Multitask GPU cap",
+                                value=bool(ui.get("gpu_multitask", False)),
+                                info=TIPS["gpu_multitask"],
+                                scale=2,
+                            )
+                            gpu_cap_pct = gr.Slider(
+                                minimum=70,
+                                maximum=100,
+                                step=5,
+                                value=int(ui.get("gpu_cap_pct") or 90),
+                                label="Cap %",
+                                info=TIPS["gpu_cap_pct"],
+                                scale=2,
+                            )
+                        gpu_cap_status = gr.Textbox(
+                            label="GPU cap",
+                            value=gpu_headroom.status_line(),
+                            interactive=False,
+                            lines=2,
+                        )
                         
                         # Output Analysis Display
                         video_output_analysis_html = gr.HTML(visible=False)
@@ -9933,6 +10002,34 @@ def create_ui():
                     label="Appearance status", interactive=False, show_label=False, scale=2
                 )
 
+            gr.Markdown("### GPU headroom (multitask)")
+            gr.Markdown(
+                "Cap the 4090 while you browse / other apps. **Off** = full card for faster queues. "
+                "Same control as the checkbox under the GPU monitor."
+            )
+            with gr.Row():
+                gpu_multitask_s = gr.Checkbox(
+                    label="Multitask GPU cap",
+                    value=bool(ui.get("gpu_multitask", False)),
+                    info=TIPS["gpu_multitask"],
+                    scale=2,
+                )
+                gpu_cap_pct_s = gr.Slider(
+                    minimum=70,
+                    maximum=100,
+                    step=5,
+                    value=int(ui.get("gpu_cap_pct") or 90),
+                    label="Cap % of full GPU power",
+                    info=TIPS["gpu_cap_pct"],
+                    scale=2,
+                )
+            gpu_cap_status_s = gr.Textbox(
+                label="GPU cap",
+                value=gpu_headroom.status_line(),
+                interactive=False,
+                lines=2,
+            )
+
             gr.Markdown("### Process naming (2 steps only)")
             gr.HTML(
                 value=(
@@ -10069,6 +10166,42 @@ def create_ui():
             outputs=[ui_appearance_status],
             js=_APPEAR_JS,
         )
+
+        def _on_gpu_cap(enabled, pct):
+            msg = apply_saved_gpu_headroom(enabled, pct)
+            return msg, enabled, pct, msg
+
+        _gpu_cap_outs_from_monitor = [
+            gpu_cap_status, gpu_multitask_s, gpu_cap_pct_s, gpu_cap_status_s,
+        ]
+        _gpu_cap_outs_from_settings = [
+            gpu_cap_status_s, gpu_multitask, gpu_cap_pct, gpu_cap_status,
+        ]
+        gpu_multitask.change(
+            fn=_on_gpu_cap,
+            inputs=[gpu_multitask, gpu_cap_pct],
+            outputs=_gpu_cap_outs_from_monitor,
+            show_progress="hidden",
+        )
+        gpu_cap_pct.release(
+            fn=_on_gpu_cap,
+            inputs=[gpu_multitask, gpu_cap_pct],
+            outputs=_gpu_cap_outs_from_monitor,
+            show_progress="hidden",
+        )
+        gpu_multitask_s.change(
+            fn=_on_gpu_cap,
+            inputs=[gpu_multitask_s, gpu_cap_pct_s],
+            outputs=_gpu_cap_outs_from_settings,
+            show_progress="hidden",
+        )
+        gpu_cap_pct_s.release(
+            fn=_on_gpu_cap,
+            inputs=[gpu_multitask_s, gpu_cap_pct_s],
+            outputs=_gpu_cap_outs_from_settings,
+            show_progress="hidden",
+        )
+
         for _ctrl in (ui_font, ui_font_size, ui_scale):
             _ctrl.change(
                 fn=None,
@@ -10260,6 +10393,7 @@ if __name__ == "__main__":
     # This allows downloading only the version they select (v1.0 or v1.1)
     log("FlashVSR+ WebUI starting...", message_type="info")
     log("Models will be downloaded automatically when you start processing.", message_type="info")
+    apply_saved_gpu_headroom()
     
     ui = create_ui()
     allowed_paths = get_gradio_allowed_paths()

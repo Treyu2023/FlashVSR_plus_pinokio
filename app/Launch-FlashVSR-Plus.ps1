@@ -25,7 +25,7 @@ try {
     # start fresh
 }
 
-$env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True,max_split_size_mb:512"
+$env:PYTORCH_CUDA_ALLOC_CONF = "max_split_size_mb:512"
 
 Write-Host "Starting FlashVSR+ (RTX 4090 profile defaults)..."
 Write-Host "App: $AppDir"

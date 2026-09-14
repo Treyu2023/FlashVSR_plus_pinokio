@@ -1,6 +1,6 @@
 # FlashVSR+ Pinokio — Custom Configuration & Code Changes
 
-**Last updated:** 2026-09-12  
+**Last updated:** 2026-09-14  
 **Install path:** `C:\pinokio\api\FlashVSR_plus_pinokio.git\app`  
 **Purpose:** Persistent record of customizations applied outside stock FlashVSR (survives app rollback/reinstall). Re-apply or merge these after updating the Pinokio launcher.
 
@@ -10,6 +10,8 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-09-14 | **No nvidia-smi watt cap from Pinokio:** `-pl` needs admin; Pinokio must not run elevated. Multitask now sets WDDM GPU scheduling (Idle / Below-Normal) in-process. Afterburner still owns watts. Boot: drop Gradio 6 `theme`/`css`/`head` deprecation spam (this Gradio still needs them on `Blocks`); strip `expandable_segments` (unsupported on Windows CUDA). |
+| 2026-09-13 | **GPU cap applies to Group Therapy:** Cap % slider on the GT tab; Start uses live slider (below 100% turns cap on); re-applies each group/file so mid-run slider changes stick; events `queue=False` so the slider works while a group is running. Cap-off no longer resets nvidia-smi to full watts (Afterburner/driver limit left alone). |
 | 2026-09-12 | **Multitask GPU cap:** Settings + GPU-monitor toggle caps 4090 power (default 90%) and Below-Normal CPU; off restores full watts. `app/gpu_headroom.py`. **Group Therapy Start:** After folder indexed once (`get_after_lookup`) so preflight is seconds not minutes. Both are env_guard CRITICAL + markers so Update/Reset reapply cannot drop them. |
 | 2026-09-09 | **Watch reclaim:** already-delivered takes leave NEW DOWNLOADS — original → Pre Scaled (reuse After PID), extras/intermediates deleted. Inbox keeps unprocessed only. Imagine `(N)` takes are distinct jobs (UUID + Chrome N). VIDUpscaler milestone copy retired; git `mine` is the backup. |
 | 2026-09-07 | **Chrome `(N)` copies no longer get a new PID:** queue add + preflight keep one file per `grok-video-UUID` (prefer the unnumbered name). After/Before/handoff folders are scanned live so a clip already in Ready for CIV is skipped even if `grok_id_index.json` was never built. Group Therapy now runs the same preflight (was video-queue only). Deliverable match treats UUID as identity — `(1)` inbox vs `_(27)_` After is the same clip. Tiny/still-writing downloads are ignored. Existing After PID is reused on retry. |

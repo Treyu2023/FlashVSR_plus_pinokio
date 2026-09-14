@@ -1,13 +1,12 @@
-"""Leave GPU headroom so the desktop stays usable while FlashVSR runs.
+"""Leave GPU time for the desktop while FlashVSR runs.
 
-Toggle ON → nvidia-smi power cap at N% of the card's full-speed limit, and
-drop this process to Below-Normal CPU priority.
-Toggle OFF (or process exit) → restore the previous power limit and Normal
-priority.
+Pinokio is not admin, so nvidia-smi -pl cannot change the 4090 watt limit
+from this process (Insufficient Permissions). Afterburner / NVIDIA App keep
+owning board watts — this module never launches them and never calls -pl.
 
-Task Manager can still show ~99% GPU: the card uses whatever budget it has.
-The cap is watts (same idea as Afterburner power limit), which is what actually
-leaves headroom for the desktop.
+Multitask ON lowers this process's WDDM GPU scheduling class (Idle or
+Below-Normal) so DWM/Chrome can preempt FlashVSR. Cap % picks how
+aggressive that class is. CPU Below-Normal is a small extra.
 """
 from __future__ import annotations
 
@@ -21,9 +20,14 @@ _FULL_W: Optional[float] = None
 _APPLIED = False
 _ATEXIT = False
 
-# Windows priority classes
-_NORMAL = 0x00000020
-_BELOW_NORMAL = 0x00004000
+# Windows process CPU priority
+_NORMAL_CPU = 0x00000020
+_BELOW_NORMAL_CPU = 0x00004000
+
+# D3DKMT_SCHEDULINGPRIORITYCLASS
+_GPU_IDLE = 0
+_GPU_BELOW_NORMAL = 1
+_GPU_NORMAL = 2
 
 
 def _smi(*args: str, timeout: float = 8.0) -> subprocess.CompletedProcess:
@@ -38,7 +42,7 @@ def _smi(*args: str, timeout: float = 8.0) -> subprocess.CompletedProcess:
 
 
 def query_power() -> Dict[str, float]:
-    """Current / default / min / max power limits in watts."""
+    """Current / default / min / max power limits in watts (read-only)."""
     r = _smi(
         "--query-gpu=power.limit,power.default_limit,power.min_limit,power.max_limit",
         "--format=csv,noheader,nounits",
@@ -52,16 +56,6 @@ def query_power() -> Dict[str, float]:
     return {"current": cur, "default": default, "min": lo, "max": hi}
 
 
-def _set_power_w(watts: float) -> float:
-    info = query_power()
-    lo, hi = info["min"], info["max"]
-    target = max(lo, min(hi, round(float(watts), 2)))
-    r = _smi("-pl", f"{target:.2f}")
-    if r.returncode != 0:
-        raise RuntimeError((r.stderr or r.stdout or "nvidia-smi -pl failed").strip())
-    return query_power()["current"]
-
-
 def _set_priority(below_normal: bool) -> None:
     if os.name != "nt":
         return
@@ -70,10 +64,62 @@ def _set_priority(below_normal: bool) -> None:
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
         kernel32.SetPriorityClass(
             kernel32.GetCurrentProcess(),
-            _BELOW_NORMAL if below_normal else _NORMAL,
+            _BELOW_NORMAL_CPU if below_normal else _NORMAL_CPU,
         )
     except Exception:
         pass
+
+
+def _set_gpu_sched(cls: int) -> bool:
+    """Set this process's WDDM GPU scheduling class. Works without admin."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        gdi32 = ctypes.WinDLL("gdi32")
+        fn = gdi32.D3DKMTSetProcessSchedulingPriorityClass
+        fn.restype = ctypes.c_long
+        fn.argtypes = [wintypes.HANDLE, ctypes.c_int]
+        kernel32 = ctypes.WinDLL("kernel32")
+        rc = fn(kernel32.GetCurrentProcess(), int(cls))
+        return rc == 0
+    except Exception:
+        return False
+
+
+def _get_gpu_sched() -> Optional[int]:
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        gdi32 = ctypes.WinDLL("gdi32")
+        fn = gdi32.D3DKMTGetProcessSchedulingPriorityClass
+        fn.restype = ctypes.c_long
+        fn.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_int)]
+        kernel32 = ctypes.WinDLL("kernel32")
+        pri = ctypes.c_int()
+        rc = fn(kernel32.GetCurrentProcess(), ctypes.byref(pri))
+        return int(pri.value) if rc == 0 else None
+    except Exception:
+        return None
+
+
+def _gpu_class_name(cls: Optional[int]) -> str:
+    return {
+        _GPU_IDLE: "Idle",
+        _GPU_BELOW_NORMAL: "Below-Normal",
+        _GPU_NORMAL: "Normal",
+    }.get(cls if cls is not None else _GPU_NORMAL, f"class {cls}")
+
+
+def _class_for_pct(pct: float) -> int:
+    if pct >= 88:
+        return _GPU_BELOW_NORMAL
+    return _GPU_IDLE
 
 
 def _remember_full_w(info: Optional[Dict[str, float]] = None) -> float:
@@ -81,8 +127,6 @@ def _remember_full_w(info: Optional[Dict[str, float]] = None) -> float:
     if _FULL_W and _FULL_W > 0:
         return _FULL_W
     info = info or query_power()
-    # Prefer the higher of current vs default so we restore Afterburner-style
-    # raised limits (this 4090 is often 463.5 W vs 450 W default).
     _FULL_W = max(float(info["current"]), float(info["default"]))
     return _FULL_W
 
@@ -96,27 +140,26 @@ def _install_atexit() -> None:
 
 
 def restore_full() -> str:
-    """Undo the cap. Safe to call when already at full speed."""
+    """Undo GPU scheduling this process applied. Never touches nvidia-smi watts."""
     global _APPLIED
     _set_priority(False)
+    _set_gpu_sched(_GPU_NORMAL)
+    _APPLIED = False
     try:
         info = query_power()
-        full = _remember_full_w(info)
-        if abs(info["current"] - full) >= 0.5:
-            now = _set_power_w(full)
-        else:
-            now = info["current"]
-        _APPLIED = False
-        return f"Full GPU: {now:.0f} W (no cap)."
+        return (
+            f"GPU scheduling Normal. "
+            f"Board watts {info['current']:.0f} W "
+            f"(Afterburner/driver limit left as-is)."
+        )
     except Exception as e:
-        _APPLIED = False
-        return f"Could not restore GPU power limit: {e}"
+        return f"GPU scheduling Normal. Watts unread ({e})."
 
 
 def apply_gpu_headroom(enabled: bool, pct: float = 90) -> str:
     """
-    enabled=True  → cap power to pct% of full-speed watts + Below-Normal CPU.
-    enabled=False → restore full watts + Normal CPU.
+    enabled=True  → WDDM GPU Idle/Below-Normal + Below-Normal CPU.
+    enabled=False → GPU/CPU Normal. Does not change board watts.
     """
     global _APPLIED
     _install_atexit()
@@ -127,23 +170,30 @@ def apply_gpu_headroom(enabled: bool, pct: float = 90) -> str:
     pct = max(70.0, min(100.0, pct))
     if not enabled or pct >= 99.5:
         return restore_full()
+    gpu_cls = _class_for_pct(pct)
+    gpu_ok = _set_gpu_sched(gpu_cls)
+    _set_priority(True)
+    _APPLIED = True
     try:
         info = query_power()
         full = _remember_full_w(info)
-        target = full * (pct / 100.0)
-        now = _set_power_w(target)
-        _set_priority(True)
-        _APPLIED = True
-        return (
-            f"Multitask cap ON: {now:.0f} W "
-            f"({pct:.0f}% of {full:.0f} W full). "
-            f"FlashVSR CPU priority Below-Normal. "
-            f"Turn off for max speed."
+        watts = (
+            f"Board watts {info['current']:.0f} W "
+            f"(Afterburner/driver — Pinokio is not admin so nvidia-smi cannot cap watts)."
         )
-    except Exception as e:
-        _set_priority(False)
-        _APPLIED = False
-        return f"GPU cap failed ({e}). nvidia-smi -pl must work on this driver."
+    except Exception:
+        watts = "Board watts unread (Afterburner/driver still own the watt limit)."
+        full = _FULL_W
+    if not gpu_ok:
+        return (
+            f"Multitask: could not set GPU scheduling. {watts} "
+            f"CPU Below-Normal only."
+        )
+    return (
+        f"Multitask ON: GPU scheduling {_gpu_class_name(gpu_cls)} "
+        f"({pct:.0f}% → desktop headroom). {watts}"
+        + (f" Full-speed reference {full:.0f} W." if full else "")
+    )
 
 
 def apply_from_config(cfg: Optional[Dict[str, Any]] = None) -> str:
@@ -175,10 +225,11 @@ def status_line() -> str:
     try:
         info = query_power()
         full = _FULL_W or max(info["current"], info["default"])
+        gpu = _gpu_class_name(_get_gpu_sched())
         return (
-            f"GPU power {info['current']:.0f} W "
-            f"(full {full:.0f} W, default {info['default']:.0f} W, "
-            f"range {info['min']:.0f}–{info['max']:.0f})"
+            f"GPU sched {gpu}. Board {info['current']:.0f} W "
+            f"(full {full:.0f} W, Afterburner/driver — no nvidia-smi watt cap from Pinokio)"
         )
     except Exception as e:
-        return f"GPU power unknown ({e})"
+        gpu = _gpu_class_name(_get_gpu_sched())
+        return f"GPU sched {gpu}. Watts unread ({e})"

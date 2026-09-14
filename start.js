@@ -17,7 +17,7 @@ module.exports = {
       params: {
         venv: "env",                // Edit this to customize the venv folder path
         env: {
-          PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,max_split_size_mb:512",
+          PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512",
           PYTHONUNBUFFERED: "1",
         },
         path: "app",                // Edit this to customize the path to start the shell from

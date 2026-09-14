@@ -15,6 +15,65 @@ import time
 from tqdm import tqdm as _Tqdm
 
 
+# Soft-stop: Pinokio log repeats a red banner every few status lines while the flag is set.
+_ANSI_RED = "\033[91m"
+_ANSI_RESET = "\033[0m"
+_stop_check = None
+_stop_was = False
+_lines_since_stop_banner = 0
+
+
+def set_stop_check(fn=None) -> None:
+    """Queue bodies register wq.stop_requested here so heartbeats can see the flag."""
+    global _stop_check, _stop_was, _lines_since_stop_banner
+    _stop_check = fn
+    _stop_was = False
+    _lines_since_stop_banner = 0
+
+
+def stop_armed() -> bool:
+    try:
+        return bool(_stop_check and _stop_check())
+    except Exception:
+        return False
+
+
+def _print_stop_banner() -> None:
+    ts = time.strftime("%H:%M:%S")
+    msg = (
+        f"{_ANSI_RED}⏹ STOP ARMED — finishing this file, then the queue pauses. "
+        f"Start / Resume to continue.{_ANSI_RESET}"
+    )
+    line = f"\n[{ts}] [FlashVSR] {msg}"
+    try:
+        print(line, flush=True)
+    except Exception:
+        try:
+            sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+
+def tick_stop_banner() -> None:
+    """Re-read the stop flag after status lines; remind in red every 5 lines."""
+    global _stop_was, _lines_since_stop_banner
+    armed = stop_armed()
+    if not armed:
+        _stop_was = False
+        _lines_since_stop_banner = 0
+        return
+    if not _stop_was:
+        _stop_was = True
+        _lines_since_stop_banner = 0
+        _print_stop_banner()
+        return
+    _lines_since_stop_banner += 1
+    if _lines_since_stop_banner >= 5:
+        _lines_since_stop_banner = 0
+        _print_stop_banner()
+
+
 def force_line_buffering() -> None:
     """Make print() show up immediately when stdout is a pipe (Pinokio)."""
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
@@ -47,6 +106,7 @@ def busy(msg: str) -> None:
     except Exception:
         pass
     WATCH.ping(msg)
+    tick_stop_banner()
 
 
 class BusyWatchdog:
@@ -93,6 +153,8 @@ class BusyWatchdog:
                 last = self._last
                 t0 = self._t0
             if depth <= 0:
+                if stop_armed():
+                    _print_stop_banner()
                 continue
             silent = time.time() - last
             if silent < self.interval:
@@ -107,6 +169,7 @@ class BusyWatchdog:
                 print(line, flush=True)
             except Exception:
                 pass
+            tick_stop_banner()
 
 
 WATCH = BusyWatchdog(interval=12.0)

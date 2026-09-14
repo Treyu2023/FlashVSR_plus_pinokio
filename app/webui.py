@@ -51,7 +51,10 @@ from typing import Optional, Sequence, Tuple
 from PIL import Image
 from tqdm import tqdm
 from einops import rearrange
-from src.busy_heartbeat import HeartbeatTqdm, busy, BusySpan, WATCH, force_line_buffering
+from src.busy_heartbeat import (
+    HeartbeatTqdm, busy, BusySpan, WATCH, force_line_buffering,
+    set_stop_check, tick_stop_banner,
+)
 
 force_line_buffering()
 tqdm = HeartbeatTqdm
@@ -1066,6 +1069,7 @@ def log(message:str, message_type:str="normal"):
         sys.stderr.flush()
     except Exception:
         pass
+    tick_stop_banner()
 
 def dummy_tqdm(iterable, *args, **kwargs):
     return iterable
@@ -3050,6 +3054,17 @@ def _queue_busy_html(wq: FlashVSRWorkQueue, message: str) -> str:
     return wq.status_html(message) + get_exclusive_queue_lock().status_html_snippet()
 
 
+def _stop_ack_html(note: str) -> str:
+    return (
+        "<div style='margin-top:8px;padding:8px 10px;background:#3f1d1d;"
+        "border:2px solid #ef4444;border-radius:6px;color:#fecaca;font-weight:700;'>"
+        f"{note}<br>"
+        "<span style='font-weight:500;color:#fca5a5;'>"
+        "Watch the Pinokio terminal — a red STOP ARMED line repeats every few status lines "
+        "until this file finishes.</span></div>"
+    )
+
+
 class _DummyProgress:
     def __call__(self, *args, **kwargs):
         pass
@@ -3220,6 +3235,7 @@ def run_group_therapy(
         log(lock_msg, message_type="warning")
         return None, _queue_busy_html(wq, lock_msg)
     try:
+        set_stop_check(wq.stop_requested)
         return _run_group_therapy_body(
             wq,
             mode=mode,
@@ -3261,6 +3277,7 @@ def run_group_therapy(
             progress=progress,
         )
     finally:
+        set_stop_check(None)
         lock.release("group")
 
 
@@ -3454,6 +3471,12 @@ def _run_group_therapy_body(
         gt_stages=",".join(stages),
     )
 
+    if wq.stop_requested():
+        wq.clear_stop()
+        note = "⏹ Stopped during Group Therapy preflight (no file started)."
+        log(note, message_type="warning")
+        return None, wq.status_html(note)
+
     items = [it for it in wq.all_items() if it.get("status") != "done"]
     groups = gt.ordered_groups(items)
     if not groups:
@@ -3471,6 +3494,7 @@ def _run_group_therapy_body(
     last_output = None
     finished = 0
     failed = 0
+    stop_finish_path = None
 
     def _settle_item(item):
         nonlocal last_output, finished
@@ -3555,6 +3579,16 @@ def _run_group_therapy_body(
 
             for f_i, item in enumerate(list(members)):
                 path = item["path"]
+                if stop_finish_path and os.path.normcase(path) != os.path.normcase(stop_finish_path):
+                    continue
+                if wq.stop_requested() and not stop_finish_path:
+                    wq.clear_stop()
+                    note = (
+                        f"⏹ Stopped after current file (did not start "
+                        f"{os.path.basename(path)}). {finished} settled this run."
+                    )
+                    log(note, message_type="warning")
+                    return last_output, wq.status_html(note)
                 if not os.path.isfile(path):
                     relocated = find_relocated_source(path, watch_folder, before_dir)
                     if relocated:
@@ -3725,14 +3759,34 @@ def _run_group_therapy_body(
                     except Exception:
                         pass
 
-                if wq.stop_requested():
-                    wq.clear_stop()
-                    note = (
-                        f"⏹ Stopped after group {gid} · {label} · "
-                        f"{os.path.basename(path)}. {finished} settled this run."
-                    )
-                    log(note, message_type="warning")
-                    return last_output, wq.status_html(note)
+                if wq.stop_requested() and not stop_finish_path:
+                    stop_finish_path = path
+                    rest = stages[stages.index(stage) + 1 :]
+                    if rest:
+                        log(
+                            "⏹ STOP ARMED — finishing remaining stages for "
+                            f"{os.path.basename(path)} ("
+                            + " → ".join(gt.STAGE_LABELS.get(s, s) for s in rest)
+                            + ") then pausing.",
+                            message_type="warning",
+                        )
+                    else:
+                        wq.clear_stop()
+                        note = (
+                            f"⏹ Stopped after group {gid} · {label} · "
+                            f"{os.path.basename(path)}. {finished} settled this run."
+                        )
+                        log(note, message_type="warning")
+                        return last_output, wq.status_html(note)
+
+            if stop_finish_path and stage == last_stage:
+                wq.clear_stop()
+                note = (
+                    f"⏹ Stopped after finishing {os.path.basename(stop_finish_path)} "
+                    f"(group {gid}). {finished} settled this run."
+                )
+                log(note, message_type="warning")
+                return last_output, wq.status_html(note)
 
             # refresh members after a stage
             members = [m for m in gt.group_members(wq.all_items(), gid) if m.get("status") != "done"]
@@ -4071,6 +4125,7 @@ def run_flashvsr_work_queue(
         log(lock_msg, message_type="warning")
         return None, _queue_busy_html(wq, lock_msg)
     try:
+        set_stop_check(wq.stop_requested)
         return _run_flashvsr_work_queue_body(
             wq, mode, model_version, scale, color_fix, tiled_vae, tiled_dit,
             tile_size, tile_overlap, unload_dit, dtype_str, seed, device, fps_override,
@@ -4078,6 +4133,7 @@ def run_flashvsr_work_queue(
             batch_resize_preset, enable_chunks, chunk_duration, progress,
         )
     finally:
+        set_stop_check(None)
         lock.release("video")
 
 
@@ -4224,6 +4280,15 @@ def _run_flashvsr_work_queue_body(
 
     for run_i, item in enumerate(list(pending)):
         video_path = item["path"]
+        if wq.stop_requested():
+            wq.clear_stop()
+            remaining = len(wq.pending_items())
+            note = (
+                f"⏹ Stopped before {os.path.basename(video_path)}. "
+                f"This run: {processed_this_run} done. Pending left: {remaining}."
+            )
+            log(note, message_type="warning")
+            return last_output_path, wq.status_html(note)
         if not os.path.isfile(video_path):
             result = handle_missing_queue_source(
                 wq,
@@ -4455,6 +4520,7 @@ def run_flashvsr_image_work_queue(
         log(lock_msg, message_type="warning")
         return None, _queue_busy_html(wq, lock_msg)
     try:
+        set_stop_check(wq.stop_requested)
         return _run_flashvsr_image_work_queue_body(
             wq, mode, model_version, scale, color_fix, tiled_vae, tiled_dit,
             tile_size, tile_overlap, unload_dit, dtype_str, seed, device, fps_override,
@@ -4462,6 +4528,7 @@ def run_flashvsr_image_work_queue(
             create_comparison, batch_resize_preset, progress,
         )
     finally:
+        set_stop_check(None)
         lock.release("image")
 
 
@@ -4557,6 +4624,14 @@ def _run_flashvsr_image_work_queue_body(
 
     for run_i, item in enumerate(list(pending)):
         image_path = item["path"]
+        if wq.stop_requested():
+            wq.clear_stop()
+            note = (
+                f"⏹ Stopped before {os.path.basename(image_path)}. "
+                f"{processed} done this run."
+            )
+            log(note, message_type="warning")
+            return last_output, wq.status_html(note)
         if not os.path.isfile(image_path):
             result = handle_missing_queue_source(
                 wq,
@@ -4681,8 +4756,10 @@ def run_toolbox_work_queue(progress=gr.Progress(track_tqdm=True)):
         log(lock_msg, message_type="warning")
         return None, _queue_busy_html(wq, lock_msg)
     try:
+        set_stop_check(wq.stop_requested)
         return _run_toolbox_work_queue_body(wq, progress)
     finally:
+        set_stop_check(None)
         lock.release("toolbox")
 
 
@@ -5614,6 +5691,14 @@ def _run_toolbox_work_queue_body(wq, progress):
 
     for run_i, item in enumerate(list(pending)):
         video_path = item["path"]
+        if wq.stop_requested():
+            wq.clear_stop()
+            note = (
+                f"⏹ Toolbox stopped before {os.path.basename(video_path)}. "
+                f"{processed} done, {requeued} requeued."
+            )
+            log(note, message_type="warning")
+            return last_out, wq.status_html(note)
         if not os.path.isfile(video_path):
             result = handle_missing_queue_source(
                 wq,
@@ -7520,6 +7605,7 @@ def create_ui():
                                     batch_add_queue_btn = gr.Button("➕ Add to Queue", size="sm")
                                     batch_run_button = gr.Button("▶️ Start / Resume Queue", variant="primary", size="sm")
                                     batch_stop_button = gr.Button("⏹ Stop After Current", variant="stop", size="sm")
+                                batch_stop_ack = gr.HTML(value="")
                                 with gr.Row():
                                     batch_requeue_failed_btn = gr.Button("↺ Re-queue Failed", size="sm")
                                     batch_clear_done_btn = gr.Button("Clear Done", size="sm")
@@ -7642,6 +7728,7 @@ def create_ui():
                                     gt_add_btn = gr.Button("➕ Scan original folder", size="sm")
                                     gt_run_btn = gr.Button("▶️ Start / Resume Group Therapy", variant="primary", size="sm")
                                     gt_stop_btn = gr.Button("⏹ Stop After Current", variant="stop", size="sm")
+                                gt_stop_ack = gr.HTML(value="")
                                 with gr.Row():
                                     gt_requeue_btn = gr.Button("↺ Re-queue Failed", size="sm")
                                     gt_clear_done_btn = gr.Button("Clear Done", size="sm")
@@ -7968,6 +8055,7 @@ def create_ui():
                                     img_add_queue_btn = gr.Button("➕ Add to Queue", size="sm")
                                     img_batch_run_button = gr.Button("▶️ Start / Resume Image Queue", variant="primary", size="sm")
                                     img_stop_queue_btn = gr.Button("⏹ Stop After Current", variant="stop", size="sm")
+                                img_stop_ack = gr.HTML(value="")
                                 with gr.Row():
                                     img_requeue_failed_btn = gr.Button("↺ Re-queue Failed", size="sm")
                                     img_clear_done_btn = gr.Button("Clear Done", size="sm")
@@ -8238,6 +8326,7 @@ def create_ui():
                                     tb_queue_stop_btn = gr.Button(
                                         "⏹ Stop After Current", variant="stop", size="sm"
                                     )
+                                tb_stop_ack = gr.HTML(value="")
                                 with gr.Row():
                                     tb_queue_requeue_btn = gr.Button("↺ Re-queue Failed", size="sm")
                                     tb_queue_clear_done_btn = gr.Button("Clear Done", size="sm")
@@ -8917,7 +9006,7 @@ def create_ui():
             wq = get_flashvsr_work_queue()
             note = wq.request_stop()
             log(note, message_type="warning")
-            return wq.status_html(note)
+            return _stop_ack_html(note)
 
         def handle_queue_clear_done():
             wq = get_flashvsr_work_queue()
@@ -8989,7 +9078,7 @@ def create_ui():
         batch_stop_button.click(
             fn=handle_queue_stop,
             inputs=[],
-            outputs=[flashvsr_queue_status],
+            outputs=[batch_stop_ack],
             queue=False,
         )
         batch_clear_done_btn.click(
@@ -9070,7 +9159,7 @@ def create_ui():
         def _gt_q_stop():
             note = get_group_therapy_queue().request_stop()
             log(note, message_type="warning")
-            return get_group_therapy_queue().status_html(note)
+            return _stop_ack_html(note)
 
         def _gt_q_clear_done():
             n = get_group_therapy_queue().clear_done()
@@ -9115,7 +9204,7 @@ def create_ui():
             return last_video, last_video, None, queue_html, queue_html
 
         gt_add_btn.click(fn=_gt_q_add, inputs=[gt_watch_folder], outputs=[gt_queue_status])
-        gt_stop_btn.click(fn=_gt_q_stop, inputs=[], outputs=[gt_queue_status], queue=False)
+        gt_stop_btn.click(fn=_gt_q_stop, inputs=[], outputs=[gt_stop_ack], queue=False)
         gt_clear_done_btn.click(fn=_gt_q_clear_done, outputs=[gt_queue_status])
         gt_clear_all_btn.click(fn=_gt_q_clear_all, outputs=[gt_queue_status])
         gt_requeue_btn.click(fn=_gt_q_requeue, outputs=[gt_queue_status])
@@ -9336,7 +9425,9 @@ def create_ui():
         )
         def _img_q_stop():
             wq = get_flashvsr_image_queue()
-            return wq.status_html(wq.request_stop())
+            note = wq.request_stop()
+            log(note, message_type="warning")
+            return _stop_ack_html(note)
 
         def _img_q_clear_done():
             wq = get_flashvsr_image_queue()
@@ -9350,7 +9441,7 @@ def create_ui():
             wq = get_flashvsr_image_queue()
             return wq.status_html(f"Re-queued {wq.requeue_failed()} failed.")
 
-        img_stop_queue_btn.click(fn=_img_q_stop, inputs=[], outputs=[img_queue_status], queue=False)
+        img_stop_queue_btn.click(fn=_img_q_stop, inputs=[], outputs=[img_stop_ack], queue=False)
         img_clear_done_btn.click(fn=_img_q_clear_done, outputs=[img_queue_status])
         img_clear_all_btn.click(fn=_img_q_clear_all, outputs=[img_queue_status])
         img_requeue_failed_btn.click(fn=_img_q_requeue, outputs=[img_queue_status])
@@ -9671,7 +9762,9 @@ def create_ui():
         )
         def _tb_q_stop():
             wq = get_toolbox_work_queue()
-            return wq.status_html(wq.request_stop())
+            note = wq.request_stop()
+            log(note, message_type="warning")
+            return _stop_ack_html(note)
 
         def _tb_q_clear_done():
             wq = get_toolbox_work_queue()
@@ -9685,7 +9778,7 @@ def create_ui():
             wq = get_toolbox_work_queue()
             return wq.status_html(f"Re-queued {wq.requeue_failed()} failed.")
 
-        tb_queue_stop_btn.click(fn=_tb_q_stop, inputs=[], outputs=[tb_queue_status], queue=False)
+        tb_queue_stop_btn.click(fn=_tb_q_stop, inputs=[], outputs=[tb_stop_ack], queue=False)
         tb_queue_clear_done_btn.click(fn=_tb_q_clear_done, outputs=[tb_queue_status])
         tb_queue_clear_all_btn.click(fn=_tb_q_clear_all, outputs=[tb_queue_status])
         tb_queue_requeue_btn.click(fn=_tb_q_requeue, outputs=[tb_queue_status])

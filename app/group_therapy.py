@@ -37,6 +37,8 @@ _PID_IN_NAME_RE = re.compile(r"_PID_([0-9a-f]{8})(?:_|$)", re.I)
 # so they cannot collide with new auto uuid-hex batches.
 _RETRO_PID_PREFIX = "9"
 _RETRO_MAP_NAME = "PID_RETRO_MAP.json"
+_PAIRS_DIR = "_pairs"
+_PAIRS_FILE = "pairs.json"
 _SKIP_DIR_NAMES = {
     "highfps",
     "novideo",
@@ -46,6 +48,7 @@ _SKIP_DIR_NAMES = {
     "from_toolbox_inbox",
     "bin",
     "crushed_old_fix",
+    "_pairs",
 }
 
 STAGES = ("upscale", "rife1", "rife2", "export")
@@ -170,50 +173,205 @@ def stamp_title_pid(path: str, pair_id: str) -> bool:
     return False
 
 
-def write_pair_marker(folder: str, *, pair_id: str, role: str, original_name: str, mate_folder: str) -> None:
-    os.makedirs(folder, exist_ok=True)
-    payload = {
-        "pair_id": pair_id,
-        "role": role,
-        "folder": os.path.basename(folder.rstrip("\\/")),
-        "original_name": original_name,
-        "mate_folder": mate_folder,
-    }
-    pair_txt = os.path.join(folder, "PAIR.txt")
-    pair_json = os.path.join(folder, "pair.json")
+def _pairs_dir(root: str) -> Path:
+    d = Path(root) / _PAIRS_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _pairs_path(root: str) -> Path:
+    return _pairs_dir(root) / _PAIRS_FILE
+
+
+def _empty_pairs_store() -> Dict[str, Any]:
+    return {"version": 1, "pairs": {}, "retro_map": {}}
+
+
+def _is_legacy_pair_sidecar(name: str) -> bool:
+    n = name.lower()
+    if n in {"pair.txt", "pair.json", "pairs.txt", "pid_retro_map.json"}:
+        return True
+    if n.startswith("pair (") and n.endswith((".txt", ".json")):
+        return True
+    return False
+
+
+def _merge_pair_record(store: Dict[str, Any], pair_id: str, *, role: str = "", folder: str = "", file_path: str = "", extra: Optional[Dict[str, Any]] = None) -> None:
+    pid = str(pair_id or "").strip().lower()
+    if not _PAIR_ID_RE.match(pid):
+        return
+    rec = store["pairs"].setdefault(pid, {})
+    if role and file_path:
+        rec[str(role)] = file_path
+    if folder:
+        rec["folder"] = folder
+    if extra:
+        for k, v in extra.items():
+            if v and k not in rec:
+                rec[k] = v
+
+
+def _parse_pairs_txt(text: str, store: Dict[str, Any]) -> None:
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        pid, role = parts[0].strip().lower(), parts[1].strip().lower()
+        folder = parts[2].strip() if len(parts) > 2 else ""
+        path = parts[3].strip() if len(parts) > 3 else ""
+        _merge_pair_record(store, pid, role=role, folder=folder, file_path=path)
+
+
+def migrate_legacy_pair_sidecars(root: str) -> int:
+    """Move pair.json / PAIR.txt / PAIRS.txt / PID_RETRO_MAP.json out of the media folder."""
+    if not root or not os.path.isdir(root):
+        return 0
+    root_p = Path(root)
     try:
-        with open(pair_txt, "w", encoding="utf-8") as f:
-            f.write(
-                f"pair_id={pair_id}\n"
-                f"role={role}\n"
-                f"folder={payload['folder']}\n"
-                f"original_name={original_name}\n"
-                f"mate={mate_folder}\n"
-            )
-        with open(pair_json, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-            f.write("\n")
+        files = [f for f in root_p.iterdir() if f.is_file() and _is_legacy_pair_sidecar(f.name)]
     except OSError:
-        pass
+        return 0
+    if not files:
+        return 0
+    store = _empty_pairs_store()
+    dest = _pairs_path(root)
+    if dest.is_file():
+        try:
+            existing = json.loads(dest.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                store["pairs"].update(existing.get("pairs") or {})
+                store["retro_map"].update(existing.get("retro_map") or {})
+        except (OSError, json.JSONDecodeError):
+            pass
+    moved = 0
+    archive = _pairs_dir(root) / "legacy"
+    archive.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        name = f.name.lower()
+        try:
+            text = f.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if name == "pairs.txt" or name.startswith("pairs "):
+            _parse_pairs_txt(text, store)
+        elif name == "pid_retro_map.json":
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    old, new = str(k).lower(), str(v).lower()
+                    if _PAIR_ID_RE.match(old) and _PAIR_ID_RE.match(new):
+                        store["retro_map"][old] = new
+        elif name.endswith(".json"):
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict) and data.get("pair_id"):
+                _merge_pair_record(
+                    store,
+                    str(data.get("pair_id")),
+                    role=str(data.get("role") or ""),
+                    folder=str(data.get("folder") or ""),
+                    extra={
+                        "original_name": data.get("original_name"),
+                        "mate_folder": data.get("mate_folder"),
+                    },
+                )
+        bak = archive / f.name
+        n = 2
+        while bak.exists():
+            bak = archive / f"{f.stem}_{n}{f.suffix}"
+            n += 1
+        try:
+            shutil.move(str(f), str(bak))
+            moved += 1
+        except OSError:
+            try:
+                f.unlink()
+                moved += 1
+            except OSError:
+                pass
+    if store["pairs"] or store["retro_map"]:
+        try:
+            dest.write_text(json.dumps(store, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+    return moved
+
+
+def load_pairs_store(root: str) -> Dict[str, Any]:
+    migrate_legacy_pair_sidecars(root)
+    store = _empty_pairs_store()
+    if not root:
+        return store
+    p = _pairs_path(root)
+    if not p.is_file():
+        return store
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return store
+    if not isinstance(data, dict):
+        return store
+    store["pairs"].update(data.get("pairs") or {})
+    store["retro_map"].update(data.get("retro_map") or {})
+    return store
+
+
+def save_pairs_store(root: str, store: Dict[str, Any]) -> None:
+    if not root:
+        return
+    payload = {
+        "version": 1,
+        "pairs": store.get("pairs") or {},
+        "retro_map": store.get("retro_map") or {},
+    }
+    dest = _pairs_path(root)
+    tmp = dest.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.replace(str(tmp), str(dest))
+    except OSError:
+        try:
+            if tmp.is_file():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def write_pair_marker(folder: str, *, pair_id: str, role: str, original_name: str, mate_folder: str) -> None:
+    """Record a pair in `_pairs/pairs.json` (never write into the media folder)."""
+    if not folder:
+        return
+    root = folder
+    # Old callers passed a GT-* subfolder; index lives on the media root.
+    base = os.path.basename(folder.rstrip("\\/"))
+    if base.lower().startswith("gt-"):
+        root = str(Path(folder).parent)
+    store = load_pairs_store(root)
+    _merge_pair_record(
+        store,
+        pair_id,
+        role=role,
+        folder=base,
+        extra={"original_name": original_name, "mate_folder": mate_folder},
+    )
+    save_pairs_store(root, store)
 
 
 def append_pair_index(root: str, *, pair_id: str, folder: str, role: str, file_path: str) -> None:
-    """One-line index so Before/After roots list every pair id."""
+    """Index Before/After pairs in `_pairs/pairs.json` (not the media folder)."""
     if not root:
         return
-    os.makedirs(root, exist_ok=True)
-    index = os.path.join(root, "PAIRS.txt")
-    line = f"{pair_id}\t{role}\t{folder}\t{file_path}\n"
-    try:
-        existing = ""
-        if os.path.isfile(index):
-            existing = Path(index).read_text(encoding="utf-8")
-        if pair_id in existing and os.path.basename(folder) in existing and role in existing:
-            return
-        with open(index, "a", encoding="utf-8") as f:
-            f.write(line)
-    except OSError:
-        pass
+    store = load_pairs_store(root)
+    _merge_pair_record(store, pair_id, role=role, folder=folder, file_path=file_path)
+    save_pairs_store(root, store)
 
 
 def selected_stages(*, do_upscale: bool, do_rife1: bool, do_rife2: bool, do_export: bool) -> List[str]:
@@ -611,50 +769,47 @@ def load_retro_pid_map(*roots: str) -> Dict[str, str]:
     """old GT pair id → remapped 9xxxxxxx id."""
     mapping: Dict[str, str] = {}
     seen = set()
-    candidates = []
     for root in roots:
         if not root:
             continue
-        p = Path(root)
-        candidates.append(p / _RETRO_MAP_NAME)
-        try:
-            candidates.append(p.parent / _RETRO_MAP_NAME)
-        except OSError:
-            pass
-    for c in candidates:
-        key = os.path.normcase(str(c))
-        if key in seen or not c.is_file():
+        key = os.path.normcase(os.path.abspath(root))
+        if key in seen:
             continue
         seen.add(key)
-        try:
-            data = json.loads(c.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        for k, v in data.items():
+        store = load_pairs_store(root)
+        for k, v in (store.get("retro_map") or {}).items():
             old, new = str(k).lower(), str(v).lower()
             if _PAIR_ID_RE.match(old) and _PAIR_ID_RE.match(new):
                 mapping[old] = new
+        try:
+            parent = str(Path(root).parent)
+        except OSError:
+            parent = ""
+        if parent and os.path.normcase(parent) not in seen:
+            seen.add(os.path.normcase(parent))
+            pstore = load_pairs_store(parent)
+            for k, v in (pstore.get("retro_map") or {}).items():
+                old, new = str(k).lower(), str(v).lower()
+                if _PAIR_ID_RE.match(old) and _PAIR_ID_RE.match(new):
+                    mapping.setdefault(old, new)
     return mapping
 
 
 def save_retro_pid_map(mapping: Dict[str, str], *roots: str) -> None:
-    text = json.dumps(mapping, indent=2, sort_keys=True) + "\n"
     written = set()
     for root in roots:
         if not root:
             continue
-        try:
-            os.makedirs(root, exist_ok=True)
-            dest = Path(root) / _RETRO_MAP_NAME
-            key = os.path.normcase(str(dest))
-            if key in written:
-                continue
-            dest.write_text(text, encoding="utf-8")
-            written.add(key)
-        except OSError:
+        key = os.path.normcase(os.path.abspath(root))
+        if key in written:
             continue
+        written.add(key)
+        store = load_pairs_store(root)
+        for k, v in mapping.items():
+            old, new = str(k).lower(), str(v).lower()
+            if _PAIR_ID_RE.match(old) and _PAIR_ID_RE.match(new):
+                store["retro_map"][old] = new
+        save_pairs_store(root, store)
 
 
 def mint_retro_pid(old_id: str, used: set) -> str:
@@ -752,6 +907,8 @@ def build_after_lookup(after_dir: str) -> Dict[str, Any]:
         except OSError:
             continue
         if is_dir:
+            if f.name.lower() in _SKIP_DIR_NAMES:
+                continue
             if f.name.lower().startswith("gt-"):
                 legacy_dirs.append(f)
             continue

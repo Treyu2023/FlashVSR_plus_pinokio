@@ -10,6 +10,8 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-09-14 | **Pair index out of Ready for CIV:** `pair.json` / `PAIR.txt` / `PAIRS.txt` / `PID_RETRO_MAP.json` move into `_pairs\\pairs.json` (one file). Media folder stays videos only. |
+| 2026-09-14 | **Stop After Current:** Click arms a flag immediately (no longer queued behind the job). Pinokio terminal prints a red `STOP ARMED` line at once, then again every 5 status lines until the current file finishes. Group Therapy finishes remaining stages of that file, then pauses. |
 | 2026-09-14 | **No nvidia-smi watt cap from Pinokio:** `-pl` needs admin; Pinokio must not run elevated. Multitask now sets WDDM GPU scheduling (Idle / Below-Normal) in-process. Afterburner still owns watts. Boot: drop Gradio 6 `theme`/`css`/`head` deprecation spam (this Gradio still needs them on `Blocks`); strip `expandable_segments` (unsupported on Windows CUDA). |
 | 2026-09-13 | **GPU cap applies to Group Therapy:** Cap % slider on the GT tab; Start uses live slider (below 100% turns cap on); re-applies each group/file so mid-run slider changes stick; events `queue=False` so the slider works while a group is running. Cap-off no longer resets nvidia-smi to full watts (Afterburner/driver limit left alone). |
 | 2026-09-12 | **Multitask GPU cap:** Settings + GPU-monitor toggle caps 4090 power (default 90%) and Below-Normal CPU; off restores full watts. `app/gpu_headroom.py`. **Group Therapy Start:** After folder indexed once (`get_after_lookup`) so preflight is seconds not minutes. Both are env_guard CRITICAL + markers so Update/Reset reapply cannot drop them. |

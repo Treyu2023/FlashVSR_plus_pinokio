@@ -464,9 +464,24 @@ class FlashVSRWorkQueue:
             self.stop_flag_path.write_text("stop\n", encoding="utf-8")
         except OSError as e:
             return f"⚠️ Could not set stop flag: {e}"
+        extra = ""
+        try:
+            lock = ExclusiveQueueLock(str(self.app_dir))
+            active = lock.active_name()
+            if active and active != self.name:
+                other = (
+                    self.app_dir / "outputs" / f"work_queue_{active}" / "STOP_AFTER_CURRENT.flag"
+                )
+                other.parent.mkdir(parents=True, exist_ok=True)
+                other.write_text("stop\n", encoding="utf-8")
+                extra = f" Also armed running queue ({QUEUE_LABELS.get(active, active)})."
+        except Exception:
+            pass
         return (
-            "⏹ Stop requested — current item will finish, then the queue pauses. "
-            "Click Start / Resume when ready."
+            "⏹ STOP ARMED — finishing this file, then the queue pauses. "
+            "Pinokio log repeats this in red every few lines until it stops. "
+            "Start / Resume when ready."
+            + extra
         )
 
     def clear_stop(self) -> None:

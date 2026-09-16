@@ -319,16 +319,11 @@ TIPS = {
     "ui_font_size": "Base text size in pixels. Path boxes and monitors scale with this.",
     "ui_scale": "Zoom the whole UI (80–150%). Use this if controls feel cramped. Paths still wrap to show the full string.",
     "gpu_multitask": (
-        "Multitask GPU headroom — ON lowers FlashVSR's Windows GPU scheduling "
-        "(Idle / Below-Normal) so the desktop and Chrome can preempt it. "
-        "Pinokio is not admin, so this cannot change Afterburner watts (nvidia-smi -pl is blocked). "
-        "OFF = Normal GPU scheduling (faster jobs, desktop may hitch). Applies immediately."
+        "Retired. FlashVSR always uses Normal GPU/CPU scheduling. "
+        "Idle / Below-Normal / watt-cap are off and cannot be turned back on."
     ),
     "gpu_cap_pct": (
-        "How aggressive GPU scheduling is while Multitask is ON. "
-        "70–85% = Idle (smoothest desktop). 90% = Below-Normal. 100% = off. "
-        "Does not change board watts — Afterburner still owns the power limit. "
-        "Moving this slider below 100% turns headroom on. Applies to Video / Image / Toolbox / Group Therapy."
+        "Retired. Cap % is ignored. GPU scheduling is always Normal (100%)."
     ),
     "naming_mode": (
         "Legacy setting (kept for compatibility). Real names are now 2-step:\n"
@@ -827,7 +822,7 @@ def get_ui_defaults(config=None):
         "ui_font_size": (14, int),
         "ui_scale": (100, int),
         "gpu_multitask": (False, bool),
-        "gpu_cap_pct": (90, int),
+        "gpu_cap_pct": (100, int),
     }
     defaults = {}
     for key, (fallback, typ) in specs.items():
@@ -987,35 +982,26 @@ def save_config(config):
 
 
 def apply_saved_gpu_headroom(enabled=None, pct=None, *, log_msg=True) -> str:
-    """Persist + apply multitask GPU headroom. Call from the toggle and before jobs.
+    """Always Normal GPU/CPU scheduling. Cap/Idle retired — args ignored.
 
-    Pass live UI values so Group Therapy / queues do not depend on a stale
-    webui_config write. log_msg=False for per-file reapply (avoids log spam).
+    log_msg=False for per-file reapply (avoids log spam). GPU scheduling retired.
     """
-    cfg = load_config()
-    if enabled is None:
-        raw = cfg.get("gpu_multitask", False)
-        enabled = raw if isinstance(raw, bool) else str(raw).lower() == "true"
-    if pct is None:
-        try:
-            pct = int(float(cfg.get("gpu_cap_pct") or 90))
-        except (TypeError, ValueError):
-            pct = 90
-    try:
-        pct = int(float(pct))
-    except (TypeError, ValueError):
-        pct = 90
-    pct = max(70, min(100, pct))
-    cfg["gpu_multitask"] = bool(enabled)
-    cfg["gpu_cap_pct"] = pct
-    # apply_from_config also seeds remembered full-watts from gpu_full_power_w
-    # so a later cap is % of 463 W, not % of an already-capped reading.
-    msg = gpu_headroom.apply_from_config(cfg)
-    full = gpu_headroom.full_power_w()
-    if full:
-        cfg["gpu_full_power_w"] = round(float(full), 2)
-    save_config(cfg)
+    msg = gpu_headroom.restore_full()
     if log_msg:
+        cfg = load_config()
+        dirty = False
+        if cfg.get("gpu_multitask"):
+            cfg["gpu_multitask"] = False
+            dirty = True
+        try:
+            cap = int(float(cfg.get("gpu_cap_pct") or 100))
+        except (TypeError, ValueError):
+            cap = 100
+        if cap != 100:
+            cfg["gpu_cap_pct"] = 100
+            dirty = True
+        if dirty:
+            save_config(cfg)
         log(msg, message_type="info")
     return msg
 
@@ -1368,6 +1354,34 @@ def create_feather_mask(size, overlap):
     mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp.view(1, 1, -1, 1))
     mask[:, :, -overlap:, :] = torch.minimum(mask[:, :, -overlap:, :], ramp.flip(0).view(1, 1, -1, 1))
     return mask
+
+
+def alloc_stitch_canvases(num_frames, height, width, channels):
+    """CPU stitch buffers that fit in 64GB RAM.
+
+    Old path allocated two float32 RGB videos (~48GB at 4K-safe) and forced paging.
+    float16 color + 1-channel float16 weights is ~1/3 the RAM.
+    """
+    canvas = torch.zeros((num_frames, height, width, channels), dtype=torch.float16)
+    weights = torch.zeros((num_frames, height, width, 1), dtype=torch.float16)
+    return canvas, weights, int(canvas.nbytes + weights.nbytes)
+
+
+def blend_tile_into_canvas(canvas, weights, tile_cpu, mask_nchw, y1, y2, x1, x2):
+    mask = mask_nchw.permute(0, 2, 3, 1).to(dtype=torch.float16)
+    canvas[:, y1:y2, x1:x2, :] += tile_cpu.to(dtype=torch.float16) * mask
+    weights[:, y1:y2, x1:x2, :] += mask
+
+
+def finalize_stitch_canvas(canvas, weights):
+    n = canvas.shape[0]
+    out = torch.empty(canvas.shape, dtype=torch.float32)
+    step = 8
+    for i in range(0, n, step):
+        sl = slice(i, min(i + step, n))
+        w = weights[sl].to(torch.float32).clamp_(min=1e-4)
+        out[sl] = canvas[sl].to(torch.float32) / w
+    return out
 
 def stitch_video_tiles(
     tile_paths,
@@ -1983,8 +1997,13 @@ def run_flashvsr_single(
                     num_aligned_frames = N
                     expected_H = max(128, round(H * scale / 128) * 128) + 128
                     expected_W = max(128, round(W * scale / 128) * 128) + 128
-                    final_output_canvas = torch.zeros((num_aligned_frames, expected_H, expected_W, C), dtype=torch.float32)
-                    weight_sum_canvas = torch.zeros((num_aligned_frames, expected_H, expected_W, C), dtype=torch.float32)
+                    final_output_canvas, weight_sum_canvas, canvas_bytes = alloc_stitch_canvases(
+                        num_aligned_frames, expected_H, expected_W, C
+                    )
+                    busy(
+                        f"stitch canvas {num_aligned_frames}×{expected_W}×{expected_H} "
+                        f"float16 ({canvas_bytes / (1024**3):.1f} GB) — GPU scheduling retired"
+                    )
 
                     for i in tqdm(range(num_tiles), desc="[FlashVSR] Processing tiles"):
                         tile_progress = 0.1 + (i / num_tiles) * 0.75
@@ -2022,14 +2041,15 @@ def run_flashvsr_single(
                         tile_w_actual = x2_s - x1_s
                         tile_h_actual = y2_s - y1_s
                         processed_tile_cpu = processed_tile_cpu[:, :tile_h_actual, :tile_w_actual, :]
-                        mask = create_feather_mask((tile_h_actual, tile_w_actual), tile_overlap * scale).cpu().permute(0, 2, 3, 1)
-                        final_output_canvas[:, y1_s:y2_s, x1_s:x2_s, :] += processed_tile_cpu * mask
-                        weight_sum_canvas[:, y1_s:y2_s, x1_s:x2_s, :] += mask
+                        mask = create_feather_mask((tile_h_actual, tile_w_actual), tile_overlap * scale).cpu()
+                        blend_tile_into_canvas(
+                            final_output_canvas, weight_sum_canvas,
+                            processed_tile_cpu, mask, y1_s, y2_s, x1_s, x2_s,
+                        )
                         del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile, mask
                         clean_vram()
 
-                    weight_sum_canvas[weight_sum_canvas == 0] = 1.0
-                    final_output_tensor = final_output_canvas / weight_sum_canvas
+                    final_output_tensor = finalize_stitch_canvas(final_output_canvas, weight_sum_canvas)
                     final_output_tensor = crop_to_scaled_dimensions(final_output_tensor, H, W, scale)
                     del final_output_canvas, weight_sum_canvas
             else:  # Non-tiled mode
@@ -3620,8 +3640,6 @@ def _run_group_therapy_body(
                     wq.set_item_status(path, "failed", error=f"no input for {stage}")
                     failed += 1
                     continue
-                # Re-read config so a mid-run Cap % change applies to this file
-                # (RIFE/export stages never went through run_flashvsr_single).
                 apply_saved_gpu_headroom(log_msg=False)
 
                 progress(
@@ -7636,30 +7654,20 @@ def create_ui():
                                     label="Group size",
                                     info=TIPS["gt_group_size"],
                                 )
-                                gr.Markdown(
-                                    "GPU headroom for this group run (same control as Video / Settings). "
-                                    "Lowers FlashVSR GPU scheduling so Windows stays usable. "
-                                    "Does **not** change Afterburner watts (Pinokio is not admin). "
-                                    "Moving the slider below 100% turns headroom **on**."
+                                gpu_multitask_g = gr.Checkbox(
+                                    label="Multitask GPU headroom",
+                                    value=False,
+                                    visible=False,
                                 )
-                                with gr.Row():
-                                    gpu_multitask_g = gr.Checkbox(
-                                        label="Multitask GPU headroom",
-                                        value=bool(ui.get("gpu_multitask", False)),
-                                        info=TIPS["gpu_multitask"],
-                                        scale=2,
-                                    )
-                                    gpu_cap_pct_g = gr.Slider(
-                                        minimum=70,
-                                        maximum=100,
-                                        step=5,
-                                        value=int(ui.get("gpu_cap_pct") or 90),
-                                        label="Headroom (GPU scheduling)",
-                                        info=TIPS["gpu_cap_pct"],
-                                        scale=2,
-                                    )
+                                gpu_cap_pct_g = gr.Slider(
+                                    minimum=70,
+                                    maximum=100,
+                                    step=5,
+                                    value=100,
+                                    visible=False,
+                                )
                                 gpu_cap_status_g = gr.Textbox(
-                                    label="GPU headroom",
+                                    label="GPU scheduling",
                                     value=gpu_headroom.status_line(),
                                     interactive=False,
                                     lines=1,
@@ -7887,24 +7895,20 @@ def create_ui():
                                     show_label=False,
                                     elem_classes="monitor-box cpu-monitor"
                                 )
-                        with gr.Row():
-                            gpu_multitask = gr.Checkbox(
-                                label="Multitask GPU headroom",
-                                value=bool(ui.get("gpu_multitask", False)),
-                                info=TIPS["gpu_multitask"],
-                                scale=2,
-                            )
-                            gpu_cap_pct = gr.Slider(
-                                minimum=70,
-                                maximum=100,
-                                step=5,
-                                value=int(ui.get("gpu_cap_pct") or 90),
-                                label="Headroom",
-                                info=TIPS["gpu_cap_pct"],
-                                scale=2,
-                            )
+                        gpu_multitask = gr.Checkbox(
+                            label="Multitask GPU headroom",
+                            value=False,
+                            visible=False,
+                        )
+                        gpu_cap_pct = gr.Slider(
+                            minimum=70,
+                            maximum=100,
+                            step=5,
+                            value=100,
+                            visible=False,
+                        )
                         gpu_cap_status = gr.Textbox(
-                            label="GPU headroom",
+                            label="GPU scheduling",
                             value=gpu_headroom.status_line(),
                             interactive=False,
                             lines=2,
@@ -9182,12 +9186,6 @@ def create_ui():
             gpu_on, gpu_pct,
         ):
             do_rife1, do_rife2 = _gt_rife_flags(rife_mode)
-            try:
-                gpu_pct_i = int(float(gpu_pct))
-            except (TypeError, ValueError):
-                gpu_pct_i = 90
-            if gpu_pct_i < 100:
-                gpu_on = True
             last_video, queue_html = run_group_therapy(
                 mode, model_version, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap,
                 unload_dit, dtype_str, seed, device, fps_override, quality, attention_mode,
@@ -9198,8 +9196,8 @@ def create_ui():
                 export_quality=export_quality,
                 export_max_width=export_max_width,
                 rife_streaming=rife_streaming,
-                gpu_enabled=gpu_on,
-                gpu_pct=gpu_pct_i,
+                gpu_enabled=False,
+                gpu_pct=100,
             )
             return last_video, last_video, None, queue_html, queue_html
 
@@ -10169,31 +10167,25 @@ def create_ui():
                     label="Appearance status", interactive=False, show_label=False, scale=2
                 )
 
-            gr.Markdown("### GPU headroom (multitask)")
+            gr.Markdown("### GPU scheduling")
             gr.Markdown(
-                "Lower FlashVSR's Windows GPU scheduling while you browse. "
-                "**Off** = Normal scheduling for faster queues. "
-                "Does not change Afterburner watts — Pinokio is not admin. "
-                "Same control as the checkbox under the GPU monitor."
+                "**Always Normal.** Multitask Idle / Below-Normal / watt-cap are retired. "
+                "FlashVSR no longer under-schedules the 4090."
             )
-            with gr.Row():
-                gpu_multitask_s = gr.Checkbox(
-                    label="Multitask GPU headroom",
-                    value=bool(ui.get("gpu_multitask", False)),
-                    info=TIPS["gpu_multitask"],
-                    scale=2,
-                )
-                gpu_cap_pct_s = gr.Slider(
-                    minimum=70,
-                    maximum=100,
-                    step=5,
-                    value=int(ui.get("gpu_cap_pct") or 90),
-                    label="Headroom (GPU scheduling)",
-                    info=TIPS["gpu_cap_pct"],
-                    scale=2,
-                )
+            gpu_multitask_s = gr.Checkbox(
+                label="Multitask GPU headroom",
+                value=False,
+                visible=False,
+            )
+            gpu_cap_pct_s = gr.Slider(
+                minimum=70,
+                maximum=100,
+                step=5,
+                value=100,
+                visible=False,
+            )
             gpu_cap_status_s = gr.Textbox(
-                label="GPU headroom",
+                label="GPU scheduling",
                 value=gpu_headroom.status_line(),
                 interactive=False,
                 lines=2,
@@ -10337,16 +10329,11 @@ def create_ui():
         )
 
         def _gpu_cap_result(enabled, pct, msg):
-            enabled = bool(enabled)
-            try:
-                pct = int(float(pct))
-            except (TypeError, ValueError):
-                pct = 90
-            pct = max(70, min(100, pct))
+            msg = gpu_headroom.restore_full()
             return (
-                enabled, pct, msg,
-                enabled, pct, msg,
-                enabled, pct, msg,
+                False, 100, msg,
+                False, 100, msg,
+                False, 100, msg,
             )
 
         _gpu_cap_outs = [
@@ -10358,31 +10345,16 @@ def create_ui():
 
         def _on_gpu_toggle(enabled, pct):
             if _gpu_cap_busy["on"]:
-                return _gpu_cap_result(enabled, pct, gpu_headroom.status_line())
+                return _gpu_cap_result(False, 100, gpu_headroom.status_line())
             _gpu_cap_busy["on"] = True
             try:
-                msg = apply_saved_gpu_headroom(enabled, pct)
-                return _gpu_cap_result(enabled, pct, msg)
+                msg = apply_saved_gpu_headroom(False, 100)
+                return _gpu_cap_result(False, 100, msg)
             finally:
                 _gpu_cap_busy["on"] = False
 
         def _on_gpu_slider(enabled, pct):
-            # Below 100% turns headroom on so Group Therapy cannot start with
-            # 80% on screen and the checkbox still off.
-            try:
-                pct_i = int(float(pct))
-            except (TypeError, ValueError):
-                pct_i = 90
-            pct_i = max(70, min(100, pct_i))
-            enabled_i = pct_i < 100
-            if _gpu_cap_busy["on"]:
-                return _gpu_cap_result(enabled_i, pct_i, gpu_headroom.status_line())
-            _gpu_cap_busy["on"] = True
-            try:
-                msg = apply_saved_gpu_headroom(enabled_i, pct_i)
-                return _gpu_cap_result(enabled_i, pct_i, msg)
-            finally:
-                _gpu_cap_busy["on"] = False
+            return _on_gpu_toggle(False, 100)
 
         _gpu_cap_event = dict(show_progress="hidden", queue=False)
         for _box, _slider in (

@@ -332,6 +332,23 @@ def create_feather_mask(size, overlap):
     
     return mask
 
+
+def alloc_stitch_canvases(num_frames, height, width, channels):
+    canvas = torch.zeros((num_frames, height, width, channels), dtype=torch.float16)
+    weights = torch.zeros((num_frames, height, width, 1), dtype=torch.float16)
+    return canvas, weights
+
+
+def finalize_stitch_canvas(canvas, weights):
+    n = canvas.shape[0]
+    out = torch.empty(canvas.shape, dtype=torch.float32)
+    step = 8
+    for i in range(0, n, step):
+        sl = slice(i, min(i + step, n))
+        w = weights[sl].to(torch.float32).clamp_(min=1e-4)
+        out[sl] = canvas[sl].to(torch.float32) / w
+    return out
+
 def stitch_video_tiles(
     tile_paths, 
     tile_coords, 
@@ -512,12 +529,9 @@ def main(input, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_ov
             local_temp = os.path.join(temp, str(uuid.uuid4()))
             os.makedirs(local_temp, exist_ok=True)
         else:
-            final_output_canvas = torch.zeros(
-                (num_aligned_frames, H * scale, W * scale, C), 
-                dtype=torch.float32, 
-                device="cpu"
+            final_output_canvas, weight_sum_canvas = alloc_stitch_canvases(
+                num_aligned_frames, H * scale, W * scale, C
             )
-            weight_sum_canvas = torch.zeros_like(final_output_canvas)
             
         tile_coords = calculate_tile_coords(H, W, tile_size, tile_overlap)
         latent_tiles_cpu = []
@@ -560,14 +574,14 @@ def main(input, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_ov
                 (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
                 tile_overlap * scale
             ).to("cpu")
-            mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
+            mask_nhwc = mask_nchw.permute(0, 2, 3, 1).to(dtype=torch.float16)
             out_x1, out_y1 = x1 * scale, y1 * scale
             
             tile_H_scaled = processed_tile_cpu.shape[1]
             tile_W_scaled = processed_tile_cpu.shape[2]
             out_x2, out_y2 = out_x1 + tile_W_scaled, out_y1 + tile_H_scaled
-            final_output_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += processed_tile_cpu * mask_nhwc
-            weight_sum_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += mask_nhwc
+            final_output_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += processed_tile_cpu.to(dtype=torch.float16) * mask_nhwc
+            weight_sum_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += mask_nhwc[:, :, :, :1]
             
             del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile
             clean_vram()
@@ -578,8 +592,8 @@ def main(input, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_ov
             )
             shutil.rmtree(local_temp)
         else:
-            weight_sum_canvas[weight_sum_canvas == 0] = 1.0
-            final_output = final_output_canvas / weight_sum_canvas
+            final_output = finalize_stitch_canvas(final_output_canvas, weight_sum_canvas)
+            del final_output_canvas, weight_sum_canvas
     else:
         if mode == "tiny-long":
             th, tw, F = get_input_params(frames, scale=scale)

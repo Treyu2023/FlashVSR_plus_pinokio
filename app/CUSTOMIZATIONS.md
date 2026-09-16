@@ -1,6 +1,6 @@
 # FlashVSR+ Pinokio — Custom Configuration & Code Changes
 
-**Last updated:** 2026-09-14  
+**Last updated:** 2026-09-16  
 **Install path:** `C:\pinokio\api\FlashVSR_plus_pinokio.git\app`  
 **Purpose:** Persistent record of customizations applied outside stock FlashVSR (survives app rollback/reinstall). Re-apply or merge these after updating the Pinokio launcher.
 
@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-09-16 | **No GPU cap / Idle under-schedule:** Multitask headroom retired. Always Normal GPU+CPU scheduling (Idle / Below-Normal / nvidia-smi -pl never applied). UI toggles hidden and ignored. **Tiled-DiT stitch canvas** is float16 color + 1-channel weights (~16GB at 4K-safe instead of ~48GB float32×2) so 64GB RAM no longer pages. |
 | 2026-09-14 | **Pair index out of Ready for CIV:** `pair.json` / `PAIR.txt` / `PAIRS.txt` / `PID_RETRO_MAP.json` move into `_pairs\\pairs.json` (one file). Media folder stays videos only. |
 | 2026-09-14 | **Stop After Current:** Click arms a flag immediately (no longer queued behind the job). Pinokio terminal prints a red `STOP ARMED` line at once, then again every 5 status lines until the current file finishes. Group Therapy finishes remaining stages of that file, then pauses. |
 | 2026-09-14 | **No nvidia-smi watt cap from Pinokio:** `-pl` needs admin; Pinokio must not run elevated. Multitask now sets WDDM GPU scheduling (Idle / Below-Normal) in-process. Afterburner still owns watts. Boot: drop Gradio 6 `theme`/`css`/`head` deprecation spam (this Gradio still needs them on `Blocks`); strip `expandable_segments` (unsupported on Windows CUDA). |
@@ -54,7 +55,8 @@
 | `webui_config` | **Created** — user defaults (pipeline folders + Group Therapy) |
 | `grok_id_index.py` | **Created** — Grok unique-ID catalog + ±2.5% original-size duplicate screen |
 | `naming_utils.py` | **Created** — output filename conventions |
-| `webui.py` | **Modified** — config, paths, Group Therapy, hygiene, 4K-safe, PID pairing; skip-reason logs; path_textbox + UI font/zoom; busy heartbeats |
+| `webui.py` | **Modified** — config, paths, Group Therapy, hygiene, 4K-safe, PID pairing; skip-reason logs; path_textbox + UI font/zoom; busy heartbeats; float16 stitch canvases; GPU cap retired |
+| `gpu_headroom.py` | **Modified** — always Normal GPU/CPU scheduling (Idle / watt-cap retired) |
 | `src/busy_heartbeat.py` | **Created** — newline tqdm snapshots + 12s still-busy watchdog for Pinokio logs |
 | `group_therapy.py` | **Created** — grouped pipeline + flat `_PID_` pairing; unstarted groups packed newest→oldest |
 | `flashvsr_work_queue.py` | **Modified** — size-dedupe, Group Therapy status, skip already-upscaled, AddResult skip reasons |

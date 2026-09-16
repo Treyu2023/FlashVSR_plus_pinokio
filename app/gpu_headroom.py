@@ -1,33 +1,28 @@
-"""Leave GPU time for the desktop while FlashVSR runs.
+"""FlashVSR always runs at Normal GPU/CPU scheduling.
 
-Pinokio is not admin, so nvidia-smi -pl cannot change the 4090 watt limit
-from this process (Insufficient Permissions). Afterburner / NVIDIA App keep
-owning board watts — this module never launches them and never calls -pl.
+Multitask Idle / Below-Normal WDDM class, CPU Below-Normal, and any
+nvidia-smi watt-cap attempts are retired. Pinokio is not admin, so -pl
+never worked from this process anyway.
 
-Multitask ON lowers this process's WDDM GPU scheduling class (Idle or
-Below-Normal) so DWM/Chrome can preempt FlashVSR. Cap % picks how
-aggressive that class is. CPU Below-Normal is a small extra.
+This module only restores Normal so old webui_config / UI state cannot
+throttle jobs. GPU scheduling retired — always Normal.
 """
 from __future__ import annotations
 
 import atexit
 import os
 import subprocess
-from typing import Any, Dict, Optional
+import sys
+from typing import Any, Dict, List, Optional
 
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 _FULL_W: Optional[float] = None
-_APPLIED = False
 _ATEXIT = False
 
-# Windows process CPU priority
 _NORMAL_CPU = 0x00000020
-_BELOW_NORMAL_CPU = 0x00004000
-
-# D3DKMT_SCHEDULINGPRIORITYCLASS
-_GPU_IDLE = 0
-_GPU_BELOW_NORMAL = 1
 _GPU_NORMAL = 2
+_PROCESS_SET_INFORMATION = 0x0200
+_PROCESS_QUERY_LIMITED = 0x1000
 
 
 def _smi(*args: str, timeout: float = 8.0) -> subprocess.CompletedProcess:
@@ -56,22 +51,17 @@ def query_power() -> Dict[str, float]:
     return {"current": cur, "default": default, "min": lo, "max": hi}
 
 
-def _set_priority(below_normal: bool) -> None:
+def _set_priority_handle(handle, below_normal: bool = False) -> None:
     if os.name != "nt":
         return
     try:
         import ctypes
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        kernel32.SetPriorityClass(
-            kernel32.GetCurrentProcess(),
-            _BELOW_NORMAL_CPU if below_normal else _NORMAL_CPU,
-        )
+        ctypes.windll.kernel32.SetPriorityClass(handle, _NORMAL_CPU)
     except Exception:
         pass
 
 
-def _set_gpu_sched(cls: int) -> bool:
-    """Set this process's WDDM GPU scheduling class. Works without admin."""
+def _set_gpu_sched_handle(handle, cls: int) -> bool:
     if os.name != "nt":
         return False
     try:
@@ -82,9 +72,31 @@ def _set_gpu_sched(cls: int) -> bool:
         fn = gdi32.D3DKMTSetProcessSchedulingPriorityClass
         fn.restype = ctypes.c_long
         fn.argtypes = [wintypes.HANDLE, ctypes.c_int]
-        kernel32 = ctypes.WinDLL("kernel32")
-        rc = fn(kernel32.GetCurrentProcess(), int(cls))
+        rc = fn(handle, int(cls))
         return rc == 0
+    except Exception:
+        return False
+
+
+def _set_priority(below_normal: bool = False) -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        _set_priority_handle(kernel32.GetCurrentProcess(), False)
+    except Exception:
+        pass
+
+
+def _set_gpu_sched(cls: int) -> bool:
+    """Set this process's WDDM GPU scheduling class. Works without admin."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32")
+        return _set_gpu_sched_handle(kernel32.GetCurrentProcess(), cls)
     except Exception:
         return False
 
@@ -109,26 +121,9 @@ def _get_gpu_sched() -> Optional[int]:
 
 
 def _gpu_class_name(cls: Optional[int]) -> str:
-    return {
-        _GPU_IDLE: "Idle",
-        _GPU_BELOW_NORMAL: "Below-Normal",
-        _GPU_NORMAL: "Normal",
-    }.get(cls if cls is not None else _GPU_NORMAL, f"class {cls}")
-
-
-def _class_for_pct(pct: float) -> int:
-    if pct >= 88:
-        return _GPU_BELOW_NORMAL
-    return _GPU_IDLE
-
-
-def _remember_full_w(info: Optional[Dict[str, float]] = None) -> float:
-    global _FULL_W
-    if _FULL_W and _FULL_W > 0:
-        return _FULL_W
-    info = info or query_power()
-    _FULL_W = max(float(info["current"]), float(info["default"]))
-    return _FULL_W
+    return {0: "Idle", 1: "Below-Normal", 2: "Normal"}.get(
+        cls if cls is not None else _GPU_NORMAL, f"class {cls}"
+    )
 
 
 def _install_atexit() -> None:
@@ -140,96 +135,122 @@ def _install_atexit() -> None:
 
 
 def restore_full() -> str:
-    """Undo GPU scheduling this process applied. Never touches nvidia-smi watts."""
-    global _APPLIED
+    """Undo any GPU/CPU scheduling this process applied. Never touches watts."""
+    _install_atexit()
     _set_priority(False)
     _set_gpu_sched(_GPU_NORMAL)
-    _APPLIED = False
     try:
         info = query_power()
         return (
-            f"GPU scheduling Normal. "
+            "GPU scheduling retired — always Normal. "
             f"Board watts {info['current']:.0f} W "
             f"(Afterburner/driver limit left as-is)."
         )
     except Exception as e:
-        return f"GPU scheduling Normal. Watts unread ({e})."
+        return f"GPU scheduling retired — always Normal. Watts unread ({e})."
 
 
-def apply_gpu_headroom(enabled: bool, pct: float = 90) -> str:
-    """
-    enabled=True  → WDDM GPU Idle/Below-Normal + Below-Normal CPU.
-    enabled=False → GPU/CPU Normal. Does not change board watts.
-    """
-    global _APPLIED
-    _install_atexit()
+def restore_pid(pid: int) -> str:
+    """Force Normal GPU + CPU scheduling on another process (live FlashVSR)."""
+    if os.name != "nt":
+        return f"pid {pid}: not Windows"
     try:
-        pct = float(pct)
-    except (TypeError, ValueError):
-        pct = 90.0
-    pct = max(70.0, min(100.0, pct))
-    if not enabled or pct >= 99.5:
-        return restore_full()
-    gpu_cls = _class_for_pct(pct)
-    gpu_ok = _set_gpu_sched(gpu_cls)
-    _set_priority(True)
-    _APPLIED = True
-    try:
-        info = query_power()
-        full = _remember_full_w(info)
-        watts = (
-            f"Board watts {info['current']:.0f} W "
-            f"(Afterburner/driver — Pinokio is not admin so nvidia-smi cannot cap watts)."
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        handle = kernel32.OpenProcess(
+            _PROCESS_SET_INFORMATION | _PROCESS_QUERY_LIMITED, False, int(pid)
         )
-    except Exception:
-        watts = "Board watts unread (Afterburner/driver still own the watt limit)."
-        full = _FULL_W
-    if not gpu_ok:
+        if not handle:
+            return f"pid {pid}: OpenProcess failed ({ctypes.GetLastError()})"
+        try:
+            gpu_ok = _set_gpu_sched_handle(handle, _GPU_NORMAL)
+            _set_priority_handle(handle, False)
+        finally:
+            kernel32.CloseHandle(handle)
         return (
-            f"Multitask: could not set GPU scheduling. {watts} "
-            f"CPU Below-Normal only."
+            f"pid {pid}: GPU scheduling Normal, CPU Normal"
+            + ("" if gpu_ok else " (GPU class call failed)")
         )
-    return (
-        f"Multitask ON: GPU scheduling {_gpu_class_name(gpu_cls)} "
-        f"({pct:.0f}% → desktop headroom). {watts}"
-        + (f" Full-speed reference {full:.0f} W." if full else "")
-    )
+    except Exception as e:
+        return f"pid {pid}: {e}"
+
+
+def flashvsr_pids() -> List[int]:
+    """Python processes whose command line is the Pinokio FlashVSR app."""
+    pids: List[int] = []
+    if os.name != "nt":
+        return pids
+    try:
+        r = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+                    "Where-Object { $_.CommandLine -match 'FlashVSR' } | "
+                    "Select-Object -ExpandProperty ProcessId"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+        for line in (r.stdout or "").splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+    except Exception:
+        pass
+    return pids
+
+
+def restore_flashvsr_processes() -> str:
+    pids = flashvsr_pids()
+    if not pids:
+        return restore_full()
+    lines = [restore_pid(p) for p in pids]
+    lines.append(restore_full())
+    return " | ".join(lines)
+
+
+def apply_gpu_headroom(enabled: bool = False, pct: float = 100) -> str:
+    """Cap/Idle path retired. enabled/pct ignored — always Normal."""
+    return restore_full()
 
 
 def apply_from_config(cfg: Optional[Dict[str, Any]] = None) -> str:
-    """Re-apply whatever webui_config currently says."""
-    enabled = False
-    pct = 90.0
-    if cfg:
-        raw = cfg.get("gpu_multitask", False)
-        enabled = raw if isinstance(raw, bool) else str(raw).lower() == "true"
-        try:
-            pct = float(cfg.get("gpu_cap_pct") or 90)
-        except (TypeError, ValueError):
-            pct = 90.0
-        saved = cfg.get("gpu_full_power_w")
-        try:
-            if saved:
-                global _FULL_W
-                _FULL_W = float(saved)
-        except (TypeError, ValueError):
-            pass
-    return apply_gpu_headroom(enabled, pct)
+    """Ignore gpu_multitask / gpu_cap_pct. Always Normal."""
+    return restore_full()
 
 
 def full_power_w() -> Optional[float]:
+    global _FULL_W
+    if _FULL_W and _FULL_W > 0:
+        return _FULL_W
+    try:
+        info = query_power()
+        _FULL_W = max(float(info["current"]), float(info["default"]))
+    except Exception:
+        pass
     return _FULL_W
 
 
 def status_line() -> str:
     try:
         info = query_power()
-        full = _FULL_W or max(info["current"], info["default"])
-        gpu = _gpu_class_name(_get_gpu_sched())
         return (
-            f"GPU sched {gpu}. Board {info['current']:.0f} W "
-            f"(full {full:.0f} W, Afterburner/driver — no nvidia-smi watt cap from Pinokio)"
+            f"GPU scheduling retired — always Normal. "
+            f"Board {info['current']:.0f} W (Afterburner/driver — no watt cap from Pinokio)"
         )
     except Exception as e:
-        gpu = _gpu_class_name(_get_gpu_sched())
-        return f"GPU sched {gpu}. Watts unread ({e})"
+        return f"GPU scheduling retired — always Normal. Watts unread ({e})"
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] in ("--pid", "pid"):
+        print(restore_pid(int(sys.argv[2])))
+    else:
+        print(restore_flashvsr_processes())

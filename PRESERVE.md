@@ -48,7 +48,7 @@ Reapply **never** copies a stale snapshot that lacks current markers (e.g. `with
 
 Critical files in each snapshot: `webui.py`, `gpu_headroom.py`, `group_therapy.py`, `flashvsr_work_queue.py`, toolbox modules, `webui_config`, launcher `*.js`, `requirements.txt`, etc.
 
-Verified 2026-09-12: live + `local-preserve/latest` + `mine/main` all carry Group Therapy After-index (`get_after_lookup`) and Multitask GPU cap (`gpu_headroom.py` / `apply_saved_gpu_headroom`). Stale Aug snapshots fail those markers and are skipped.
+Verified 2026-09-16: live + `local-preserve/latest` carry Group Therapy After-index (`get_after_lookup`), retired GPU scheduling (`GPU scheduling retired` / always Normal), and `alloc_stitch_canvases`. Stale snapshots that still apply Idle/Below-Normal fail those markers and are skipped.
 
 ## Manual commands
 

@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-09-16 | **Quality-neutral speed defaults:** tile **320**/32 (fewer 4K-safe tiles; same model; OOM auto-drops 192→128), toolbox export **medium** (same CRF as slow; NVENC still p6), TF32 + cuDNN benchmark on Ada. Sparse 1.0 / quality 10 / RIFE 4× / color-fix unchanged. |
 | 2026-09-16 | **No GPU cap / Idle under-schedule:** Multitask headroom retired. Always Normal GPU+CPU scheduling (Idle / Below-Normal / nvidia-smi -pl never applied). UI toggles hidden and ignored. **Tiled-DiT stitch canvas** is float16 color + 1-channel weights (~16GB at 4K-safe instead of ~48GB float32×2) so 64GB RAM no longer pages. |
 | 2026-09-14 | **Pair index out of Ready for CIV:** `pair.json` / `PAIR.txt` / `PAIRS.txt` / `PID_RETRO_MAP.json` move into `_pairs\\pairs.json` (one file). Media folder stays videos only. |
 | 2026-09-14 | **Stop After Current:** Click arms a flag immediately (no longer queued behind the job). Pinokio terminal prints a red `STOP ARMED` line at once, then again every 5 status lines until the current file finishes. Group Therapy finishes remaining stages of that file, then pauses. |
@@ -70,22 +71,24 @@
 ## `webui_config` (current values)
 
 ```ini
-# Clarity profile — see Changelog 2026-08-11
+# Speed + clarity — see Changelog 2026-09-16
 batch_resize_preset=4K-safe (auto)
-tile_size=256
-tile_overlap=48
-quality=9
-sparse_ratio=1.2
-chunk_duration=10
+tile_size=320
+tile_overlap=32
+quality=10
+sparse_ratio=1.0
+chunk_duration=10.25
 enable_chunks=True
 tiled_dit=True
 tiled_vae=True
 unload_dit=True
 scale=4
 mode=tiny
-tb_frames_quality=98
-tb_export_quality=96
-tb_export_preset=slow
+tb_frames_quality=100
+tb_export_quality=100
+tb_export_preset=medium
+gpu_multitask=False
+gpu_cap_pct=100
 ```
 
 **RTX 4090 clarity notes:** Prefer **1024px input + tile 256** over **768px + tile 320**. Soft “lost quality” was from pre-downscale discarding pixels the model never sees. If OOM: drop resize to 768px (keep tile 256) or Restart FlashVSR after a hard OOM (VRAM can stick at 0 free).
@@ -229,9 +232,11 @@ Key symbols that must exist (reapply uses these as markers):
 After restart, verify in UI if anything did not load:
 
 - Upscale **4×**, chunks **on** @ **10.25s**
-- Tiled DiT/VAE **on**, unload DiT **on**, tile **256** / overlap **32**
-- Advanced: sage, bf16, **cuda:0**, quality **8**
-- Batch tab resize preset **512px** (also applies to Single Video via config)
+- Tiled DiT/VAE **on**, unload DiT **on**, tile **320** / overlap **32**
+- Advanced: sage, bf16, **cuda:0**, quality **10**, sparse **1.0**
+- Batch tab resize preset **4K-safe (auto)**
+- GPU scheduling **Normal** (no multitask/Idle cap)
+- Toolbox/GT export **medium** (NVENC p6 when available)
 
 ---
 

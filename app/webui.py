@@ -36,6 +36,20 @@ import json
 import math
 import uuid
 import torch
+
+def _enable_fast_gpu_math() -> None:
+    """Quality-neutral Ada speedups: TF32 for leftover fp32 ops, cuDNN autotune for repeated tile shapes."""
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+
+_enable_fast_gpu_math()
 import shutil
 import imageio
 import ffmpeg
@@ -179,8 +193,9 @@ TIPS = {
         "turning off is only for short tiny-mode tests."
     ),
     "tile_size": (
-        "Tile Size — default 256. Larger tiles = fewer seams / more VRAM. "
-        "Must keep overlap < half of tile size (256 → overlap ≤128)."
+        "Tile Size — default 320 on 4K-safe. Larger tiles = fewer passes (faster) and fewer seams. "
+        "Same model, no quality drop. Overlap must stay < half of tile size. "
+        "If VRAM OOMs, the run auto-drops to 192 then 128."
     ),
     "tile_overlap": (
         "Tile Overlap — default 32. Softens tile seams. Must stay < half of tile size."
@@ -744,7 +759,7 @@ def get_ui_defaults(config=None):
         "tiled_dit": (True, bool),
         "tiled_vae": (True, bool),
         "unload_dit": (True, bool),
-        "tile_size": (256, int),
+        "tile_size": (320, int),
         "tile_overlap": (32, int),
         "attention_mode": ("sage", str),
         "sparse_ratio": (1.0, float),
@@ -802,8 +817,8 @@ def get_ui_defaults(config=None):
         "gt_export_quality": (100, int),
         "gt_export_max_width": (3840, int),
         "gt_rife_streaming": (True, bool),
-        # Quality-first toolbox export (slower encode, sharper finals)
-        "tb_export_preset": ("slow", str),
+        # Same CRF as slow; medium is ~2–3× faster on libx264 fallback. NVENC uses p6 anyway.
+        "tb_export_preset": ("medium", str),
         "tb_prefer_nvenc": (True, bool),
         "gt_group_size": (5, int),
         "gt_do_upscale": (True, bool),
@@ -3373,7 +3388,7 @@ def _run_group_therapy_body(
     except (TypeError, ValueError):
         export_w = 3840
     use_streaming = bool(ui.get("gt_rife_streaming", True)) if rife_streaming is None else bool(rife_streaming)
-    export_preset = (ui.get("tb_export_preset") or "slow").strip().lower()
+    export_preset = (ui.get("tb_export_preset") or "medium").strip().lower()
     prefer_nvenc = True if ui.get("tb_prefer_nvenc") is None else bool(ui.get("tb_prefer_nvenc"))
 
     if toolbox_processor is None:

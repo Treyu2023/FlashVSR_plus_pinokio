@@ -298,9 +298,14 @@ class FlashVSRTinyPipeline(BasePipeline):
         self.prompt_emb_posi['stats'] = "offload"
         self.load_models_to_device([])
         if hasattr(self.dit, "LQ_proj_in"):
+            try:
+                self.dit.LQ_proj_in.clear_cache()
+            except Exception:
+                pass
             self.dit.LQ_proj_in.to('cpu')
         if not keep_vae:
             self.TCDecoder.to('cpu')
+        clean_vram()
 
     @torch.no_grad()
     def __call__(
@@ -450,35 +455,68 @@ class FlashVSRTinyPipeline(BasePipeline):
                 
             if hasattr(self.dit, "LQ_proj_in"):
                 self.dit.LQ_proj_in.clear_cache()
-                
+            # Drop DiT KV / window caches *before* VAE. These stay on GPU after
+            # module.cpu() and are why 10s clips (249 frames) VAE for ~15 min
+            # while 5s clips (121 frames) finish in ~4s.
+            pre_cache_k = None
+            pre_cache_v = None
+            LQ_latents = None
+
             if unload_dit and hasattr(self, 'dit') and not next(self.dit.parameters()).is_cpu:
                 print("[FlashVSR] Offloading DiT to the CPU to free up VRAM...", flush=True)
                 with BusySpan("offloading DiT to CPU"):
                     self.offload_model(keep_vae=True)
-                
+            else:
+                clean_vram()
+
             latents = torch.cat(latents_total, dim=2)
-            
+            del latents_total
+            if torch.cuda.is_available():
+                alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+                reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+                print(
+                    f"[FlashVSR] VRAM before VAE: {alloc:.1f} GB alloc / {reserved:.1f} GB reserved",
+                    flush=True,
+                )
+
             # Decode
             print("[FlashVSR] Starting VAE decoding...", flush=True)
             with BusySpan("VAE decoding", extra=f"{num_frames} frames {width}x{height}"):
                 frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=True, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)
-            
+
             self.TCDecoder.clean_mem()
+            del latents
+            clean_vram()
             if force_offload:
                 with BusySpan("offloading models"):
                     self.offload_model()
-                
-            # 颜色校正（wavelet）
+
+            # Color-fix in 16-frame GPU slices so the full 249-frame tensor
+            # never sits on the 4090 at once (same cliff as VAE).
             try:
                 if color_fix:
                     with BusySpan("color correction"):
-                        frames = self.ColorCorrector(
-                            frames.to(device=LQ_video.device),
-                            LQ_video[:, :, :frames.shape[2], :, :],
-                            clip_range=(-1, 1),
-                            chunk_size=16,
-                            method='adain'
-                        )
+                        fcount = frames.shape[2]
+                        lq = LQ_video[:, :, :fcount, :, :]
+                        cs = 16
+                        parts = []
+                        for start in range(0, fcount, cs):
+                            end = min(start + cs, fcount)
+                            hq = frames[:, :, start:end]
+                            if hq.device != lq.device:
+                                hq = hq.to(device=lq.device, non_blocking=True)
+                            parts.append(
+                                self.ColorCorrector(
+                                    hq,
+                                    lq[:, :, start:end],
+                                    clip_range=(-1, 1),
+                                    chunk_size=None,
+                                    method='adain',
+                                ).cpu()
+                            )
+                            del hq
+                        frames = torch.cat(parts, dim=2)
+                        clean_vram()
             except:
                 pass
                 

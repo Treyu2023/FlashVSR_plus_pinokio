@@ -299,9 +299,14 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         self.prompt_emb_posi['stats'] = "offload"
         self.load_models_to_device([])
         if hasattr(self.dit, "LQ_proj_in"):
+            try:
+                self.dit.LQ_proj_in.clear_cache()
+            except Exception:
+                pass
             self.dit.LQ_proj_in.to('cpu')
         if not keep_vae:
             self.TCDecoder.to('cpu')
+        clean_vram()
 
     @torch.no_grad()
     def __call__(

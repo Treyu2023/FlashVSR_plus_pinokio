@@ -458,13 +458,17 @@ class FlashVSRFullPipeline(BasePipeline):
                 
             if hasattr(self.dit, "LQ_proj_in"):
                 self.dit.LQ_proj_in.clear_cache()
-                
+            pre_cache_k = None
+            pre_cache_v = None
+            LQ_latents = None
+
             if unload_dit and hasattr(self, 'dit') and not next(self.dit.parameters()).is_cpu:
                 print("[FlashVSR] Offloading DiT to the CPU to free up VRAM...", flush=True)
                 with BusySpan("offloading DiT to CPU"):
                     self.offload_model(keep_vae=True)
 
             latents = torch.cat(latents_total, dim=2)
+            del latents_total
             
             # Decode
             print("[FlashVSR] Starting VAE decoding...", flush=True)

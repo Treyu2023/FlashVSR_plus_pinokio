@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-09-16 | **VAE gap after DiT:** 10s chunks (~249 frames) spent ~15 min/tile in VAE (3.5s/step → 16s/step) while 5s clips stayed ~4s. DiT was already ~1.3 steps/s. Fix: drop DiT KV caches before decode, `empty_cache`, stream finished VAE frames to CPU, color-fix in 16-frame GPU slices. Same model/quality. Needs FlashVSR restart. |
 | 2026-09-16 | **Quality-neutral speed defaults:** tile **320**/32 (fewer 4K-safe tiles; same model; OOM auto-drops 192→128), toolbox export **medium** (same CRF as slow; NVENC still p6), TF32 + cuDNN benchmark on Ada. Sparse 1.0 / quality 10 / RIFE 4× / color-fix unchanged. |
 | 2026-09-16 | **No GPU cap / Idle under-schedule:** Multitask headroom retired. Always Normal GPU+CPU scheduling (Idle / Below-Normal / nvidia-smi -pl never applied). UI toggles hidden and ignored. **Tiled-DiT stitch canvas** is float16 color + 1-channel weights (~16GB at 4K-safe instead of ~48GB float32×2) so 64GB RAM no longer pages. |
 | 2026-09-14 | **Pair index out of Ready for CIV:** `pair.json` / `PAIR.txt` / `PAIRS.txt` / `PID_RETRO_MAP.json` move into `_pairs\\pairs.json` (one file). Media folder stays videos only. |
@@ -62,7 +63,9 @@
 | `group_therapy.py` | **Created** — grouped pipeline + flat `_PID_` pairing; unstarted groups packed newest→oldest |
 | `flashvsr_work_queue.py` | **Modified** — size-dedupe, Group Therapy status, skip already-upscaled, AddResult skip reasons |
 | `toolbox/toolbox.py` | **Modified** — FPS cap, no-video probe, HighFPS skip |
-| `src/pipelines/flashvsr_tiny_long.py` | **Modified** — refuse `output_path=None` (4k_safe mode bug) |
+| `src/pipelines/flashvsr_tiny.py` | **Modified** — drop DiT KV before VAE; color-fix in slices; `clean_vram` after offload |
+| `src/models/TCDecoder.py` | **Modified** — sequential VAE finished frames go to CPU (no 249-frame GPU stack) |
+| `src/pipelines/flashvsr_tiny_long.py` | **Modified** — refuse `output_path=None` (4k_safe mode bug); `clean_vram` on offload |
 | `../scripts/env_guard.py` | **Modified** — snapshot + **reapply after Update/Install/Start** |
 | `../update.js` `../install.js` `../start.js` `../pinokio.js` | **Modified** — call reapply / preflight |
 

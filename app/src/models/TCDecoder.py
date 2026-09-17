@@ -133,7 +133,9 @@ def apply_model_with_memblocks(model, x, parallel, show_progress_bar, mem=None):
             if i == 0:
                 progress_bar.update(1)
             if i == len(model):
-                out.append(xt)
+                # Keep finished RGB frames on CPU. Holding all T frames on the
+                # 4090 (249×1280×1280) packs WDDM and VAE slows 3s/step → 16s/step.
+                out.append(xt.detach().to("cpu"))
             else:
                 b = model[i]
                 if isinstance(b, MemBlock):

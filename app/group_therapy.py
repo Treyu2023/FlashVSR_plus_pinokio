@@ -27,6 +27,8 @@ from flashvsr_work_queue import (
     FlashVSRWorkQueue,
     VIDEO_EXTS,
     _file_mtime,
+    looks_like_finished_export,
+    looks_like_rife_output,
     looks_like_upscaled_output,
 )
 
@@ -666,6 +668,17 @@ def settle_pair(
     end = last_output(it) or ""
     if not end or not os.path.isfile(end):
         raise FileNotFoundError("no end file to settle")
+    # A Toolbox final in the inbox is the After file, not a source original.
+    try:
+        same_file = (
+            original
+            and os.path.normcase(os.path.abspath(original))
+            == os.path.normcase(os.path.abspath(end))
+        )
+    except OSError:
+        same_file = False
+    if looks_like_finished_export(end) and (not original or same_file):
+        original = ""
 
     pair_id = ensure_pair_id(it)
     it["gt_pair_folder"] = pid_token(pair_id)
@@ -1005,26 +1018,73 @@ def find_existing_pair(
     return None
 
 
+def find_after_named_like(after_dir: str, src_name: str) -> Optional[str]:
+    """Match an After file to an inbox name, ignoring _PID_xxxxxxxx."""
+    if not after_dir or not src_name or not os.path.isdir(after_dir):
+        return None
+    stem = _PID_IN_NAME_RE.sub("", Path(src_name).stem).rstrip("_").lower()
+    if not stem:
+        return None
+    try:
+        for p in Path(after_dir).iterdir():
+            if not p.is_file() or p.suffix.lower() not in VIDEO_EXTS:
+                continue
+            other = _PID_IN_NAME_RE.sub("", p.stem).rstrip("_").lower()
+            if other == stem:
+                return str(p)
+    except OSError:
+        return None
+    return None
+
+
+def adopt_finished_export(path: str, after_dir: str, pair_id: str = "") -> str:
+    """Move a Toolbox final into After with a PID. Does not copy it to Before."""
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    os.makedirs(after_dir, exist_ok=True)
+    pid = (pair_id or pair_id_from_name(path) or make_pair_id()).lower()
+    dest_name = with_pid_name(path, pid)
+    dest = unique_pid_dest(after_dir, dest_name)
+    src_abs = os.path.abspath(path)
+    dest_abs = os.path.abspath(dest)
+    if os.path.normcase(src_abs) != os.path.normcase(dest_abs):
+        try:
+            shutil.move(src_abs, dest_abs)
+        except OSError:
+            shutil.copy2(src_abs, dest_abs)
+            try:
+                os.remove(src_abs)
+            except OSError:
+                pass
+    stamp_title_pid(dest_abs, pid)
+    append_pair_index(after_dir, pair_id=pid, folder=".", role="after", file_path=dest_abs)
+    return dest_abs
+
+
 def reclaim_watch_folder(
     watch_dir: str,
     before_dir: str,
     after_dir: str,
 ) -> Dict[str, int]:
     """
-    Watch/Downloads may only hold unprocessed originals.
+    Watch/Downloads may only hold unprocessed originals (plus partials that
+    still need RIFE/export).
 
     If After already has this Imagine take (UUID + Chrome N):
       - Before already has it → delete the inbox copy
       - else move the original into Before, reusing the After PID
     Same-size Chrome re-downloads of an archived original are deleted.
-    Leftover upscaled/RIFE names in the inbox are deleted (intermediates).
+    Finished Toolbox exports are moved to After (not reprocessed, not deleted).
+    Leftover upscaled/RIFE names are deleted only when After already has that take.
     """
     stats = {
         "scanned": 0,
         "moved_before": 0,
+        "moved_after": 0,
         "deleted_already_paired": 0,
         "deleted_same_size": 0,
         "deleted_intermediate": 0,
+        "kept_partial": 0,
         "kept_unprocessed": 0,
     }
     if not watch_dir or not os.path.isdir(watch_dir):
@@ -1072,12 +1132,42 @@ def reclaim_watch_folder(
             except Exception:
                 vk = None
 
-        if looks_like_upscaled_output(ap):
+        if looks_like_finished_export(ap):
+            if vk and vk in after_map:
+                try:
+                    os.remove(ap)
+                    stats["deleted_already_paired"] += 1
+                except OSError:
+                    pass
+                continue
+            existing = find_after_named_like(after_dir, p.name)
+            if existing:
+                try:
+                    os.remove(ap)
+                    stats["deleted_already_paired"] += 1
+                except OSError:
+                    pass
+                continue
             try:
-                os.remove(ap)
-                stats["deleted_intermediate"] += 1
+                dest = adopt_finished_export(ap, after_dir)
+                if vk:
+                    after_map[vk] = dest
+                stats["moved_after"] += 1
             except OSError:
-                pass
+                kept.append(ap)
+            continue
+
+        if looks_like_upscaled_output(ap) or looks_like_rife_output(ap):
+            if vk and vk in after_map:
+                try:
+                    os.remove(ap)
+                    stats["deleted_intermediate"] += 1
+                except OSError:
+                    pass
+                continue
+            # After does not have this take yet — keep so remaining stages can run
+            stats["kept_partial"] += 1
+            kept.append(ap)
             continue
 
         if vk and vk in after_map:
@@ -1156,6 +1246,51 @@ def reclaim_watch_folder(
         if sz <= 0:
             still.append(ap)
     stats["kept_unprocessed"] = len({os.path.normcase(p) for p in still if os.path.isfile(p)})
+    return stats
+
+
+def mark_finished_exports(wq: FlashVSRWorkQueue, after_dir: str) -> Dict[str, int]:
+    """
+    Queue rows that are already Toolbox finals: move to After if still in the
+    inbox, then mark done. Never send them through upscale / RIFE again.
+    """
+    stats = {"moved_after": 0, "marked_done": 0}
+    data = wq.load()
+    now = datetime.now().isoformat(timespec="seconds")
+    changed = False
+    for it in data.get("items") or []:
+        if it.get("status") == "done":
+            continue
+        path = it.get("path") or ""
+        if not looks_like_finished_export(path):
+            continue
+        dest = ""
+        if os.path.isfile(path):
+            try:
+                dest = adopt_finished_export(
+                    path, after_dir, pair_id=str(it.get("gt_pair_id") or "")
+                )
+                stats["moved_after"] += 1
+            except OSError:
+                dest = ""
+        if not dest:
+            dest = find_after_named_like(after_dir, Path(path).name) or ""
+        if not dest:
+            continue
+        pid = pair_id_from_name(dest) or str(it.get("gt_pair_id") or "") or ""
+        if pid:
+            it["gt_pair_id"] = pid
+            it["gt_pair_folder"] = pid_token(pid)
+        it["gt_after"] = dest
+        it["gt_export"] = dest
+        it["status"] = "done"
+        it["output"] = dest
+        it["error"] = None
+        it["finished"] = now
+        stats["marked_done"] += 1
+        changed = True
+    if changed:
+        wq.save(data)
     return stats
 
 

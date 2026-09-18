@@ -3420,19 +3420,35 @@ def _run_group_therapy_body(
     os.makedirs(before_dir, exist_ok=True)
     os.makedirs(after_dir, exist_ok=True)
 
+    stuck = wq.reset_stuck_running()
+    if stuck:
+        log(f"Re-queued {stuck} stuck Group Therapy job(s)", message_type="info")
+    wq.requeue_failed()
+    adopted = gt.mark_finished_exports(wq, after_dir)
+    if adopted.get("marked_done") or adopted.get("moved_after"):
+        log(
+            "🧹 Already-exported finals: "
+            f"{adopted.get('moved_after', 0)} moved to Ready for CIV, "
+            f"{adopted.get('marked_done', 0)} marked done (no reprocess)",
+            message_type="info",
+        )
+
     if watch_folder and os.path.isdir(watch_folder):
         rec = gt.reclaim_watch_folder(watch_folder, before_dir, after_dir)
         moved = rec.get("moved_before", 0)
+        moved_after = rec.get("moved_after", 0)
         dropped = (
             rec.get("deleted_already_paired", 0)
             + rec.get("deleted_same_size", 0)
             + rec.get("deleted_intermediate", 0)
         )
-        if moved or dropped:
+        if moved or moved_after or dropped:
             log(
                 "🧹 Watch reclaim: "
                 f"{moved} original(s) → Pre Scaled, "
+                f"{moved_after} already-exported final(s) → Ready for CIV, "
                 f"{dropped} already-done/duplicate/intermediate deleted, "
+                f"{rec.get('kept_partial', 0)} partial(s) kept for remaining stages, "
                 f"{rec.get('kept_unprocessed', 0)} unprocessed left in Downloads",
                 message_type="info",
             )
@@ -3449,6 +3465,13 @@ def _run_group_therapy_body(
         )
         _log_queue_scan("Group Therapy", watch_folder, scan, noun="video")
 
+    seeded = wq.seed_partial_pipeline()
+    if seeded:
+        log(
+            f"Group Therapy: {seeded} already-upscaled/RIFE file(s) will skip "
+            f"finished stages (RIFE/export only — not another 4×)",
+            message_type="info",
+        )
     dropped = wq.drop_wrong_stage_pending()
     if dropped:
         log(
@@ -3456,11 +3479,6 @@ def _run_group_therapy_body(
             f"those stay on Toolbox (RIFE + export), not another upscale",
             message_type="warning",
         )
-
-    stuck = wq.reset_stuck_running()
-    if stuck:
-        log(f"Re-queued {stuck} stuck Group Therapy job(s)", message_type="info")
-    wq.requeue_failed()
 
     def _gt_complete(path: str):
         return gt.find_existing_pair(after_dir, {"path": path})

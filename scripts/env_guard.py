@@ -71,8 +71,8 @@ MARKERS = {
     "app/grok_id_index.py": ("extract_grok_ids", "SIZE_TOLERANCE", "screen_folder", "def version_key"),
     "app/src/busy_heartbeat.py": ("class HeartbeatTqdm", "still busy", "STOP ARMED", "tick_stop_banner"),
     "app/src/pipelines/flashvsr_tiny.py": ("BusySpan", "show_progress_bar=True"),
-    "app/group_therapy.py": ("stamp_title_pid", "flatten_gt_pair_folders", "pid_token", "item_in_progress", "version_keys_in_folder", "reclaim_watch_folder", "get_after_lookup", "migrate_legacy_pair_sidecars", "_pairs"),
-    "app/flashvsr_work_queue.py": ("gt_pair_id", "drop_wrong_stage_pending", "class AddResult", "grok_id_dupes", "first_matching_version"),
+    "app/group_therapy.py": ("stamp_title_pid", "flatten_gt_pair_folders", "pid_token", "item_in_progress", "version_keys_in_folder", "reclaim_watch_folder", "get_after_lookup", "migrate_legacy_pair_sidecars", "_pairs", "looks_like_finished_export", "moved_after", "mark_finished_exports"),
+    "app/flashvsr_work_queue.py": ("gt_pair_id", "drop_wrong_stage_pending", "class AddResult", "grok_id_dupes", "first_matching_version", "looks_like_finished_export", "seed_pipeline_fields"),
     "app/naming_utils.py": ("clean_original_stem", "step1_filename"),
     "app/toolbox/toolbox.py": ("_choose_interp_factor", "_has_video_stream"),
     "app/src/pipelines/flashvsr_tiny_long.py": (

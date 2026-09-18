@@ -39,11 +39,16 @@ SKIP_PARENT_DIRS = {
     "done", "archive", "work", "failed", "completed",
 }
 
-# Already-upscaled / step-1 outputs — video / image / Group Therapy must not pick these up
+# Already-upscaled / step-1 outputs — video / image queues must not 4× these again
 _UPSCALED_OUTPUT_RE = re.compile(
-    r"(?:upscaled_x\d+|_Upscaled(?:_|\.|$)|^UpScale(?:2K|4K|8K)|_chunked_1(?:_|\.|$))",
+    r"(?:upscaled_x\d+|_Upscaled(?:_|\.|$)|^UpScale(?:2K|4K|8K)|_chunked_1(?:_|\.|$)|_tiny_s\d+(?:_|$)|_resized_\d+x\d+_tiny)",
     re.I,
 )
+# Toolbox final: already RIFE'd + exported — belongs in After / Ready for CIV
+_FINISHED_EXPORT_RE = re.compile(r"(?i)_exported_\d+w_\d+q")
+# Toolbox RIFE/interp output that still needs export (and maybe another 2×)
+_RIFE_OUTPUT_RE = re.compile(r"(?i)_frames_(?:\d+x)?frames")
+_RIFE4_RE = re.compile(r"(?i)(?:4x\s*frames|4xframes)")
 
 # Queues that run FlashVSR upscale (not RIFE/export)
 _UPSCALE_QUEUES = {"video", "image", "group"}
@@ -53,10 +58,53 @@ _MIN_QUEUE_BYTES = 32 * 1024
 _RECENT_WRITE_SEC = 20.0
 
 
+def looks_like_finished_export(path: str) -> bool:
+    """True if this is a Toolbox final export (already RIFE + export)."""
+    name = Path(path or "").name
+    return bool(name) and bool(_FINISHED_EXPORT_RE.search(name))
+
+
+def looks_like_rife_output(path: str) -> bool:
+    """True if this is a RIFE/interp file that still needs export (not a final)."""
+    name = Path(path or "").name
+    if not name or looks_like_finished_export(name):
+        return False
+    return bool(_RIFE_OUTPUT_RE.search(name))
+
+
 def looks_like_upscaled_output(path: str) -> bool:
     """True if this file is already a FlashVSR / step-1 output (belongs on Toolbox)."""
     name = Path(path or "").name
-    return bool(name) and bool(_UPSCALED_OUTPUT_RE.search(name))
+    if not name or looks_like_finished_export(name) or looks_like_rife_output(name):
+        return False
+    return bool(_UPSCALED_OUTPUT_RE.search(name))
+
+
+def looks_like_pipeline_output(path: str) -> bool:
+    """Any FlashVSR/Toolbox product — not a raw download."""
+    return (
+        looks_like_finished_export(path)
+        or looks_like_rife_output(path)
+        or looks_like_upscaled_output(path)
+    )
+
+
+def seed_pipeline_fields(path: str) -> Dict[str, str]:
+    """
+    Group Therapy resume from filename: skip stages that already ran.
+    Finished exports are not seeded here (those move to After).
+    """
+    if not path or looks_like_finished_export(path):
+        return {}
+    name = Path(path).name
+    if looks_like_rife_output(name):
+        fields = {"gt_upscale": path, "gt_rife1": path}
+        if _RIFE4_RE.search(name):
+            fields["gt_rife2"] = path
+        return fields
+    if looks_like_upscaled_output(name):
+        return {"gt_upscale": path}
+    return {}
 
 
 class AddResult:
@@ -67,6 +115,7 @@ class AddResult:
         "skipped",
         "already_queued",
         "already_upscaled",
+        "finished_export",
         "same_size_copy",
         "sidecar",
         "grok_id_dupes",
@@ -79,6 +128,7 @@ class AddResult:
         skipped: int = 0,
         already_queued: int = 0,
         already_upscaled: int = 0,
+        finished_export: int = 0,
         same_size_copy: int = 0,
         sidecar: int = 0,
         grok_id_dupes: int = 0,
@@ -87,6 +137,7 @@ class AddResult:
         self.added = int(added)
         self.already_queued = int(already_queued)
         self.already_upscaled = int(already_upscaled)
+        self.finished_export = int(finished_export)
         self.same_size_copy = int(same_size_copy)
         self.sidecar = int(sidecar)
         self.grok_id_dupes = int(grok_id_dupes)
@@ -94,7 +145,12 @@ class AddResult:
         self.skipped = int(
             skipped
             if skipped
-            else already_queued + already_upscaled + same_size_copy + sidecar + grok_id_dupes
+            else already_queued
+            + already_upscaled
+            + finished_export
+            + same_size_copy
+            + sidecar
+            + grok_id_dupes
         )
 
     def __iter__(self) -> Iterator[int]:
@@ -106,6 +162,7 @@ class AddResult:
             added=self.added + other.added,
             already_queued=self.already_queued + other.already_queued,
             already_upscaled=self.already_upscaled + other.already_upscaled,
+            finished_export=self.finished_export + other.finished_export,
             same_size_copy=self.same_size_copy + other.same_size_copy,
             sidecar=self.sidecar + other.sidecar,
             grok_id_dupes=self.grok_id_dupes + other.grok_id_dupes,
@@ -128,6 +185,11 @@ class AddResult:
             bits.append(
                 f"{self.already_upscaled} already-upscaled names "
                 "(Toolbox / RIFE, not another 4× pass)"
+            )
+        if self.finished_export:
+            bits.append(
+                f"{self.finished_export} already-exported finals "
+                "(moved to After / Ready for CIV — not another pipeline)"
             )
         if self.sidecar:
             bits.append(
@@ -511,6 +573,7 @@ class FlashVSRWorkQueue:
         added = 0
         already_queued = 0
         already_upscaled = 0
+        finished_export = 0
         same_size_copy = 0
         sidecar = 0
         grok_id_dupes = 0
@@ -576,10 +639,15 @@ class FlashVSRWorkQueue:
             if _path_in_sidecar_dir(ap):
                 sidecar += 1
                 continue
-            if self.name in _UPSCALE_QUEUES and looks_like_upscaled_output(ap):
-                # Already upscaled — Toolbox / RIFE+export, not another FlashVSR pass
-                already_upscaled += 1
+            if looks_like_finished_export(ap):
+                # Toolbox final — reclaim moves it to After; never 4× / RIFE again
+                finished_export += 1
                 continue
+            if self.name in _UPSCALE_QUEUES and self.name != "group":
+                if looks_like_upscaled_output(ap) or looks_like_rife_output(ap):
+                    # Video/image queues are upscale-only — remaining stages are Toolbox/GT
+                    already_upscaled += 1
+                    continue
             key = _norm(ap)
             if key in existing:
                 already_queued += 1
@@ -628,22 +696,30 @@ class FlashVSRWorkQueue:
 
         for ap in candidates:
             sz = _file_size(ap)
-            items.append(
-                {
-                    "path": ap,
-                    "status": ST_PENDING,
-                    "output": None,
-                    "error": None,
-                    "added": _now_iso(),
-                    "finished": None,
-                    "size": sz,
-                }
-            )
+            row: Dict[str, Any] = {
+                "path": ap,
+                "status": ST_PENDING,
+                "output": None,
+                "error": None,
+                "added": _now_iso(),
+                "finished": None,
+                "size": sz,
+            }
+            if self.name == "group":
+                row.update(seed_pipeline_fields(ap))
+            items.append(row)
             existing.add(_norm(ap))
             if sz > 0:
                 existing_sizes.add(sz)
             added += 1
-        skipped = already_queued + already_upscaled + same_size_copy + sidecar + grok_id_dupes
+        skipped = (
+            already_queued
+            + already_upscaled
+            + finished_export
+            + same_size_copy
+            + sidecar
+            + grok_id_dupes
+        )
         if added:
             self.save(data)
         else:
@@ -653,6 +729,7 @@ class FlashVSRWorkQueue:
             skipped=skipped,
             already_queued=already_queued,
             already_upscaled=already_upscaled,
+            finished_export=finished_export,
             same_size_copy=same_size_copy,
             sidecar=sidecar,
             grok_id_dupes=grok_id_dupes,
@@ -687,10 +764,13 @@ class FlashVSRWorkQueue:
 
     def drop_wrong_stage_pending(self) -> int:
         """
-        Pull already-upscaled files off video / image / Group Therapy pending lists.
-        Those belong on the Toolbox queue (RIFE + export), not another upscale pass.
+        Pull already-upscaled / already-exported files off video / image pending lists.
+        Group Therapy keeps upscaled/RIFE names so remaining stages can run; finished
+        exports are moved to After by reclaim / mark_finished_exports instead.
         """
         if self.name not in _UPSCALE_QUEUES:
+            return 0
+        if self.name == "group":
             return 0
         data = self.load()
         items: List[Dict[str, Any]] = list(data.get("items") or [])
@@ -701,7 +781,7 @@ class FlashVSRWorkQueue:
         for it in items:
             st = it.get("status", ST_PENDING)
             path = it.get("path") or ""
-            if st in (ST_PENDING, ST_FAILED) and looks_like_upscaled_output(path):
+            if st in (ST_PENDING, ST_FAILED) and looks_like_pipeline_output(path):
                 dropped += 1
                 continue
             kept.append(it)
@@ -709,6 +789,30 @@ class FlashVSRWorkQueue:
             data["items"] = kept
             self.save(data)
         return dropped
+
+    def seed_partial_pipeline(self) -> int:
+        """Fill gt_upscale / gt_rife* on existing Group Therapy rows from filename."""
+        if self.name != "group":
+            return 0
+        data = self.load()
+        n = 0
+        for it in data.get("items") or []:
+            if it.get("status") == ST_DONE:
+                continue
+            path = it.get("path") or ""
+            fields = seed_pipeline_fields(path)
+            if not fields:
+                continue
+            changed = False
+            for k, v in fields.items():
+                if not it.get(k):
+                    it[k] = v
+                    changed = True
+            if changed:
+                n += 1
+        if n:
+            self.save(data)
+        return n
 
     def reorder_pending_newest_first(self) -> int:
         """

@@ -334,8 +334,12 @@ def create_feather_mask(size, overlap):
 
 
 def alloc_stitch_canvases(num_frames, height, width, channels):
-    canvas = torch.zeros((num_frames, height, width, channels), dtype=torch.float16)
-    weights = torch.zeros((num_frames, height, width, 1), dtype=torch.float16)
+    canvas = torch.zeros(
+        (num_frames, height, width, channels), dtype=torch.float16, device="cpu"
+    )
+    weights = torch.zeros(
+        (num_frames, height, width, 1), dtype=torch.float16, device="cpu"
+    )
     return canvas, weights
 
 

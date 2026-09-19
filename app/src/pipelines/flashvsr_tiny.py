@@ -293,6 +293,22 @@ class FlashVSRTinyPipeline(BasePipeline):
         
         return frames
     
+    def drop_dit_stream_kv(self):
+        """Free streaming KV / LQ caches. Keep DiT weights on the GPU.
+
+        enable_vram_management() turns cpu_offload on, so offload_model()
+        memcpy's the whole DiT to RAM. The next tile copies it back while the
+        stitch canvas is already in RAM → pagefile + WDDM thrash
+        (100% GPU / ~110 W, 3 s/step → 40+ s/step). Stream KV is what packed
+        VAE; DiT weights are ~3 GB and fit next to VAE on a 24 GB 4090.
+        """
+        if hasattr(self.dit, "LQ_proj_in"):
+            try:
+                self.dit.LQ_proj_in.clear_cache()
+            except Exception:
+                pass
+        clean_vram()
+
     def offload_model(self, keep_vae=False):
         self.dit.clear_cross_kv()
         self.prompt_emb_posi['stats'] = "offload"
@@ -380,6 +396,13 @@ class FlashVSRTinyPipeline(BasePipeline):
         self.load_models_to_device(["dit"])
         self.dit.LQ_proj_in.to(self.device)
         self.TCDecoder.to(self.device)
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+            reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+            print(
+                f"[FlashVSR] VRAM before DiT: {alloc:.1f} GB alloc / {reserved:.1f} GB reserved",
+                flush=True,
+            )
 
         # 清理可能存在的 LQ_proj_in cache
         if hasattr(self.dit, "LQ_proj_in"):
@@ -455,17 +478,16 @@ class FlashVSRTinyPipeline(BasePipeline):
                 
             if hasattr(self.dit, "LQ_proj_in"):
                 self.dit.LQ_proj_in.clear_cache()
-            # Drop DiT KV / window caches *before* VAE. These stay on GPU after
-            # module.cpu() and are why 10s clips (249 frames) VAE for ~15 min
-            # while 5s clips (121 frames) finish in ~4s.
+            # Drop DiT stream KV / window caches *before* VAE. Do NOT move DiT
+            # weights to CPU: tiled jobs reload DiT on the next tile, and the
+            # CPU copy + stitch canvas pagefile-thrash the 4090.
             pre_cache_k = None
             pre_cache_v = None
             LQ_latents = None
 
-            if unload_dit and hasattr(self, 'dit') and not next(self.dit.parameters()).is_cpu:
-                print("[FlashVSR] Offloading DiT to the CPU to free up VRAM...", flush=True)
-                with BusySpan("offloading DiT to CPU"):
-                    self.offload_model(keep_vae=True)
+            if unload_dit:
+                print("[FlashVSR] Dropping DiT stream KV (DiT stays on GPU)...", flush=True)
+                self.drop_dit_stream_kv()
             else:
                 clean_vram()
 

@@ -462,10 +462,14 @@ class FlashVSRFullPipeline(BasePipeline):
             pre_cache_v = None
             LQ_latents = None
 
-            if unload_dit and hasattr(self, 'dit') and not next(self.dit.parameters()).is_cpu:
-                print("[FlashVSR] Offloading DiT to the CPU to free up VRAM...", flush=True)
-                with BusySpan("offloading DiT to CPU"):
-                    self.offload_model(keep_vae=True)
+            if unload_dit:
+                print("[FlashVSR] Dropping DiT stream KV (DiT stays on GPU)...", flush=True)
+                if hasattr(self.dit, "LQ_proj_in"):
+                    try:
+                        self.dit.LQ_proj_in.clear_cache()
+                    except Exception:
+                        pass
+                clean_vram()
 
             latents = torch.cat(latents_total, dim=2)
             del latents_total

@@ -1377,8 +1377,12 @@ def alloc_stitch_canvases(num_frames, height, width, channels):
     Old path allocated two float32 RGB videos (~48GB at 4K-safe) and forced paging.
     float16 color + 1-channel float16 weights is ~1/3 the RAM.
     """
-    canvas = torch.zeros((num_frames, height, width, channels), dtype=torch.float16)
-    weights = torch.zeros((num_frames, height, width, 1), dtype=torch.float16)
+    canvas = torch.zeros(
+        (num_frames, height, width, channels), dtype=torch.float16, device="cpu"
+    )
+    weights = torch.zeros(
+        (num_frames, height, width, 1), dtype=torch.float16, device="cpu"
+    )
     return canvas, weights, int(canvas.nbytes + weights.nbytes)
 
 
@@ -2030,6 +2034,7 @@ def run_flashvsr_single(
 
                         LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
                         LQ_tile = LQ_tile.to(_device)
+                        log_vram_status(f"tile-{i+1}-dit-start")
                         with BusySpan(
                             f"tile {i+1}/{num_tiles} DiT+VAE",
                             extra=f"{tile_w_in}x{tile_h_in} → {tw}x{th}",

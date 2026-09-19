@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-09-18 | **WDDM thrash on tile 2+:** VAE was fine (2.9 GB, ~13 s/tile) but `unload_dit` actually memcpy'd the whole DiT to RAM (`enable_vram_management` → `cpu_offload`). Next tile copied it back while the float16 stitch canvas sat in RAM → 17 GB pagefile, 4090 packed 23/24.5 GB, 100% util / ~110 W, DiT 9 s/step → 40–57 s/step. Fix: drop stream KV only; keep DiT on the GPU; force stitch canvases `device="cpu"`. Needs FlashVSR restart. |
 | 2026-09-18 | **No reprocess of finished/partial pipeline files:** Toolbox finals (`_exported_Nw_Nq`) in NEW DOWNLOADS are moved to Ready for CIV and marked done. `_tiny_s2_` / `_Upscaled` / RIFE `_*Frames` names skip already-done stages (RIFE/export only). Watch reclaim no longer deletes those unless After already has that take. |
 | 2026-09-16 | **VAE gap after DiT:** 10s chunks (~249 frames) spent ~15 min/tile in VAE (3.5s/step → 16s/step) while 5s clips stayed ~4s. DiT was already ~1.3 steps/s. Fix: drop DiT KV caches before decode, `empty_cache`, stream finished VAE frames to CPU, color-fix in 16-frame GPU slices. Same model/quality. Needs FlashVSR restart. |
 | 2026-09-16 | **Quality-neutral speed defaults:** tile **320**/32 (fewer 4K-safe tiles; same model; OOM auto-drops 192→128), toolbox export **medium** (same CRF as slow; NVENC still p6), TF32 + cuDNN benchmark on Ada. Sparse 1.0 / quality 10 / RIFE 4× / color-fix unchanged. |
@@ -64,7 +65,7 @@
 | `group_therapy.py` | **Created** — grouped pipeline + flat `_PID_` pairing; unstarted groups packed newest→oldest; finished exports → After |
 | `flashvsr_work_queue.py` | **Modified** — size-dedupe, Group Therapy status, skip already-upscaled/exported, seed remaining stages |
 | `toolbox/toolbox.py` | **Modified** — FPS cap, no-video probe, HighFPS skip |
-| `src/pipelines/flashvsr_tiny.py` | **Modified** — drop DiT KV before VAE; color-fix in slices; `clean_vram` after offload |
+| `src/pipelines/flashvsr_tiny.py` | **Modified** — drop DiT stream KV before VAE (weights stay on GPU); color-fix in slices |
 | `src/models/TCDecoder.py` | **Modified** — sequential VAE finished frames go to CPU (no 249-frame GPU stack) |
 | `src/pipelines/flashvsr_tiny_long.py` | **Modified** — refuse `output_path=None` (4k_safe mode bug); `clean_vram` on offload |
 | `../scripts/env_guard.py` | **Modified** — snapshot + **reapply after Update/Install/Start** |

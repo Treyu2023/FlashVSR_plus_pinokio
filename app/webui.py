@@ -51,6 +51,8 @@ def _enable_fast_gpu_math() -> None:
 
 _enable_fast_gpu_math()
 import shutil
+import stat
+import html
 import imageio
 import ffmpeg
 import numpy as np
@@ -1072,6 +1074,58 @@ def log(message:str, message_type:str="normal"):
         pass
     tick_stop_banner()
 
+
+def _rmtree_best_effort(path, retries=3, delay=0.75):
+    """Delete a directory tree; skip locked/read-only leftovers. Never raises.
+
+    Returns leftover paths that could not be removed (empty if the tree is gone).
+    Retries so a just-killed previous process can release Windows handles.
+    """
+    leftovers = []
+    if not path or not os.path.exists(path):
+        return leftovers
+
+    def _onerror(func, p, _exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+            return
+        except Exception:
+            leftovers.append(p)
+
+    attempts = max(1, int(retries))
+    for attempt in range(attempts):
+        leftovers.clear()
+        try:
+            shutil.rmtree(path, onerror=_onerror)
+        except Exception:
+            if os.path.exists(path):
+                leftovers.append(path)
+        if not os.path.exists(path):
+            leftovers.clear()
+            return leftovers
+        if attempt < attempts - 1:
+            time.sleep(max(0.0, float(delay)))
+
+    seen = set()
+    uniq = []
+    for p in leftovers:
+        key = os.path.normcase(os.path.abspath(str(p)))
+        if key not in seen:
+            seen.add(key)
+            uniq.append(p)
+    if os.path.exists(path):
+        key = os.path.normcase(os.path.abspath(path))
+        if key not in seen:
+            uniq.append(path)
+    return uniq
+
+
+def _format_leftover_names(paths, limit=5):
+    names = [os.path.basename(str(p)) or str(p) for p in paths[:limit]]
+    extra = f" (+{len(paths) - limit} more)" if len(paths) > limit else ""
+    return ", ".join(names) + extra
+
 def dummy_tqdm(iterable, *args, **kwargs):
     return iterable
 
@@ -1637,16 +1691,28 @@ def save_file_manually(temp_path):
 
 def clear_temp_files():
     try:
-        if os.path.exists(TEMP_DIR):
-            shutil.rmtree(TEMP_DIR)
-            os.makedirs(TEMP_DIR, exist_ok=True)
-            log("Temp files cleared.", message_type="finish")
-            return '<div style="padding: 1px; background-color: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac;">✅ Temp files cleared.</div>'
-        else:
+        if not os.path.exists(TEMP_DIR):
             log("Temp directory doesn't exist.", message_type="info")
             return '<div style="padding: 1px; background-color: #0c2d48; border: 1px solid #1e4a6e; border-radius: 4px; color: #7dd3fc;">ℹ️ Temp directory doesn\'t exist.</div>'
+        leftovers = _rmtree_best_effort(TEMP_DIR)
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        if leftovers:
+            preview = _format_leftover_names(leftovers)
+            log(f"Temp cleanup skipped {len(leftovers)} locked file(s): {preview}", message_type="warning")
+            safe = html.escape(preview, quote=True)
+            return (
+                f'<div style="padding: 1px; background-color: #3f2d1d; border: 1px solid #7f5f1d; '
+                f'border-radius: 4px; color: #fcd34d;">⚠️ Temp cleanup skipped {len(leftovers)} '
+                f"locked file(s): {safe}</div>"
+            )
+        log("Temp files cleared.", message_type="finish")
+        return '<div style="padding: 1px; background-color: #14352a; border: 1px solid #166534; border-radius: 4px; color: #86efac;">✅ Temp files cleared.</div>'
     except Exception as e:
         log(f"Error clearing temp files: {e}", message_type="error")
+        try:
+            os.makedirs(TEMP_DIR, exist_ok=True)
+        except Exception:
+            pass
         return f'<div style="padding: 1px; background-color: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 4px; color: #fca5a5;">❌ Error clearing temp files: {e}</div>'
     
 
@@ -10601,8 +10667,16 @@ if __name__ == "__main__":
     config = load_config()
     if config.get("clear_temp_on_start", False):
         if os.path.exists(TEMP_DIR):
-            shutil.rmtree(TEMP_DIR)
-            log("Temp files cleared on startup.", message_type="info")
+            leftovers = _rmtree_best_effort(TEMP_DIR)
+            if leftovers:
+                preview = _format_leftover_names(leftovers)
+                log(
+                    f"Temp cleanup skipped {len(leftovers)} locked file(s) on startup "
+                    f"(continuing): {preview}",
+                    message_type="warning",
+                )
+            else:
+                log("Temp files cleared on startup.", message_type="info")
     
     os.makedirs(TEMP_DIR, exist_ok=True)
     

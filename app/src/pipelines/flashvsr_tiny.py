@@ -538,6 +538,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                             )
                             del hq
                         frames = torch.cat(parts, dim=2)
+                        del parts
                         clean_vram()
             except:
                 pass

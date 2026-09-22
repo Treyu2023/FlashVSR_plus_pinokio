@@ -429,12 +429,18 @@ class SelfAttention(nn.Module):
             attention_mask = generate_draft_block_mask_sage(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
 
         x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
+        del reorder_q, reorder_k, reorder_v, attention_mask, q_w
 
         cur_block_n, cur_block_s, _ = k_w.shape
         cache_num = cur_block_n // one_len
         if cache_num > kv_len:
-            cache_k = k_w[one_len:, :, :]
-            cache_v = v_w[one_len:, :, :]
+            # stream KV clone drops prefix storage. A slice keeps the dropped
+            # window's GPU block alive; under WDDM that commit pages the host
+            # out from under the next tile. Attention temps are freed first so
+            # the copy does not stack on top of them.
+            cache_k = k_w[one_len:, :, :].clone()
+            cache_v = v_w[one_len:, :, :].clone()
+            del k_w, v_w
         else:
             cache_k = k_w
             cache_v = v_w

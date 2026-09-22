@@ -81,6 +81,7 @@ from src import ModelManager, FlashVSRFullPipeline, FlashVSRTinyPipeline, FlashV
 from src.models import wan_video_dit
 from src.models.TCDecoder import build_tcdecoder
 from src.models.utils import get_device_list, clean_vram, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
+from stitch_canvas import DiskStitchCanvas, frames_to_fp16_cpu, release_host_cache
 
 from toolbox.system_monitor import SystemMonitor
 from toolbox.toolbox import ToolboxProcessor
@@ -1295,6 +1296,37 @@ def save_video(frames, save_path, fps=30, quality=5, progress_desc="Saving video
             frame_np = (frames[i].cpu().float() * 255.0).clip(0, 255).numpy().astype(np.uint8)
             writer.append_data(frame_np)
 
+def save_disk_stitch(stitch, save_path, fps, quality, src_h, src_w, scale, progress_desc="Saving video..."):
+    """Stream a disk canvas to video. Same crop and 8-bit convert as save_video."""
+    target_h = int(src_h) * int(scale)
+    target_w = int(src_w) * int(scale)
+    out_h, out_w = stitch.height, stitch.width
+    if out_h < target_h or out_w < target_w:
+        log(
+            f"Warning: upscaled {out_w}×{out_h} smaller than target {target_w}×{target_h}",
+            message_type="warning",
+        )
+        crop = None
+    else:
+        crop_top = (out_h - target_h) // 2
+        crop_left = (out_w - target_w) // 2
+        crop = (crop_top, crop_left, target_h, target_w)
+        aligned = (target_w % 16 == 0 and target_h % 16 == 0)
+        log(
+            f"Output dimensions: {target_w}×{target_h}"
+            + (" (codec-safe, divisible by 16)" if aligned else ""),
+            message_type="info",
+        )
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    step = 2
+    nchunks = math.ceil(stitch.num_frames / step)
+    with imageio.get_writer(save_path, fps=fps, quality=quality, macro_block_size=1) as writer:
+        for chunk in tqdm(stitch.blended_chunks(step=step, crop=crop), total=nchunks, desc=f"[FlashVSR] {progress_desc}"):
+            for i in range(chunk.shape[0]):
+                frame_np = (chunk[i].float() * 255.0).clip(0, 255).numpy().astype(np.uint8)
+                writer.append_data(frame_np)
+            del chunk
+
 def prepare_tensors(path: str, dtype=torch.bfloat16):
     if os.path.isdir(path):
         paths0 = list_images_natural(path)
@@ -1397,7 +1429,9 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
         tensor_out = (upscaled_tensor.squeeze(0) * 2.0 - 1.0).to('cpu').to(dtype)
         frames.append(tensor_out)
     vid_stacked = torch.stack(frames, 0)
+    del frames
     vid_final = vid_stacked.permute(1, 0, 2, 3).unsqueeze(0)
+    del vid_stacked
     clean_vram()
     return vid_final, tH, tW, Fs
 
@@ -1426,35 +1460,8 @@ def create_feather_mask(size, overlap):
 
 
 def alloc_stitch_canvases(num_frames, height, width, channels):
-    """CPU stitch buffers that fit in 64GB RAM.
-
-    Old path allocated two float32 RGB videos (~48GB at 4K-safe) and forced paging.
-    float16 color + 1-channel float16 weights is ~1/3 the RAM.
-    """
-    canvas = torch.zeros(
-        (num_frames, height, width, channels), dtype=torch.float16, device="cpu"
-    )
-    weights = torch.zeros(
-        (num_frames, height, width, 1), dtype=torch.float16, device="cpu"
-    )
-    return canvas, weights, int(canvas.nbytes + weights.nbytes)
-
-
-def blend_tile_into_canvas(canvas, weights, tile_cpu, mask_nchw, y1, y2, x1, x2):
-    mask = mask_nchw.permute(0, 2, 3, 1).to(dtype=torch.float16)
-    canvas[:, y1:y2, x1:x2, :] += tile_cpu.to(dtype=torch.float16) * mask
-    weights[:, y1:y2, x1:x2, :] += mask
-
-
-def finalize_stitch_canvas(canvas, weights):
-    n = canvas.shape[0]
-    out = torch.empty(canvas.shape, dtype=torch.float32)
-    step = 8
-    for i in range(0, n, step):
-        sl = slice(i, min(i + step, n))
-        w = weights[sl].to(torch.float32).clamp_(min=1e-4)
-        out[sl] = canvas[sl].to(torch.float32) / w
-    return out
+    """fp16 stitch files. Mapped only while blending, not during DiT."""
+    return DiskStitchCanvas(num_frames, height, width, channels, TEMP_DIR)
 
 def stitch_video_tiles(
     tile_paths,
@@ -1985,6 +1992,7 @@ def run_flashvsr_single(
     )
 
     final_output_tensor = None
+    stitch = None
     profiles = oom_fallback_profiles(tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit)
     last_err = None
     success = False
@@ -2082,12 +2090,13 @@ def run_flashvsr_single(
                     num_aligned_frames = N
                     expected_H = max(128, round(H * scale / 128) * 128) + 128
                     expected_W = max(128, round(W * scale / 128) * 128) + 128
-                    final_output_canvas, weight_sum_canvas, canvas_bytes = alloc_stitch_canvases(
+                    stitch = alloc_stitch_canvases(
                         num_aligned_frames, expected_H, expected_W, C
                     )
                     busy(
                         f"stitch canvas {num_aligned_frames}×{expected_W}×{expected_H} "
-                        f"float16 ({canvas_bytes / (1024**3):.1f} GB) — GPU scheduling retired"
+                        f"float16 ({stitch.nbytes / (1024**3):.1f} GB) on disk during DiT "
+                        f"— GPU scheduling retired"
                     )
 
                     for i in tqdm(range(num_tiles), desc="[FlashVSR] Processing tiles"):
@@ -2098,8 +2107,10 @@ def run_flashvsr_single(
                         input_tile = frames[:, y1:y2, x1:x2, :]
                         tile_h_in, tile_w_in = y2 - y1, x2 - x1
 
-                        LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
-                        LQ_tile = LQ_tile.to(_device)
+                        LQ_cpu, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
+                        LQ_tile = LQ_cpu.to(_device)
+                        del LQ_cpu
+                        release_host_cache()
                         log_vram_status(f"tile-{i+1}-dit-start")
                         with BusySpan(
                             f"tile {i+1}/{num_tiles} DiT+VAE",
@@ -2109,8 +2120,11 @@ def run_flashvsr_single(
                                 LQ_video=LQ_tile, num_frames=F, height=th, width=tw,
                                 topk_ratio=sparse_ratio*768*1280/(th*tw), **pipe_kwargs
                             )
+                        del LQ_tile
                         busy(f"tile {i+1}/{num_tiles} stitching into canvas")
-                        processed_tile_cpu = tensor2video(output_tile_gpu).cpu()
+                        processed_tile_cpu = frames_to_fp16_cpu(output_tile_gpu)
+                        del output_tile_gpu
+                        clean_vram()
                         processed_tile_cpu = processed_tile_cpu[:num_aligned_frames]
 
                         tile_h_out, tile_w_out = processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]
@@ -2128,16 +2142,12 @@ def run_flashvsr_single(
                         tile_h_actual = y2_s - y1_s
                         processed_tile_cpu = processed_tile_cpu[:, :tile_h_actual, :tile_w_actual, :]
                         mask = create_feather_mask((tile_h_actual, tile_w_actual), tile_overlap * scale).cpu()
-                        blend_tile_into_canvas(
-                            final_output_canvas, weight_sum_canvas,
+                        stitch.blend(
                             processed_tile_cpu, mask, y1_s, y2_s, x1_s, x2_s,
                         )
-                        del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile, mask
+                        del processed_tile_cpu, input_tile, mask
                         clean_vram()
-
-                    final_output_tensor = finalize_stitch_canvas(final_output_canvas, weight_sum_canvas)
-                    final_output_tensor = crop_to_scaled_dimensions(final_output_tensor, H, W, scale)
-                    del final_output_canvas, weight_sum_canvas
+                        release_host_cache()
             else:  # Non-tiled mode
                 progress(0.1, desc="Initializing model pipeline...")
                 pipe = init_pipeline(mode, _device, dtype, model_version=model_version)
@@ -2192,6 +2202,9 @@ def run_flashvsr_single(
         finally:
             release_pipeline(pipe)
             clean_vram()
+            if not success and stitch is not None:
+                stitch.close()
+                stitch = None
             if last_err is not None and is_cuda_oom(last_err) and not success:
                 # Extra pass after dropping the pipeline; still-low free VRAM means
                 # the CUDA context needs a full process restart.
@@ -2210,7 +2223,21 @@ def run_flashvsr_single(
             raise last_err
         raise gr.Error(oom_recovery_hint())
 
-    if final_output_tensor is not None:
+    if stitch is not None:
+        progress(0.9, desc="Saving final video...")
+        del frames
+        clean_vram()
+        release_host_cache()
+        try:
+            save_disk_stitch(
+                stitch, temp_video_path, fps=_fps, quality=quality,
+                src_h=H, src_w=W, scale=scale,
+            )
+        finally:
+            stitch.close()
+            stitch = None
+        clean_vram()
+    elif final_output_tensor is not None:
         progress(0.9, desc="Saving final video...")
         del frames
         clean_vram()

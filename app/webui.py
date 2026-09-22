@@ -6444,9 +6444,10 @@ def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress(), m
         return video_path
 
 def chunk_units(video_path, chunk_seconds=10.0):
-    """File length measured in chunks. 0.10 is one second when a chunk is 10s.
+    """File length in chunks. Rounded to tenths at display time.
 
-    One metadata read. The same duration lookup chunking already does.
+    Chunk size is the slider (10.25s). A clip of about 10.02s is under that,
+    so it stays one chunk and shows as 1.0. One metadata read.
     """
     try:
         step = float(chunk_seconds)

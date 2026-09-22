@@ -142,7 +142,8 @@ def _emit_raw(text: str) -> None:
 def _file_header(done: int, total: int, index: int, name: str, section: str, chunks=None) -> str:
     """One line per file: which file this is, how many are still unfinished, chunk length.
 
-    chunks is this file's length in chunk-units (15s at a 10s chunk is 1.50).
+    chunks is this file's length in chunk-units, rounded to tenths.
+    A 10.02s clip at a 10.25s chunk is 1.0 — it does not split.
     """
     total_i = max(1, int(total))
     done_i = max(0, int(done))
@@ -155,7 +156,7 @@ def _file_header(done: int, total: int, index: int, name: str, section: str, chu
         bits.append(f"file —/{total_i}")
     bits.append(f"left {left}")
     if chunks is not None:
-        bits.append(f"ÇÇhunks={float(chunks):.2f}")
+        bits.append(f"ÇÇhunks={round(float(chunks), 1):.1f}")
     if section:
         bits.append(section)
     if name:

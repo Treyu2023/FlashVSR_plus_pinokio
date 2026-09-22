@@ -69,7 +69,7 @@ from tqdm import tqdm
 from einops import rearrange
 from src.busy_heartbeat import (
     HeartbeatTqdm, busy, BusySpan, WATCH, force_line_buffering,
-    set_stop_check, tick_stop_banner,
+    set_stop_check, tick_stop_banner, set_session, set_section, clear_session,
 )
 
 force_line_buffering()
@@ -2626,9 +2626,11 @@ def run_flashvsr_batch_image(
     
     batch_messages = [f"🚀 Starting batch process for {total_images} images..."]
     last_output_path = None
+    batch_done = 0
     
     for i, image_path in enumerate(input_paths):
         try:
+            set_session(batch_done, total_images, i + 1, os.path.basename(image_path), "image")
             # Update batch progress
             batch_progress = (i / total_images)
             progress(batch_progress, desc=f"Batch: Processing image {i+1}/{total_images}: {os.path.basename(image_path)}")
@@ -2714,6 +2716,7 @@ def run_flashvsr_batch_image(
                 last_output_path = final_path
                 log(f"✅ Saved to batch folder: {final_path}", message_type='finish')
                 batch_messages.append(f"✅ Saved to: {filename}")
+                batch_done += 1
             else:
                 log(f"❌ Processing failed for {os.path.basename(image_path)}", message_type='error')
                 batch_messages.append(f"❌ Processing failed")
@@ -2722,6 +2725,8 @@ def run_flashvsr_batch_image(
             log(f"❌ Error processing {os.path.basename(image_path)}: {e}", message_type='error')
             batch_messages.append(f"❌ Error: {str(e)}")
             continue
+        finally:
+            clear_session()
     
     progress(1.0, desc="Batch processing complete!")
     batch_messages.append(f"\n✅ Batch processing complete! All results saved to: {batch_output_dir}")
@@ -2973,9 +2978,14 @@ def run_flashvsr_batch(
     batch_messages.append(f"📋 Remaining after crash: {os.path.join(batch_output_dir, 'REMAINING.txt')}")
     last_output_path = None
     fatal_oom = False
+    batch_done = 0
 
     for i, video_path in enumerate(input_paths):
         try:
+            set_session(
+                batch_done, total_videos, i + 1, os.path.basename(video_path), "upscale",
+                chunks=chunk_units(video_path, chunk_duration),
+            )
             # Update batch progress
             batch_progress = (i / total_videos)
             progress(batch_progress, desc=f"Batch: Processing video {i+1}/{total_videos}: {os.path.basename(video_path)}")
@@ -3086,6 +3096,7 @@ def run_flashvsr_batch(
                 last_output_path = final_path
                 log(f"✅ Saved to batch folder: {final_path}", message_type='finish')
                 batch_messages.append(f"✅ Saved to: {filename}")
+                batch_done += 1
                 write_live_batch_progress(
                     batch_output_dir,
                     total=total_videos,
@@ -3133,6 +3144,7 @@ def run_flashvsr_batch(
                 )
         finally:
             release_processing_vram()
+            clear_session()
     
     progress(1.0, desc="Batch processing complete!")
     if fatal_oom:
@@ -3629,6 +3641,10 @@ def _run_group_therapy_body(
         return None, wq.status_html(note)
 
     items = [it for it in wq.all_items() if it.get("status") != "done"]
+    session_order = {
+        os.path.normcase(it.get("path") or ""): i + 1 for i, it in enumerate(items)
+    }
+    session_total = len(items)
     groups = gt.ordered_groups(items)
     if not groups:
         note = f"Group Therapy empty — drop videos in {watch_folder or 'the original folder'}."
@@ -3791,6 +3807,12 @@ def _run_group_therapy_body(
                     wq.update_item(path, gt_original=path)
 
                 try:
+                    file_index = session_order.get(os.path.normcase(path), f_i + 1)
+                    set_session(
+                        finished, session_total, file_index,
+                        os.path.basename(path), label,
+                        chunks=chunk_units(path, chunk_duration),
+                    )
                     if stage == "upscale":
                         out, resized = _gt_upscale_one(
                             src,
@@ -3899,6 +3921,7 @@ def _run_group_therapy_body(
                         log(note, message_type="error")
                         return last_output, wq.status_html(note)
                 finally:
+                    clear_session()
                     if stage == "upscale":
                         release_processing_vram()
                     try:
@@ -4462,6 +4485,11 @@ def _run_flashvsr_work_queue_body(
         progress((run_i / max(pending_count, 1)), desc=label)
         log(f"\n--- {label} ---", message_type="info")
         wq.set_item_status(video_path, "running")
+        done_n = sum(1 for it in wq.all_items() if it.get("status") == "done")
+        set_session(
+            done_n, total_q, idx, os.path.basename(video_path), "upscale",
+            chunks=chunk_units(video_path, chunk_duration),
+        )
 
         if fatal_oom or cuda_context_poisoned(min_free_mb=1500):
             fatal_oom = True
@@ -4477,6 +4505,7 @@ def _run_flashvsr_work_queue_body(
                 error=msg,
                 all_sources=all_paths,
             )
+            clear_session()
             continue
 
         try:
@@ -4596,6 +4625,7 @@ def _run_flashvsr_work_queue_body(
                 )
         finally:
             release_processing_vram()
+            clear_session()
 
         # Soft-stop: finish current (already done), then pause before next
         if wq.stop_requested():
@@ -4806,6 +4836,8 @@ def _run_flashvsr_image_work_queue_body(
         progress(run_i / max(pending_count, 1), desc=label)
         log(f"\n--- {label} ---", message_type="info")
         wq.set_item_status(image_path, "running")
+        done_n = sum(1 for it in wq.all_items() if it.get("status") == "done")
+        set_session(done_n, total_q, idx, os.path.basename(image_path), "image")
 
         try:
             class DummyProgress:
@@ -4876,6 +4908,7 @@ def _run_flashvsr_image_work_queue_body(
             wq.set_item_status(image_path, "failed", error=str(e))
         finally:
             release_processing_vram()
+            clear_session()
 
         if wq.stop_requested():
             wq.clear_stop()
@@ -5897,6 +5930,11 @@ def _run_toolbox_work_queue_body(wq, progress):
             permanent_fail += 1
             continue
         wq.set_item_status(video_path, "running")
+        done_n = sum(1 for it in wq.all_items() if it.get("status") == "done")
+        set_session(
+            done_n, total_q, idx, os.path.basename(video_path), "toolbox",
+            chunks=chunk_units(video_path, get_ui_defaults().get("chunk_duration") or 10.0),
+        )
         t0 = time.time()
         result_path, messages = None, ""
 
@@ -6037,6 +6075,7 @@ def _run_toolbox_work_queue_body(wq, progress):
                 permanent_fail += 1
         finally:
             release_processing_vram()
+            clear_session()
 
         if wq.stop_requested():
             wq.clear_stop()
@@ -6403,6 +6442,26 @@ def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress(), m
         import traceback
         log(traceback.format_exc(), message_type="error")
         return video_path
+
+def chunk_units(video_path, chunk_seconds=10.0):
+    """File length measured in chunks. 0.10 is one second when a chunk is 10s.
+
+    One metadata read. The same duration lookup chunking already does.
+    """
+    try:
+        step = float(chunk_seconds)
+    except (TypeError, ValueError):
+        step = 10.0
+    if step <= 0:
+        step = 10.0
+    try:
+        dur = float(get_video_duration(video_path) or 0)
+    except (TypeError, ValueError):
+        return None
+    if dur <= 0:
+        return None
+    return dur / step
+
 
 def get_video_duration(video_path):
     """Get video duration in seconds. Returns 0 on error."""
@@ -6888,6 +6947,7 @@ def process_video_with_chunks(
         
         log(f"Processing chunk {i+1}/{num_chunks}...", message_type="info")
         progress(chunk_progress_start, desc=f"Processing chunk {i+1}/{num_chunks}...")
+        prev_section = set_section(f"chunk {i + 1}/{num_chunks}")
         
         try:
             # Create a custom progress wrapper that scales to the chunk's progress range
@@ -6949,6 +7009,7 @@ def process_video_with_chunks(
                 log_vram_status(f"chunk-{i+1}-after-oom")
             continue
         finally:
+            set_section(prev_section)
             release_processing_vram()
 
     # Clean up unprocessed chunks

@@ -88,17 +88,132 @@ def force_line_buffering() -> None:
             pass
 
 
-# One mark per step when there are few of them (tiles, DiT windows). Big jobs
-# (VAE, save) fold into a fixed ring so the line stays short.
-_PIE_ONE_EACH = 32
-_PIE_RING = 16
-_PIE_DONE = "●"
-_PIE_LEFT = "○"
-_PIE_WORK = ("◉", "◈")
+# One 100-piece bar per status line. Each kind of work has its own marks so a
+# tiles row, a DiT row, and a decode row are obvious without reading the label.
+# done, empty, (work frame A, work frame B)
+_PIE_SLOTS = 100
+_STYLES = {
+    "tiles":  ("█", "░", ("▓", "▒")),
+    "dit":    ("●", "○", ("◉", "◈")),
+    "decode": ("■", "□", ("▣", "▢")),
+    "save":   ("▰", "▱", ("▶", "▷")),
+    "stitch": ("✚", "·", ("✦", "✧")),
+    "chunks": ("❚", "╌", ("▮", "▯")),
+    "frames": ("▲", "△", ("▴", "▵")),
+    "image":  ("◆", "⋄", ("◇", "◈")),
+    "work":   ("#", "-", (">", "<")),
+}
 _SPIN = ("◐", "◓", "◑", "◒")
 
 _prog_lock = threading.Lock()
-_prog = {"done": None, "total": None, "label": "", "pulse": 0}
+_prog = {"done": None, "total": None, "label": "", "pulse": 0, "start_t": None}
+_session = {
+    "done": None,
+    "total": None,
+    "index": None,
+    "name": "",
+    "section": "",
+}
+
+
+def _short_file(name: str, limit: int = 36) -> str:
+    base = os.path.basename(name or "").strip()
+    if len(base) <= limit:
+        return base
+    stem, ext = os.path.splitext(base)
+    keep = max(8, limit - len(ext) - 1)
+    return stem[:keep] + "…" + ext
+
+
+def _emit_raw(text: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+    line = f"\n[{ts}] [FlashVSR] {text}"
+    try:
+        print(line, flush=True)
+    except Exception:
+        try:
+            sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+    tick_stop_banner()
+
+
+def _file_header(done: int, total: int, index: int, name: str, section: str, chunks=None) -> str:
+    """One line per file: which file this is, how many are still unfinished, chunk length.
+
+    chunks is this file's length in chunk-units (15s at a 10s chunk is 1.50).
+    """
+    total_i = max(1, int(total))
+    done_i = max(0, int(done))
+    index_i = int(index or 0)
+    left = max(0, total_i - done_i)
+    bits = []
+    if index_i:
+        bits.append(f"file {index_i}/{total_i}")
+    else:
+        bits.append(f"file —/{total_i}")
+    bits.append(f"left {left}")
+    if chunks is not None:
+        bits.append(f"ÇÇhunks={float(chunks):.2f}")
+    if section:
+        bits.append(section)
+    if name:
+        bits.append(name)
+    return "« " + "  ·  ".join(bits) + " »"
+
+
+def set_session(done: int, total: int, index: int, name: str = "", section: str = "", chunks=None) -> None:
+    """Print the file line once. Later rows for this file are only the work bar.
+
+    done = files already finished, total = queued, index = 1-based file now running.
+    section is the pipeline stage (upscale, RIFE, export, …).
+    chunks is this file's length in chunk-units, shown once next to files left.
+    """
+    short = _short_file(name)
+    section = (section or "").strip()
+    index_i = int(index) if index else None
+    try:
+        chunks_f = None if chunks is None else float(chunks)
+    except (TypeError, ValueError):
+        chunks_f = None
+    with _prog_lock:
+        changed = (index_i, short) != (_session["index"], _session["name"])
+        _session["done"] = int(done)
+        _session["total"] = int(total) if total else None
+        _session["index"] = index_i
+        _session["name"] = short
+        _session["section"] = section
+        total_i = _session["total"]
+        done_i = _session["done"]
+    if changed and total_i:
+        _emit_raw(_file_header(done_i or 0, total_i, index_i or 0, short, section, chunks_f))
+
+
+def set_section(section: str) -> str:
+    """Swap the stage label. Returns the previous one so a chunk can restore it.
+
+    A real stage change prints one line. It does not repeat the file count.
+    """
+    section = (section or "").strip()
+    with _prog_lock:
+        prev = _session["section"]
+        _session["section"] = section
+        have_file = bool(_session["total"])
+    # Only a new chunk is worth a line. Restoring "upscale" after the chunk
+    # would repeat the file header's stage.
+    if have_file and section and section != (prev or "") and section.lower().startswith("chunk"):
+        _emit_raw(f"› {section}")
+    return prev
+
+
+def clear_session() -> None:
+    with _prog_lock:
+        _session["done"] = None
+        _session["total"] = None
+        _session["index"] = None
+        _session["name"] = ""
+        _session["section"] = ""
 
 
 def _short_label(desc: str) -> str:
@@ -123,56 +238,104 @@ def _short_label(desc: str) -> str:
     return (low.split()[:1] or ["work"])[0][:12]
 
 
-def render_pie(done: int, total: int, pulse: int = 0) -> str:
-    """Solid piece = finished, flashing piece = the one running, hollow = left."""
+def _style(label: str):
+    key = (label or "work").lower()
+    return _STYLES.get(key, _STYLES["work"])
+
+
+def render_pie(done: int, total: int, pulse: int = 0, slots: int = _PIE_SLOTS, label: str = "work") -> str:
+    """100 marks. Solid = finished, flashing pair = the piece running, hollow = left.
+
+    `label` picks the glyph set (tiles, DiT, decode, save, …).
+    """
+    done_g, left_g, work = _style(label)
     total = max(1, int(total))
     done = min(total, max(0, int(done)))
-    if total <= _PIE_ONE_EACH:
-        slots = total
-        filled = done
-    else:
-        slots = _PIE_RING
-        filled = int(round(slots * done / total))
-        filled = min(slots, max(0, filled))
+    slots = max(1, int(slots))
+    filled = int(round(slots * done / total))
+    filled = min(slots, max(0, filled))
     working = done < total
     if working and filled >= slots:
         filled = slots - 1
     marks = []
     for i in range(slots):
         if i < filled:
-            marks.append(_PIE_DONE)
+            marks.append(done_g)
         elif working and i == filled:
-            marks.append(_PIE_WORK[pulse % 2])
+            marks.append(work[pulse % 2])
         else:
-            marks.append(_PIE_LEFT)
+            marks.append(left_g)
     return "".join(marks)
 
 
-def _remember_progress(done, total, label: str) -> str:
+def _format_counts(done, total, start_t, now: float) -> str:
+    """n/total, percent, rate, seconds per step, elapsed, ETA."""
+    if done is None or start_t is None:
+        return ""
+    done_i = int(done)
+    elapsed = max(0.0, now - float(start_t))
+    rate = (done_i / elapsed) if elapsed > 0 and done_i else 0.0
+    if not total:
+        return f"{done_i}  elapsed {elapsed:.0f}s"
+    total_i = max(1, int(total))
+    pct = 100.0 * done_i / total_i
+    parts = [f"{done_i}/{total_i} ({pct:.0f}%)"]
+    if rate > 0:
+        parts.append(f"{rate:.2f}/s")
+        parts.append(f"{1.0 / rate:.1f}s/step")
+        remain = max(0.0, (total_i - done_i) / rate)
+        parts.append(f"elapsed {elapsed:.0f}s")
+        parts.append(f"ETA {remain:.0f}s")
+    else:
+        parts.append(f"elapsed {elapsed:.0f}s")
+        parts.append("ETA —" if done_i < total_i else "ETA 0s")
+    return "  ".join(parts)
+
+
+def _progress_text(done, total, label: str, pulse: int, start_t, now: float, silent: float | None = None) -> str:
+    """One bar for this step, then the counts. The file line is not repeated."""
+    if total:
+        visual = render_pie(done or 0, total, pulse, label=label or "work")
+    else:
+        visual = _SPIN[pulse % len(_SPIN)]
+    bits = [visual]
+    if label:
+        bits.append(label)
+    counts = _format_counts(done, total, start_t, now)
+    if counts:
+        bits.append(counts)
+    if silent is not None and silent >= 1:
+        bits.append(f"{silent:.0f}s since last step")
+    return "  ".join(bits)
+
+
+def _remember_progress(done, total, label: str, start_t) -> str:
     with _prog_lock:
         _prog["done"] = done
         _prog["total"] = total
         _prog["label"] = label
+        _prog["start_t"] = start_t
         _prog["pulse"] ^= 1
         pulse = _prog["pulse"]
-    if total:
-        return f"{render_pie(done, total, pulse)}  {label}"
-    spin = _SPIN[pulse % len(_SPIN)]
-    return f"{spin}  {label}" if label else spin
+    return _progress_text(done, total, label, pulse, start_t, time.time())
 
 
-def _flash_progress(fallback_label: str) -> str:
-    """Next blink of the same pie. Used when a GPU step prints nothing for a while."""
+def _flash_progress(fallback_label: str, silent: float) -> str:
+    """Next blink of the same pie, with the counts still on the line.
+
+    Used when a GPU step prints nothing for a while. The old "still busy"
+    sentence stayed noisy; the numbers and the seconds since the last step
+    carry that same "not frozen" fact.
+    """
+    now = time.time()
     with _prog_lock:
         done = _prog["done"]
         total = _prog["total"]
         label = _prog["label"] or _short_label(fallback_label)
+        start_t = _prog["start_t"]
         _prog["pulse"] ^= 1
         pulse = _prog["pulse"]
-    if total:
-        return f"{render_pie(done or 0, total, pulse)}  {label}"
-    spin = _SPIN[pulse % len(_SPIN)]
-    return f"{spin}  {label}" if label else spin
+    return _progress_text(done, total, label, pulse, start_t, now, silent=silent)
 
 
 def busy(msg: str) -> None:
@@ -238,7 +401,6 @@ class BusyWatchdog:
                 depth = self._depth
                 phase = self._phase
                 last = self._last
-                t0 = self._t0
             if depth <= 0:
                 if stop_armed():
                     _print_stop_banner()
@@ -246,10 +408,10 @@ class BusyWatchdog:
             silent = time.time() - last
             if silent < self.interval:
                 continue
-            # Reprint the pie with the working piece toggled. The old
-            # "still busy" sentence is intentionally not printed.
+            # Reprint the pie and the counts. A quiet GPU step used to say
+            # "still busy"; the seconds-since-last-step figure says the same thing.
             ts = time.strftime("%H:%M:%S")
-            line = f"\n[{ts}] {_flash_progress(phase)}"
+            line = f"\n[{ts}] [FlashVSR] {_flash_progress(phase, silent)}"
             try:
                 print(line, flush=True)
             except Exception:
@@ -286,7 +448,11 @@ class BusySpan:
 
 
 class HeartbeatTqdm(_Tqdm):
-    """Progress as a pie row. The classic text bar is not written to the log."""
+    """Pie row plus count, percent, rate, elapsed, and ETA.
+
+    The classic tqdm text bar is not written to the log (Pinokio only keeps
+    whole lines, and a ``\\r`` bar never shows up).
+    """
 
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("mininterval", 1.0)
@@ -310,9 +476,9 @@ class HeartbeatTqdm(_Tqdm):
             return
         self._last_hb = now
         label = _short_label(self.desc or "working")
-        visual = _remember_progress(self.n or 0, self.total, label)
+        visual = _remember_progress(self.n or 0, self.total, label, self.start_t)
         ts = time.strftime("%H:%M:%S")
-        line = f"\n[{ts}] {visual}"
+        line = f"\n[{ts}] [FlashVSR] {visual}"
         try:
             print(line, flush=True)
         except Exception:

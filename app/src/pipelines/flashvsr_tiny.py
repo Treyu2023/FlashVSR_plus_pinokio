@@ -395,12 +395,18 @@ class FlashVSRTinyPipeline(BasePipeline):
             self.init_cross_kv(context_tensor=self.prompt_emb_posi['context'])
         self.load_models_to_device(["dit"])
         self.dit.LQ_proj_in.to(self.device)
-        self.TCDecoder.to(self.device)
+        # TCDecoder is idle until VAE. Leaving it on the 4090 during the
+        # stream, next to 30 blocks of KV, is what packed the card.
+        if getattr(self, "TCDecoder", None) is not None:
+            self.TCDecoder.to("cpu")
+        clean_vram()
         if torch.cuda.is_available():
             alloc = torch.cuda.memory_allocated() / (1024 ** 3)
             reserved = torch.cuda.memory_reserved() / (1024 ** 3)
             print(
-                f"[FlashVSR] VRAM before DiT: {alloc:.1f} GB alloc / {reserved:.1f} GB reserved",
+                "[FlashVSR] VRAM before DiT: "
+                f"{alloc:.1f} GB alloc / {reserved:.1f} GB reserved "
+                "(park stream KV on CPU between blocks)",
                 flush=True,
             )
 
@@ -450,6 +456,11 @@ class FlashVSRTinyPipeline(BasePipeline):
                     LQ_cur_idx = cur_process_idx*8+21+(inner_loop_num-2)*4
                     cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
 
+                # Full LQ for every layer is several GB. Park it before the
+                # block loop so it is not resident next to the KV caches.
+                LQ_latents = _park_stream_tensors(LQ_latents)
+                del cur
+
                 # 推理（无 motion_controller / vace）
                 noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
                     self.dit,
@@ -490,6 +501,9 @@ class FlashVSRTinyPipeline(BasePipeline):
                 self.drop_dit_stream_kv()
             else:
                 clean_vram()
+
+            if getattr(self, "TCDecoder", None) is not None:
+                self.TCDecoder.to(self.device)
 
             latents = torch.cat(latents_total, dim=2)
             del latents_total
@@ -597,6 +611,25 @@ class TeaCache:
         return hidden_states
 
 
+def _park_stream_tensors(layers):
+    """Park stream KV / LQ on CPU.
+
+    Thirty blocks each keep a kv_ratio window of K and V. Resident together
+    with the per-layer LQ stack they fill a 24 GB 4090, WDDM pages the
+    weights, and the chip sits near 110 W (a DiT step goes from ~10 s to
+    60–170 s). Callers copy one block back to the GPU just for that block.
+    """
+    if not layers:
+        return layers
+    parked = []
+    for tensor in layers:
+        if tensor is None or tensor.device.type == "cpu":
+            parked.append(tensor)
+        else:
+            parked.append(tensor.detach().to("cpu"))
+    return parked
+
+
 # -----------------------------
 # 简化版模型前向封装（无 vace / 无 motion_controller）
 # -----------------------------
@@ -663,7 +696,18 @@ def model_fn_wan_video(
     else:
         for block_id, block in enumerate(dit.blocks):
             if LQ_latents is not None and block_id < len(LQ_latents):
-                x = x + LQ_latents[block_id]
+                lq = LQ_latents[block_id]
+                if lq is not None and lq.device != x.device:
+                    lq = lq.to(device=x.device, dtype=x.dtype, non_blocking=True)
+                x = x + lq
+                del lq
+            # park stream KV: only this block's window is on the GPU.
+            pk = pre_cache_k[block_id] if pre_cache_k is not None else None
+            pv = pre_cache_v[block_id] if pre_cache_v is not None else None
+            if pk is not None and pk.device != x.device:
+                pk = pk.to(device=x.device, non_blocking=True)
+            if pv is not None and pv.device != x.device:
+                pv = pv.to(device=x.device, non_blocking=True)
             x, last_pre_cache_k, last_pre_cache_v = block(
                 x, context, t_mod, freqs, f, h, w,
                 local_num, topk,
@@ -671,12 +715,14 @@ def model_fn_wan_video(
                 kv_len=kv_len,
                 is_full_block=is_full_block,
                 is_stream=is_stream,
-                pre_cache_k=pre_cache_k[block_id] if pre_cache_k is not None else None,
-                pre_cache_v=pre_cache_v[block_id] if pre_cache_v is not None else None,
+                pre_cache_k=pk,
+                pre_cache_v=pv,
                 local_range = local_range,
             )
-            if pre_cache_k is not None: pre_cache_k[block_id] = last_pre_cache_k
-            if pre_cache_v is not None: pre_cache_v[block_id] = last_pre_cache_v
+            if pre_cache_k is not None:
+                pre_cache_k[block_id] = last_pre_cache_k.detach().to("cpu")
+                pre_cache_v[block_id] = last_pre_cache_v.detach().to("cpu")
+            del pk, pv, last_pre_cache_k, last_pre_cache_v
 
     x = dit.head(x, t)
     if use_unified_sequence_parallel:

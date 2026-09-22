@@ -88,6 +88,93 @@ def force_line_buffering() -> None:
             pass
 
 
+# One mark per step when there are few of them (tiles, DiT windows). Big jobs
+# (VAE, save) fold into a fixed ring so the line stays short.
+_PIE_ONE_EACH = 32
+_PIE_RING = 16
+_PIE_DONE = "●"
+_PIE_LEFT = "○"
+_PIE_WORK = ("◉", "◈")
+_SPIN = ("◐", "◓", "◑", "◒")
+
+_prog_lock = threading.Lock()
+_prog = {"done": None, "total": None, "label": "", "pulse": 0}
+
+
+def _short_label(desc: str) -> str:
+    d = (desc or "").strip()
+    if d.startswith("[FlashVSR]"):
+        d = d[len("[FlashVSR]"):].strip()
+    low = d.lower().replace("...", "").strip()
+    if "dit" in low:
+        return "DiT"
+    if "vae" in low or low == "working":
+        return "decode"
+    if "tile" in low:
+        return "tiles"
+    if "sav" in low:
+        return "save"
+    if "chunk" in low:
+        return "chunks"
+    if "frame" in low:
+        return "frames"
+    if "stitch" in low:
+        return "stitch"
+    return (low.split()[:1] or ["work"])[0][:12]
+
+
+def render_pie(done: int, total: int, pulse: int = 0) -> str:
+    """Solid piece = finished, flashing piece = the one running, hollow = left."""
+    total = max(1, int(total))
+    done = min(total, max(0, int(done)))
+    if total <= _PIE_ONE_EACH:
+        slots = total
+        filled = done
+    else:
+        slots = _PIE_RING
+        filled = int(round(slots * done / total))
+        filled = min(slots, max(0, filled))
+    working = done < total
+    if working and filled >= slots:
+        filled = slots - 1
+    marks = []
+    for i in range(slots):
+        if i < filled:
+            marks.append(_PIE_DONE)
+        elif working and i == filled:
+            marks.append(_PIE_WORK[pulse % 2])
+        else:
+            marks.append(_PIE_LEFT)
+    return "".join(marks)
+
+
+def _remember_progress(done, total, label: str) -> str:
+    with _prog_lock:
+        _prog["done"] = done
+        _prog["total"] = total
+        _prog["label"] = label
+        _prog["pulse"] ^= 1
+        pulse = _prog["pulse"]
+    if total:
+        return f"{render_pie(done, total, pulse)}  {label}"
+    spin = _SPIN[pulse % len(_SPIN)]
+    return f"{spin}  {label}" if label else spin
+
+
+def _flash_progress(fallback_label: str) -> str:
+    """Next blink of the same pie. Used when a GPU step prints nothing for a while."""
+    with _prog_lock:
+        done = _prog["done"]
+        total = _prog["total"]
+        label = _prog["label"] or _short_label(fallback_label)
+        _prog["pulse"] ^= 1
+        pulse = _prog["pulse"]
+    if total:
+        return f"{render_pie(done or 0, total, pulse)}  {label}"
+    spin = _SPIN[pulse % len(_SPIN)]
+    return f"{spin}  {label}" if label else spin
+
+
 def busy(msg: str) -> None:
     """Print a timestamped status line that always becomes a new log row."""
     ts = time.strftime("%H:%M:%S")
@@ -159,12 +246,10 @@ class BusyWatchdog:
             silent = time.time() - last
             if silent < self.interval:
                 continue
-            total = time.time() - t0
+            # Reprint the pie with the working piece toggled. The old
+            # "still busy" sentence is intentionally not printed.
             ts = time.strftime("%H:%M:%S")
-            line = (
-                f"\n[{ts}] [FlashVSR] still busy — {phase} "
-                f"(job {total:.0f}s, {silent:.0f}s since last step; GPU work, not frozen)"
-            )
+            line = f"\n[{ts}] {_flash_progress(phase)}"
             try:
                 print(line, flush=True)
             except Exception:
@@ -201,7 +286,7 @@ class BusySpan:
 
 
 class HeartbeatTqdm(_Tqdm):
-    """tqdm that also emits a newline snapshot so Pinokio logs move."""
+    """Progress as a pie row. The classic text bar is not written to the log."""
 
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("mininterval", 1.0)
@@ -213,6 +298,9 @@ class HeartbeatTqdm(_Tqdm):
         if not self.disable:
             self._emit(force=True, why="start")
 
+    def display(self, msg=None, pos=None):
+        return None
+
     def _emit(self, force: bool = False, why: str = "") -> None:
         if self.disable:
             return
@@ -221,22 +309,16 @@ class HeartbeatTqdm(_Tqdm):
             WATCH.ping(self.desc or "working")
             return
         self._last_hb = now
-        total = self.total
-        n = self.n
-        elapsed = now - self.start_t if self.start_t else 0.0
-        rate = (n / elapsed) if elapsed > 0 and n else 0.0
-        desc = (self.desc or "working").strip() or "working"
-        if desc.startswith("[FlashVSR]"):
-            desc = desc[len("[FlashVSR]"):].strip() or "working"
-        if total:
-            pct = 100.0 * n / total
-            remain = ((total - n) / rate) if rate else 0.0
-            busy(
-                f"{desc}: {n}/{total} ({pct:.0f}%) {rate:.2f}/s "
-                f"elapsed {elapsed:.0f}s ETA {remain:.0f}s"
-            )
-        else:
-            busy(f"{desc}: {n} elapsed {elapsed:.0f}s")
+        label = _short_label(self.desc or "working")
+        visual = _remember_progress(self.n or 0, self.total, label)
+        ts = time.strftime("%H:%M:%S")
+        line = f"\n[{ts}] {visual}"
+        try:
+            print(line, flush=True)
+        except Exception:
+            pass
+        WATCH.ping(label)
+        tick_stop_banner()
 
     def update(self, n=1):
         result = super().update(n)

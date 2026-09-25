@@ -139,11 +139,65 @@ def _emit_raw(text: str) -> None:
     tick_stop_banner()
 
 
-def _file_header(done: int, total: int, index: int, name: str, section: str, chunks=None) -> str:
-    """One line per file: which file this is, how many are still unfinished, chunk length.
+def chunk_tenths(duration, fps, chunk_seconds) -> float | None:
+    """Work in this clip, in chunk-lengths, before display rounding.
 
-    chunks is this file's length in chunk-units, rounded to tenths.
-    A 10.02s clip at a 10.25s chunk is 1.0 — it does not split.
+    Matches the cutter: a chunk is `chunk_seconds` (10.25). A tail shorter than
+    21 frames is pulled into the previous piece, so a 10.02s file stays one
+    chunk. Divide by the chunk size; the header rounds that to tenths.
+    """
+    try:
+        step = float(chunk_seconds)
+    except (TypeError, ValueError):
+        step = 10.25
+    if step <= 0:
+        step = 10.25
+    try:
+        dur = float(duration or 0)
+    except (TypeError, ValueError):
+        return None
+    if dur <= 0:
+        return None
+    try:
+        fps_v = float(fps or 0)
+    except (TypeError, ValueError):
+        fps_v = 0.0
+    if fps_v <= 1:
+        fps_v = 30.0
+    min_tail = max(21.0 / fps_v, 0.05)
+    if dur <= step + 1e-6:
+        return dur / step
+    units = 0.0
+    t = 0.0
+    end = dur
+    while t < end - 1e-6:
+        next_t = min(t + step, end)
+        remaining_after = end - next_t
+        if 0 < remaining_after < min_tail:
+            next_t = end
+        this = next_t - t
+        if this < min_tail and units > 0:
+            units += this / step
+            break
+        units += this / step
+        if next_t >= end - 1e-6:
+            break
+        t = next_t
+    return units
+
+
+def _fmt_tenths(value) -> str:
+    return f"{round(float(value), 1):.1f}"
+
+
+def _file_header(
+    done: int, total: int, index: int, name: str, section: str,
+    chunks=None, chunks_left=None,
+) -> str:
+    """One line per file. Files left, then leftover chunks, then this file.
+
+    ÇÇleft is the queue still unfinished, in tenths of a chunk.
+    ÇÇhunks is this file only. A 10.02s clip at 10.25s is 1.0.
     """
     total_i = max(1, int(total))
     done_i = max(0, int(done))
@@ -155,8 +209,17 @@ def _file_header(done: int, total: int, index: int, name: str, section: str, chu
     else:
         bits.append(f"file —/{total_i}")
     bits.append(f"left {left}")
+    show_left_chunks = chunks_left is not None
+    if show_left_chunks and chunks is not None:
+        try:
+            if abs(float(chunks_left) - float(chunks)) < 0.05:
+                show_left_chunks = False
+        except (TypeError, ValueError):
+            pass
+    if show_left_chunks:
+        bits.append(f"ÇÇleft={_fmt_tenths(chunks_left)}")
     if chunks is not None:
-        bits.append(f"ÇÇhunks={round(float(chunks), 1):.1f}")
+        bits.append(f"ÇÇhunks={_fmt_tenths(chunks)}")
     if section:
         bits.append(section)
     if name:
@@ -164,20 +227,27 @@ def _file_header(done: int, total: int, index: int, name: str, section: str, chu
     return "« " + "  ·  ".join(bits) + " »"
 
 
-def set_session(done: int, total: int, index: int, name: str = "", section: str = "", chunks=None) -> None:
+def set_session(
+    done: int, total: int, index: int, name: str = "", section: str = "",
+    chunks=None, chunks_left=None,
+) -> None:
     """Print the file line once. Later rows for this file are only the work bar.
 
     done = files already finished, total = queued, index = 1-based file now running.
-    section is the pipeline stage (upscale, RIFE, export, …).
-    chunks is this file's length in chunk-units, shown once next to files left.
+    chunks is this file. chunks_left is every file not finished yet, same units.
     """
     short = _short_file(name)
     section = (section or "").strip()
     index_i = int(index) if index else None
-    try:
-        chunks_f = None if chunks is None else float(chunks)
-    except (TypeError, ValueError):
-        chunks_f = None
+
+    def _f(value):
+        try:
+            return None if value is None else float(value)
+        except (TypeError, ValueError):
+            return None
+
+    chunks_f = _f(chunks)
+    left_f = _f(chunks_left)
     with _prog_lock:
         changed = (index_i, short) != (_session["index"], _session["name"])
         _session["done"] = int(done)
@@ -188,7 +258,9 @@ def set_session(done: int, total: int, index: int, name: str = "", section: str 
         total_i = _session["total"]
         done_i = _session["done"]
     if changed and total_i:
-        _emit_raw(_file_header(done_i or 0, total_i, index_i or 0, short, section, chunks_f))
+        _emit_raw(_file_header(
+            done_i or 0, total_i, index_i or 0, short, section, chunks_f, left_f,
+        ))
 
 
 def set_section(section: str) -> str:

@@ -70,6 +70,7 @@ from einops import rearrange
 from src.busy_heartbeat import (
     HeartbeatTqdm, busy, BusySpan, WATCH, force_line_buffering,
     set_stop_check, tick_stop_banner, set_session, set_section, clear_session,
+    chunk_tenths,
 )
 
 force_line_buffering()
@@ -2985,6 +2986,7 @@ def run_flashvsr_batch(
             set_session(
                 batch_done, total_videos, i + 1, os.path.basename(video_path), "upscale",
                 chunks=chunk_units(video_path, chunk_duration),
+                chunks_left=queue_chunk_units(input_paths[i:], chunk_duration),
             )
             # Update batch progress
             batch_progress = (i / total_videos)
@@ -3811,7 +3813,11 @@ def _run_group_therapy_body(
                     set_session(
                         finished, session_total, file_index,
                         os.path.basename(path), label,
-                        chunks=chunk_units(path, chunk_duration),
+                        chunks=chunk_units(src or path, chunk_duration),
+                        chunks_left=queue_chunk_units(
+                            [it.get("path") for it in wq.all_items() if it.get("status") != "done"],
+                            chunk_duration,
+                        ),
                     )
                     if stage == "upscale":
                         out, resized = _gt_upscale_one(
@@ -4489,6 +4495,10 @@ def _run_flashvsr_work_queue_body(
         set_session(
             done_n, total_q, idx, os.path.basename(video_path), "upscale",
             chunks=chunk_units(video_path, chunk_duration),
+            chunks_left=queue_chunk_units(
+                [video_path] + [it.get("path") for it in wq.pending_items()],
+                chunk_duration,
+            ),
         )
 
         if fatal_oom or cuda_context_poisoned(min_free_mb=1500):
@@ -5931,9 +5941,14 @@ def _run_toolbox_work_queue_body(wq, progress):
             continue
         wq.set_item_status(video_path, "running")
         done_n = sum(1 for it in wq.all_items() if it.get("status") == "done")
+        _chunk_step = get_ui_defaults().get("chunk_duration") or 10.25
         set_session(
             done_n, total_q, idx, os.path.basename(video_path), "toolbox",
-            chunks=chunk_units(video_path, get_ui_defaults().get("chunk_duration") or 10.0),
+            chunks=chunk_units(video_path, _chunk_step),
+            chunks_left=queue_chunk_units(
+                [video_path] + [it.get("path") for it in wq.pending_items()],
+                _chunk_step,
+            ),
         )
         t0 = time.time()
         result_path, messages = None, ""
@@ -6443,25 +6458,88 @@ def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress(), m
         log(traceback.format_exc(), message_type="error")
         return video_path
 
-def chunk_units(video_path, chunk_seconds=10.0):
-    """File length in chunks. Rounded to tenths at display time.
+_dur_fps_cache = {}
 
-    Chunk size is the slider (10.25s). A clip of about 10.02s is under that,
-    so it stays one chunk and shows as 1.0. One metadata read.
-    """
-    try:
-        step = float(chunk_seconds)
-    except (TypeError, ValueError):
-        step = 10.0
-    if step <= 0:
-        step = 10.0
-    try:
-        dur = float(get_video_duration(video_path) or 0)
-    except (TypeError, ValueError):
+
+def _probe_dur_fps(video_path):
+    """Duration and fps. Cached. ffprobe metadata only — not a decode."""
+    key = os.path.normcase(os.path.abspath(video_path)) if video_path else ""
+    if key in _dur_fps_cache:
+        return _dur_fps_cache[key]
+    dur, fps = 0.0, 0.0
+    if video_path and os.path.exists(video_path):
+        try:
+            proc = subprocess.run(
+                [
+                    _ffprobe_exe(), "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=avg_frame_rate:format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=0",
+                    video_path,
+                ],
+                capture_output=True, text=True, timeout=8, check=False,
+            )
+            rate = ""
+            for line in (proc.stdout or "").splitlines():
+                if line.startswith("duration="):
+                    try:
+                        val = float(line.split("=", 1)[1])
+                    except ValueError:
+                        val = 0.0
+                    if val > dur:
+                        dur = val
+                elif line.startswith("avg_frame_rate="):
+                    rate = line.split("=", 1)[1].strip()
+            if "/" in rate:
+                num, den = rate.split("/", 1)
+                den_f = float(den)
+                fps = float(num) / den_f if den_f else 0.0
+            elif rate:
+                fps = float(rate)
+        except Exception:
+            dur, fps = 0.0, 0.0
+    if dur <= 0 and video_path:
+        try:
+            dur = float(get_video_duration(video_path) or 0)
+        except (TypeError, ValueError):
+            dur = 0.0
+    if fps <= 1 and video_path:
+        try:
+            fps = float(get_video_fps(video_path) or 30)
+        except (TypeError, ValueError):
+            fps = 30.0
+    if fps <= 1:
+        fps = 30.0
+    if key:
+        _dur_fps_cache[key] = (dur, fps)
+    return dur, fps
+
+
+def chunk_units(video_path, chunk_seconds=10.25):
+    """This file in chunk-lengths. Same cuts as the 10.25s splitter. Not rounded."""
+    if not video_path:
         return None
-    if dur <= 0:
-        return None
-    return dur / step
+    dur, fps = _probe_dur_fps(video_path)
+    return chunk_tenths(dur, fps, chunk_seconds)
+
+
+def queue_chunk_units(paths, chunk_seconds=10.25):
+    """Sum of chunk-lengths still to run. Each path is probed once, then cached."""
+    total = 0.0
+    found = 0
+    seen = set()
+    for path in paths or []:
+        if not path:
+            continue
+        key = os.path.normcase(os.path.abspath(path)) if os.path.isabs(path) else os.path.normcase(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        units = chunk_units(path, chunk_seconds)
+        if units is None:
+            continue
+        total += units
+        found += 1
+    return total if found else None
 
 
 def get_video_duration(video_path):

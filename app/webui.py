@@ -10827,7 +10827,72 @@ def create_ui():
         
     return demo
 
+
+_WEBUI_INSTANCE_LOCK = None
+
+
+def _tcp_open(host: str, port: int) -> bool:
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=0.4):
+            return True
+    except OSError:
+        return False
+
+
+def _try_webui_instance_lock(path: str):
+    """Exclusive byte lock. None when another live webui already holds it."""
+    if os.name != "nt":
+        return None
+    import msvcrt
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fh = open(path, "a+b")
+    try:
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() < 1:
+            fh.write(b"\0")
+            fh.flush()
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        return fh
+    except OSError:
+        fh.close()
+        return None
+
+
+def _claim_webui_instance(port: int) -> None:
+    """Only one process may build the UI and bind the port.
+
+    Pinokio auto-launch starts start.js more than once as the app comes up.
+    The second process used to die with "Cannot find empty port 7860", which
+    is the failed first launch. It now waits, prints the URL Pinokio watches
+    for, and leaves the server that already owns the port alone.
+    """
+    global _WEBUI_INSTANCE_LOCK
+    if os.name != "nt":
+        return
+    import time
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui.instance.lock")
+    announced = False
+    while True:
+        fh = _try_webui_instance_lock(lock_path)
+        if fh is not None:
+            _WEBUI_INSTANCE_LOCK = fh
+            return
+        if not announced and _tcp_open("127.0.0.1", port):
+            print(f"* Running on local URL:  http://127.0.0.1:{port}", flush=True)
+            log(
+                "Another FlashVSR start already has the server. This start is attaching to it.",
+                message_type="info",
+            )
+            announced = True
+        time.sleep(0.5)
+
+
 if __name__ == "__main__":
+    # Before temp cleanup and create_ui(), so a second auto-launch cannot
+    # delete the first process's files or load a second copy of the UI.
+    _claim_webui_instance(args.port)
     os.makedirs(get_output_dir(), exist_ok=True)
     
     # Check user preference for clearing temp on start

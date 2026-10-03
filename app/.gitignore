@@ -27,6 +27,7 @@ env/
 /models/
 outputs/
 _temp/
+webui.instance.lock
 inputs/
 **/__pycache__/
 *.pyc

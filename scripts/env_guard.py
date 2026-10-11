@@ -68,7 +68,7 @@ CRITICAL = [
 
 # Strings that MUST appear in a live custom file. Missing ⇒ stock overwrite.
 MARKERS = {
-    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir", "no size recode", "accurate_rnd+full_chroma_int", "orientation_input_box", "_gt_rife_flags", "resolve_resize_encode", "tonemap=hable", "open_media_folder", "_log_queue_scan", "def path_textbox", "HeartbeatTqdm", "handle_scan_grok_outputs", "chrome_copy_number", "apply_saved_gpu_headroom", "gpu_multitask_g", "stop_finish_path", "tick_stop_banner", "alloc_stitch_canvases", "GPU scheduling retired", "_enable_fast_gpu_math"),
+    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir", "no size recode", "accurate_rnd+full_chroma_int", "orientation_input_box", "_gt_rife_flags", "resolve_resize_encode", "tonemap=hable", "open_media_folder", "_log_queue_scan", "def path_textbox", "HeartbeatTqdm", "handle_scan_grok_outputs", "chrome_copy_number", "apply_saved_gpu_headroom", "gpu_multitask_g", "stop_finish_path", "tick_stop_banner", "alloc_stitch_canvases", "GPU scheduling retired", "_enable_fast_gpu_math", '"randomize_seed": (True'),
     "app/stitch_canvas.py": ("class DiskStitchCanvas", "torch.from_file", "release_host_cache"),
     "app/src/models/wan_video_dit.py": ("stream KV clone drops prefix storage",),
     "app/gpu_headroom.py": ("apply_gpu_headroom", "D3DKMTSetProcessSchedulingPriorityClass", "nvidia-smi", "GPU scheduling retired", "always Normal"),
@@ -93,7 +93,7 @@ MARKERS = {
 CONFIG_FILES = {"app/webui_config.bak"}
 
 # User pipeline paths — stock/empty config gets replaced; live custom config is kept.
-MARKERS["app/webui_config"] = ("gt_before_dir=", "gt_after_dir=", "batch_watch_folder=", "resize_kernel=", "gpu_multitask=")
+MARKERS["app/webui_config"] = ("gt_before_dir=", "gt_after_dir=", "batch_watch_folder=", "resize_kernel=", "gpu_multitask=", "randomize_seed=True", "chunk_duration=10.25")
 
 SAFETENSORS_PIN = "safetensors~=0.6.0"
 

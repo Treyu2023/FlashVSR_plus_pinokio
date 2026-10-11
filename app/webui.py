@@ -770,7 +770,7 @@ def get_ui_defaults(config=None):
         "local_range": (7, int),
         "kv_ratio": (3, int),
         "quality": (10, int),
-        "randomize_seed": (False, bool),
+        "randomize_seed": (True, bool),
         "scale": (4, int),
         "mode": ("tiny", str),
         "model_version": ("v1.1", str),

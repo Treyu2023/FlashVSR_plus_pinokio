@@ -118,7 +118,7 @@ Stock FlashVSR only read theme/autosave/output from `webui_config`. Added `get_u
 
 | Step | What | Default path |
 |------|------|----------------|
-| 1 | Intake / watch | `D:\OUTPUTS\__X_GROK\NEW DOWNLOADS` |
+| 1 | Intake / watch | `O:\New Downloads ODrive Media` |
 | 2 | Originals archive | `D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos` |
 | 3 | After upscale (videos) | `D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox` |
 | 4 | After upscale (images) | `...\Ready for CIV\images` |
@@ -186,7 +186,7 @@ Resize flow (video + image):
 
 ## Intended workflow
 
-1. Drop sources in **Step 1** (NEW DOWNLOADS).
+1. Drop sources in **Step 1** (`O:\New Downloads ODrive Media`).
 2. **Group Therapy** (recommended for mixed batches): pick group size + Before/After folders, Start. Each group of N runs **upscale → RIFE 2× → RIFE 2× → export**, then the next N. Both sides stay **flat** (no per-file folders). Pairing is `_PID_xxxxxxxx` at the end of the filename plus Title=`PID_xxxxxxxx` (not Media Center tags). Only original + final are kept.
 3. Or classic split: Video queue upscales → **Step 3 Ready for Toolbox**; originals → Step 2. Toolbox reads Step 5/3 → export → **Step 6 Ready for CIV**.
 4. Images → **Step 4** Ready for CIV\images (skip RIFE).

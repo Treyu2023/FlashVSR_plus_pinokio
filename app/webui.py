@@ -353,7 +353,10 @@ TIPS = {
     ),
     "output_dir": "Legacy alias — use Step 3 (After upscale / Ready for Toolbox). Same as batch_upscale_handoff_dir.",
     "toolbox_output_dir": "Step 6 — final Ready for CIV folder after Toolbox export.",
-    "batch_watch_folder": "Step 1 — intake. New downloads drop here; queues scan on Start / Resume.",
+    "batch_watch_folder": (
+        "Step 1 — intake. New images and videos drop in "
+        "O:\\New Downloads ODrive Media. Queues scan this folder on Start / Resume."
+    ),
     "batch_source_archive_dir": "Step 2 — originals archive after upscale (for pairing).",
     "batch_upscale_handoff_dir": "Step 3 — where upscaled VIDEOS are saved (Ready for Toolbox).",
     "img_upscale_handoff_dir": "Step 4 — where upscaled IMAGES are saved (skip Toolbox → Ready for CIV\\images).",
@@ -381,8 +384,9 @@ os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 # ── Clear pipeline steps (readable + configurable) ─────────────────────────
-# Away from the old "app\\outputs only" archetype: every production step lives
-# under D:\OUTPUTS\__X_GROK\... with a plain-English name.
+# Away from the old "app\\outputs only" archetype.
+# Step 1 intake is O:\New Downloads ODrive Media.
+# Later steps stay under D:\OUTPUTS\__X_GROK\... with a plain-English name.
 WORKFLOW_DEFAULTS = {
     "batch_watch_folder": r"O:\New Downloads ODrive Media",
     "batch_source_archive_dir": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
@@ -394,7 +398,7 @@ WORKFLOW_DEFAULTS = {
 
 # (step#, short title, config key, what lands here)
 WORKFLOW_STEPS = (
-    (1, "Intake / watch", "batch_watch_folder", "New downloads · queue picks up from here"),
+    (1, "Intake / watch", "batch_watch_folder", "O:\\New Downloads ODrive Media · new images and videos · queue picks up from here"),
     (2, "Originals archive", "batch_source_archive_dir", "Pre-upscale sources moved here for pairing"),
     (3, "After upscale (videos)", "batch_upscale_handoff_dir", "FIRST save · upscaled videos · Ready for Toolbox"),
     (4, "After upscale (images)", "img_upscale_handoff_dir", "Upscaled images (skip RIFE) · Ready for CIV\\images"),
@@ -4785,7 +4789,7 @@ def run_flashvsr_image_work_queue(
     batch_resize_preset,
     progress=gr.Progress(track_tqdm=True),
 ):
-    """Image upscale queue: watch NEW DOWNLOADS → Ready for CIV/images; originals → Pre Scaled."""
+    """Image upscale queue: watch O:\\New Downloads ODrive Media → Ready for CIV/images; originals → Pre Scaled."""
     apply_saved_gpu_headroom()
     wq = get_flashvsr_image_queue()
     lock = get_exclusive_queue_lock()
@@ -7828,7 +7832,8 @@ def create_ui():
                                     height="200px",                            
                                 )
                                 gr.Markdown(
-                                    "**Watch folder** (auto-scanned on Start / Resume) or paste another path:"
+                                    "**Watch folder** — `O:\\New Downloads ODrive Media` "
+                                    "(auto-scanned on Start / Resume) or paste another path:"
                                 )
                                 batch_folder_path = path_textbox(
                                     value=ui.get(
@@ -7839,7 +7844,8 @@ def create_ui():
                                     label="Watch / folder path",
                                     show_label=True,
                                     info=(
-                                        "Step 1 — intake. Start / Resume scans here. "
+                                        "Step 1 — intake at O:\\New Downloads ODrive Media. "
+                                        "Start / Resume scans here. "
                                         "Originals → Step 2 (Pre Scaled). Upscaled videos → Step 3 (Ready for Toolbox)."
                                     ),
                                 )
@@ -7999,8 +8005,13 @@ def create_ui():
                                 )
                                 gt_watch_folder = path_textbox(
                                     value=ui.get("batch_watch_folder", r"O:\New Downloads ODrive Media"),
+                                    placeholder=r"O:\New Downloads ODrive Media",
                                     label="Original folder (intake)",
-                                    info="Newest files first, oldest last. In-progress group finishes before jumping to newer files.",
+                                    info=(
+                                        "Intake is O:\\New Downloads ODrive Media. "
+                                        "Newest files first, oldest last. "
+                                        "An in-progress group finishes before newer files."
+                                    ),
                                 )
                                 gt_group_size = gr.Slider(
                                     minimum=1,
@@ -8371,13 +8382,19 @@ def create_ui():
                                     file_types=["image"],
                                     height="200px",
                                 )
-                                gr.Markdown("**Watch folder** (same NEW DOWNLOADS as video — images auto-picked):")
+                                gr.Markdown(
+                                    "**Watch folder** (same intake as video — "
+                                    "`O:\\New Downloads ODrive Media` — images auto-picked):"
+                                )
                                 img_batch_folder_path = path_textbox(
                                     value=ui.get("batch_watch_folder", r"O:\New Downloads ODrive Media"),
                                     placeholder=r"O:\New Downloads ODrive Media",
                                     label="Watch / folder path",
                                     show_label=True,
-                                    info="Start/Resume scans this folder for images. Upscales → Ready for CIV\\images; originals → Pre Scaled.",
+                                    info=(
+                                        "Start/Resume scans O:\\New Downloads ODrive Media for images. "
+                                        "Upscales → Ready for CIV\\images; originals → Pre Scaled."
+                                    ),
                                 )
                                 gr.Markdown("---")
                                 gr.Markdown(
@@ -10573,13 +10590,18 @@ def create_ui():
             naming_mode_status = gr.Textbox(label="Naming status", interactive=False, show_label=False)
             apply_naming_mode_btn = gr.Button("Apply name style", size="sm", variant="primary")
 
-            gr.Markdown("### Folders (selectable — your current D: paths are fine)")
+            gr.Markdown(
+                "### Folders (selectable — intake is `O:\\New Downloads ODrive Media`; later steps stay on D:)"
+            )
             gr.HTML(value=workflow_paths_html(config))
             _wp = get_workflow_paths(config)
             step1_watch = path_textbox(
                 label="Intake / watch (new downloads)",
                 value=_wp["batch_watch_folder"],
-                info="Where new files land · queues scan on Start / Resume",
+                info=(
+                    "Where new images and videos land: O:\\New Downloads ODrive Media. "
+                    "Queues scan this folder on Start / Resume."
+                ),
             )
             step2_archive = path_textbox(
                 label="Originals archive (pre-upscale sources for pairing)",

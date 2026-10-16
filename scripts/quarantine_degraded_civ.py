@@ -1,6 +1,6 @@
 """
 Quarantine non-96fps Ready-for-CIV (stage 3) videos, match originals,
-copy originals back to NEW DOWNLOADS for restage.
+copy originals back to O:\\New Downloads ODrive Media for restage.
 
 Usage:
   python quarantine_degraded_civ.py
@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 CIV = Path(r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Post Scaling\Ready for CIV")
-DOWNLOADS = Path(r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS")
+DOWNLOADS = Path(r"O:\New Downloads ODrive Media")
 PRE = Path(r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos")
 DEGRADED = Path(r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Post Scaling\degraded")
 MATCHED = DEGRADED / "matched"
@@ -341,10 +341,10 @@ def main():
             f"  matched (original found) → matched\\ : {moved_m}",
             f"  unmatched → unmatched\\ : {moved_u}",
             f"  24fps but scaled-up (salvage): {len(salvage24)}",
-            f"Originals copied into NEW DOWNLOADS: {copied}",
-            f"Originals already in NEW DOWNLOADS: {already_in_dl}",
+            f"Originals copied into O:\\New Downloads ODrive Media: {copied}",
+            f"Originals already in O:\\New Downloads ODrive Media: {already_in_dl}",
             "Good 96fps files were left in Ready for CIV.",
-            "Re-run FlashVSR from NEW DOWNLOADS; 4K-safe downscale is now fit-scale + full chroma/color range.",
+            "Re-run FlashVSR from O:\\New Downloads ODrive Media; 4K-safe downscale is now fit-scale + full chroma/color range.",
             f"Log: {log_csv.name}",
             "",
         ]),

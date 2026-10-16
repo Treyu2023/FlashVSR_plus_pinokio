@@ -1,5 +1,6 @@
 """
-Purge CRF-12 inbox recodes and restore Over4K originals into NEW DOWNLOADS.
+Purge CRF-12 inbox recodes and restore Over4K originals into
+O:\\New Downloads ODrive Media.
 
 - Moves recodes to Post Scaling\\degraded\\crf12_inbox_<stamp>\\
 - Moves matching Over4K originals back to the watch folder
@@ -17,7 +18,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-WATCH = Path(r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS")
+WATCH = Path(r"O:\New Downloads ODrive Media")
 O4K = WATCH / "Over4K"
 PRE = Path(r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos")
 DEGRADED = Path(r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Post Scaling\degraded")
@@ -143,7 +144,7 @@ def main() -> None:
     readme.write_text(
         "\n".join(
             [
-                "CRF-12 / whole-folder downscales purged from NEW DOWNLOADS.",
+                "CRF-12 / whole-folder downscales purged from O:\\New Downloads ODrive Media.",
                 f"When: {stamp}",
                 f"Restored Over4K originals: {restored_o4k}",
                 f"Restored larger Pre Scaled copies: {restored_pre}",

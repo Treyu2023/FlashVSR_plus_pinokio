@@ -336,6 +336,33 @@ class ExclusiveQueueLock:
         )
 
 
+def queue_runner_alive(app_dir: str) -> bool:
+    """True when a live process still holds the exclusive queue lock."""
+    lock = ExclusiveQueueLock(app_dir)
+    st = lock.status()
+    if not st:
+        return False
+    return bool(lock._pid_alive(st.get("pid")))
+
+
+def release_finished_stop(wq: "FlashVSRWorkQueue") -> bool:
+    """Drop a stop flag that no live runner is still honoring.
+
+    Leaves the flag alone while a process is finishing the current file.
+    Returns True when a leftover flag was removed. Does not touch terminal logs.
+    """
+    if not wq.stop_requested():
+        return False
+    if queue_runner_alive(str(wq.app_dir)):
+        return False
+    wq.clear_stop()
+    try:
+        wq.save(wq.load())
+    except Exception:
+        pass
+    return True
+
+
 def _norm(path: str) -> str:
     try:
         return os.path.normcase(os.path.normpath(str(Path(path).resolve())))

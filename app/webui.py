@@ -97,6 +97,8 @@ from flashvsr_work_queue import (
     VIDEO_EXTS,
     IMAGE_EXTS,
     AddResult,
+    queue_runner_alive,
+    release_finished_stop,
 )
 import grok_id_index
 import group_therapy as gt
@@ -382,7 +384,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # Away from the old "app\\outputs only" archetype: every production step lives
 # under D:\OUTPUTS\__X_GROK\... with a plain-English name.
 WORKFLOW_DEFAULTS = {
-    "batch_watch_folder": r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS",
+    "batch_watch_folder": r"O:\New Downloads ODrive Media",
     "batch_source_archive_dir": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
     "batch_upscale_handoff_dir": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Ready for Toolbox",
     "img_upscale_handoff_dir": r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Post Scaling\Ready for CIV\images",
@@ -789,7 +791,7 @@ def get_ui_defaults(config=None):
         "resize_kernel": ("lanczos", str),
         "resize_crf": (10, int),
         "resize_color": ("source", str),
-        "batch_watch_folder": (r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS", str),
+        "batch_watch_folder": (r"O:\New Downloads ODrive Media", str),
         "batch_source_archive_dir": (
             r"D:\OUTPUTS\__X_GROK\Upscaled Videos\Pre Scaled videos",
             str,
@@ -3210,6 +3212,89 @@ def _stop_ack_html(note: str) -> str:
         "Watch the Pinokio terminal — a red STOP ARMED line repeats every few status lines "
         "until this file finishes.</span></div>"
     )
+
+
+# Last stop-armed state pushed to the open web UI. Missing key = not pushed yet.
+_STOP_UI_ARMED = {}
+
+
+def _stop_queues():
+    return (
+        get_flashvsr_work_queue(),
+        get_group_therapy_queue(),
+        get_flashvsr_image_queue(),
+        get_toolbox_work_queue(),
+    )
+
+
+def _present_stop(wq) -> str:
+    """Arm stop while a file is running. Clear the web UI banner if nothing is."""
+    if not queue_runner_alive(str(wq.app_dir)):
+        release_finished_stop(wq)
+        log("Stop: nothing is running, so the web UI stays clear.", message_type="info")
+        _STOP_UI_ARMED[wq.name] = False
+        return ""
+    note = wq.request_stop()
+    log(note, message_type="warning")
+    _STOP_UI_ARMED[wq.name] = True
+    return _stop_ack_html(note)
+
+
+def _clear_stale_stop_flags() -> None:
+    """A fresh process is not finishing a file. Drop flags left by the last run.
+
+    The open web UI reads these flags when it builds the queue panel, so a
+    restart used to paint the red stop message again. Terminal history is left
+    as-is.
+    """
+    for wq in _stop_queues():
+        try:
+            if release_finished_stop(wq):
+                log(
+                    f"Cleared leftover stop flag for {wq.label} (no file is running).",
+                    message_type="info",
+                )
+        except Exception:
+            pass
+
+
+def _stop_panel_updates():
+    """Clear the red stop box in the open web UI once the file has actually stopped.
+
+    Terminal lines stay. The status note from the run (Stopped after …) stays.
+    A leftover flag with no live runner is removed and the panel is refreshed.
+    """
+    acks = []
+    statuses = []
+    for wq in _stop_queues():
+        cleared = False
+        armed = False
+        try:
+            cleared = release_finished_stop(wq)
+            armed = bool(wq.stop_requested() and queue_runner_alive(str(wq.app_dir)))
+        except Exception:
+            armed = False
+        prev = _STOP_UI_ARMED.get(wq.name)
+        _STOP_UI_ARMED[wq.name] = armed
+        ack = (
+            _stop_ack_html("⏹ STOP ARMED — finishing this file, then the queue pauses.")
+            if armed
+            else ""
+        )
+        if prev is None or prev != armed:
+            acks.append(ack)
+        else:
+            acks.append(gr.skip())
+        # First paint clears a reconnected page. Arming shows the badge.
+        # A clean stop leaves the run's own status note in place.
+        if prev is None or cleared or (prev is False and armed):
+            try:
+                statuses.append(wq.status_html())
+            except Exception:
+                statuses.append(gr.skip())
+        else:
+            statuses.append(gr.skip())
+    return acks + statuses
 
 
 class _DummyProgress:
@@ -7748,9 +7833,9 @@ def create_ui():
                                 batch_folder_path = path_textbox(
                                     value=ui.get(
                                         "batch_watch_folder",
-                                        r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS",
+                                        r"O:\New Downloads ODrive Media",
                                     ),
-                                    placeholder=r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS",
+                                    placeholder=r"O:\New Downloads ODrive Media",
                                     label="Watch / folder path",
                                     show_label=True,
                                     info=(
@@ -7913,7 +7998,7 @@ def create_ui():
                                     "Before and After stay **flat folders** so you can compare side by side."
                                 )
                                 gt_watch_folder = path_textbox(
-                                    value=ui.get("batch_watch_folder", r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS"),
+                                    value=ui.get("batch_watch_folder", r"O:\New Downloads ODrive Media"),
                                     label="Original folder (intake)",
                                     info="Newest files first, oldest last. In-progress group finishes before jumping to newer files.",
                                 )
@@ -8288,8 +8373,8 @@ def create_ui():
                                 )
                                 gr.Markdown("**Watch folder** (same NEW DOWNLOADS as video — images auto-picked):")
                                 img_batch_folder_path = path_textbox(
-                                    value=ui.get("batch_watch_folder", r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS"),
-                                    placeholder=r"D:\OUTPUTS\__X_GROK\NEW DOWNLOADS",
+                                    value=ui.get("batch_watch_folder", r"O:\New Downloads ODrive Media"),
+                                    placeholder=r"O:\New Downloads ODrive Media",
                                     label="Watch / folder path",
                                     show_label=True,
                                     info="Start/Resume scans this folder for images. Upscales → Ready for CIV\\images; originals → Pre Scaled.",
@@ -9278,10 +9363,7 @@ def create_ui():
             return wq.status_html(note)
 
         def handle_queue_stop():
-            wq = get_flashvsr_work_queue()
-            note = wq.request_stop()
-            log(note, message_type="warning")
-            return _stop_ack_html(note)
+            return _present_stop(get_flashvsr_work_queue())
 
         def handle_queue_clear_done():
             wq = get_flashvsr_work_queue()
@@ -9432,9 +9514,7 @@ def create_ui():
             return wq.status_html(note)
 
         def _gt_q_stop():
-            note = get_group_therapy_queue().request_stop()
-            log(note, message_type="warning")
-            return _stop_ack_html(note)
+            return _present_stop(get_group_therapy_queue())
 
         def _gt_q_clear_done():
             n = get_group_therapy_queue().clear_done()
@@ -9516,11 +9596,19 @@ def create_ui():
 
         def update_monitor():
             gpu_info, cpu_info = SystemMonitor.get_system_info()
-            # Return same info for both video and image tabs
-            return gpu_info, cpu_info, gpu_info, cpu_info
+            # Return same info for both video and image tabs, plus stop banners.
+            panels = _stop_panel_updates()
+            return (gpu_info, cpu_info, gpu_info, cpu_info, *panels)
             
         monitor_timer = gr.Timer(2, active=True)
-        monitor_timer.tick(fn=update_monitor, outputs=[gpu_monitor, cpu_monitor, img_gpu_monitor, img_cpu_monitor]) 
+        monitor_timer.tick(
+            fn=update_monitor,
+            outputs=[
+                gpu_monitor, cpu_monitor, img_gpu_monitor, img_cpu_monitor,
+                batch_stop_ack, gt_stop_ack, img_stop_ack, tb_stop_ack,
+                flashvsr_queue_status, gt_queue_status, img_queue_status, tb_queue_status,
+            ],
+        ) 
         
         def send_to_toolbox(video_path):
             if not video_path:
@@ -9693,10 +9781,7 @@ def create_ui():
             outputs=[img_queue_status],
         )
         def _img_q_stop():
-            wq = get_flashvsr_image_queue()
-            note = wq.request_stop()
-            log(note, message_type="warning")
-            return _stop_ack_html(note)
+            return _present_stop(get_flashvsr_image_queue())
 
         def _img_q_clear_done():
             wq = get_flashvsr_image_queue()
@@ -10030,10 +10115,7 @@ def create_ui():
             outputs=[tb_queue_status],
         )
         def _tb_q_stop():
-            wq = get_toolbox_work_queue()
-            note = wq.request_stop()
-            log(note, message_type="warning")
-            return _stop_ack_html(note)
+            return _present_stop(get_toolbox_work_queue())
 
         def _tb_q_clear_done():
             wq = get_toolbox_work_queue()
@@ -10917,6 +10999,7 @@ if __name__ == "__main__":
     log("FlashVSR+ WebUI starting...", message_type="info")
     log("Models will be downloaded automatically when you start processing.", message_type="info")
     apply_saved_gpu_headroom()
+    _clear_stale_stop_flags()
     
     ui = create_ui()
     allowed_paths = get_gradio_allowed_paths()

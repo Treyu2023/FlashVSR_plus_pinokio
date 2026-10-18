@@ -21,3 +21,6 @@ local-preserve/
 # Logs / caches at repo root
 cache/
 logs/
+
+# Dated local backups of app/webui_config (machine-local; never commit). The tracked app/webui_config.bak is not matched.
+app/webui_config.bak-*

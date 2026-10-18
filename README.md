@@ -2,6 +2,16 @@ This repo has a [Pinokio](https://pinokio.co/) 1-click-installer available [here
 
 Installing outside of Pinokio will require ffmepg on PATH and self-installed pytorch. Torch install info can be seen [here:](https://github.com/ai-anchorite/FlashVSR_plus_pinokio/blob/main/torch.js)
 ---
+## This fork (Treyu2023/FlashVSR_plus_pinokio)
+
+This is Ryan's customized fork of the FlashVSR Pinokio launcher, tuned for an unattended batch upscaling pipeline.
+Update and Install pull only from this fork (`mine/main`, fast-forward only) and never from stock upstream.
+- [UPGRADES.md](UPGRADES.md): what changed and why, in plain language
+- [RESTORE.md](RESTORE.md): rebuild step by step on a new machine
+- [PRESERVE.md](PRESERVE.md): update and reset safety
+
+Folders are configured in `app/webui_config` (see [RESTORE.md, Settings](RESTORE.md#settings)).
+
 Installs a custom fork: [ai-anchorite/FlashVSR_plus](https://github.com/ai-anchorite/FlashVSR_plus)
 
 Forked from: [lihaoyun6/FlashVSR_plus](https://github.com/lihaoyun6/FlashVSR_plus)

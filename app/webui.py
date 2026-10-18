@@ -707,6 +707,7 @@ def get_gradio_allowed_paths():
         ui.get("img_upscale_handoff_dir", ""),
         ui.get("tb_inbox_folder", ""),
         r"D:\OUTPUTS\__X_GROK",
+        r"O:\New Downloads ODrive Media",
         os.environ.get("TMPDIR", ""),
         os.environ.get("TEMP", ""),
         os.environ.get("TMP", ""),

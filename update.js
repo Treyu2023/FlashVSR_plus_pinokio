@@ -19,11 +19,14 @@ module.exports = {
         ]
       }
     },
-    // Launcher + monorepo pull (tracks mine/main with local customizations)
+    // Launcher + monorepo pull: always Ryan's fork (mine/main), fast-forward only
     {
       method: "shell.run",
       params: {
-        message: "git pull"
+        message: [
+          "git remote get-url mine || git remote add mine https://github.com/Treyu2023/FlashVSR_plus_pinokio.git",
+          "git pull --ff-only mine main"
+        ]
       }
     },
     // Nested stock install only: separate app/.git (skipped for monorepo)

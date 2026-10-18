@@ -1,10 +1,22 @@
 module.exports = {
   run: [
+    // Monorepo: app/ is tracked in Ryan's fork. After Reset, restore it from
+    // the local checkout (never clone stock upstream), then fast-forward to mine/main.
+    {
+      when: "{{!exists('app/webui.py')}}",
+      method: "shell.run",
+      params: {
+        message: [
+          "git checkout HEAD -- app",
+        ]
+      }
+    },
     {
       method: "shell.run",
       params: {
         message: [
-          "git clone https://github.com/ai-anchorite/FlashVSR_plus.git app",
+          "git remote get-url mine || git remote add mine https://github.com/Treyu2023/FlashVSR_plus_pinokio.git",
+          "git pull --ff-only mine main",
         ]
       }
     },

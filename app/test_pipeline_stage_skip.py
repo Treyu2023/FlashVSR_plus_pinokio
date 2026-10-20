@@ -149,10 +149,131 @@ def test_mark_finished_exports_queue_row() -> None:
         assert "PID_6696319b" in row["output"]
 
 
+def test_bare_stage_does_not_beat_newest() -> None:
+    """A stuck upscale label with no output must not pin an old group first."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        app = root / "app"
+        app.mkdir()
+        old = root / "old.mp4"
+        new = root / "new.mp4"
+        old.write_bytes(b"o" * (40 * 1024))
+        new.write_bytes(b"n" * (41 * 1024))
+        old_ts = time.time() - 86400 * 40
+        new_ts = time.time() - 120
+        os.utime(old, (old_ts, old_ts))
+        os.utime(new, (new_ts, new_ts))
+        wq = FlashVSRWorkQueue(str(app), name="group", extensions={".mp4"}, label="t")
+        data = wq.load()
+        data["items"] = [
+            {
+                "path": str(old),
+                "status": "running",
+                "gt_group": 24,
+                "gt_stage": "upscale",
+                "size": old.stat().st_size,
+                "attempts": 0,
+            },
+            {
+                "path": str(new),
+                "status": "pending",
+                "gt_group": 25,
+                "size": new.stat().st_size,
+            },
+        ]
+        wq.save(data)
+        assert gt.item_in_progress(data["items"][0]) is True  # still running
+        assert wq.reset_stuck_running() == 1
+        stuck = next(it for it in wq.load()["items"] if it["path"].endswith("old.mp4"))
+        assert stuck["status"] == "pending"
+        assert not stuck.get("gt_stage")
+        assert gt.item_in_progress(stuck) is False
+        wq.requeue_failed()
+        gt.assign_groups(wq, 1)
+        order = [Path(it["path"]).name for it in gt.run_order(wq.all_items())]
+        assert order[0] == "new.mp4", order
+        assert order[-1] == "old.mp4", order
+
+
+def test_real_partial_still_finishes_before_newer() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        app = root / "app"
+        app.mkdir()
+        old = root / "old.mp4"
+        new = root / "new.mp4"
+        partial = root / "old_upscaled.mp4"
+        old.write_bytes(b"o" * (40 * 1024))
+        new.write_bytes(b"n" * (41 * 1024))
+        partial.write_bytes(b"u" * (42 * 1024))
+        old_ts = time.time() - 86400 * 40
+        new_ts = time.time() - 120
+        os.utime(old, (old_ts, old_ts))
+        os.utime(new, (new_ts, new_ts))
+        os.utime(partial, (old_ts, old_ts))
+        wq = FlashVSRWorkQueue(str(app), name="group", extensions={".mp4"}, label="t")
+        data = wq.load()
+        data["items"] = [
+            {
+                "path": str(old),
+                "status": "pending",
+                "gt_group": 3,
+                "gt_stage": "upscale",
+                "gt_upscale": str(partial),
+                "size": old.stat().st_size,
+            },
+            {
+                "path": str(new),
+                "status": "pending",
+                "gt_group": 9,
+                "size": new.stat().st_size,
+            },
+        ]
+        wq.save(data)
+        assert gt.item_in_progress(data["items"][0]) is True
+        gt.assign_groups(wq, 1)
+        order = [Path(it["path"]).name for it in gt.run_order(wq.all_items())]
+        assert order[0] == "old.mp4", order
+
+
+def test_gave_up_stays_failed_on_start_requeue() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        app = root / "app"
+        app.mkdir()
+        src = root / "poison.mp4"
+        src.write_bytes(b"p" * (40 * 1024))
+        os.utime(src, (time.time() - 120, time.time() - 120))
+        wq = FlashVSRWorkQueue(str(app), name="group", extensions={".mp4"}, label="t")
+        data = wq.load()
+        data["items"] = [
+            {
+                "path": str(src),
+                "status": "running",
+                "gt_group": 1,
+                "gt_stage": "upscale",
+                "attempts": 2,
+                "size": src.stat().st_size,
+            }
+        ]
+        wq.save(data)
+        assert wq.reset_stuck_running(max_attempts=3) == 1
+        row = wq.load()["items"][0]
+        assert row["status"] == "failed"
+        assert row.get("gave_up") is True
+        assert wq.requeue_failed() == 0
+        assert wq.load()["items"][0]["status"] == "failed"
+        assert wq.requeue_failed(include_gave_up=True) == 1
+        assert wq.load()["items"][0]["status"] == "pending"
+
+
 if __name__ == "__main__":
     test_classifiers()
     test_group_keeps_tiny_skips_export()
     test_video_queue_skips_all_pipeline_outputs()
     test_reclaim_moves_export_keeps_tiny()
     test_mark_finished_exports_queue_row()
+    test_bare_stage_does_not_beat_newest()
+    test_real_partial_still_finishes_before_newer()
+    test_gave_up_stays_failed_on_start_requeue()
     print("ok")

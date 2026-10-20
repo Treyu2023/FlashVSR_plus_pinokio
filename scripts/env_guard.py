@@ -31,6 +31,7 @@ OFFLINE_BACKUPS = Path(r"C:\pinokio\backups\FlashVSR_plus_pinokio")
 # Snapshot before pull; reapply after pull/clone. Markers detect stock overwrite.
 CRITICAL = [
     "app/webui.py",
+    "app/session_board.py",
     "app/stitch_canvas.py",
     "app/src/models/wan_video_dit.py",
     "app/gpu_headroom.py",
@@ -68,12 +69,13 @@ CRITICAL = [
 
 # Strings that MUST appear in a live custom file. Missing ⇒ stock overwrite.
 MARKERS = {
-    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir", "no size recode", "accurate_rnd+full_chroma_int", "orientation_input_box", "_gt_rife_flags", "resolve_resize_encode", "tonemap=hable", "open_media_folder", "_log_queue_scan", "def path_textbox", "HeartbeatTqdm", "handle_scan_grok_outputs", "chrome_copy_number", "apply_saved_gpu_headroom", "gpu_multitask_g", "stop_finish_path", "tick_stop_banner", "alloc_stitch_canvases", "GPU scheduling retired", "_enable_fast_gpu_math", '"randomize_seed": (True'),
+    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir", "no size recode", "accurate_rnd+full_chroma_int", "orientation_input_box", "_gt_rife_flags", "resolve_resize_encode", "tonemap=hable", "open_media_folder", "open_video_output_folder", "session_board.render", "_log_queue_scan", "def path_textbox", "HeartbeatTqdm", "handle_scan_grok_outputs", "chrome_copy_number", "apply_saved_gpu_headroom", "gpu_multitask_g", "stop_finish_path", "tick_stop_banner", "alloc_stitch_canvases", "GPU scheduling retired", "_enable_fast_gpu_math", '"randomize_seed": (True'),
     "app/stitch_canvas.py": ("class DiskStitchCanvas", "torch.from_file", "release_host_cache"),
     "app/src/models/wan_video_dit.py": ("stream KV clone drops prefix storage",),
     "app/gpu_headroom.py": ("apply_gpu_headroom", "D3DKMTSetProcessSchedulingPriorityClass", "nvidia-smi", "GPU scheduling retired", "always Normal"),
     "app/grok_id_index.py": ("extract_grok_ids", "SIZE_TOLERANCE", "screen_folder", "def version_key"),
-    "app/src/busy_heartbeat.py": ("class HeartbeatTqdm", "still busy", "STOP ARMED", "tick_stop_banner"),
+    "app/src/busy_heartbeat.py": ("class HeartbeatTqdm", "still busy", "STOP ARMED", "tick_stop_banner", "def snapshot"),
+    "app/session_board.py": ("def render", "def classify_health", "def save_profile"),
     "app/src/pipelines/flashvsr_tiny.py": ("BusySpan", "show_progress_bar=True", "drop_dit_stream_kv", "park stream KV"),
     "app/group_therapy.py": ("stamp_title_pid", "flatten_gt_pair_folders", "pid_token", "item_in_progress", "version_keys_in_folder", "reclaim_watch_folder", "get_after_lookup", "migrate_legacy_pair_sidecars", "_pairs", "looks_like_finished_export", "moved_after", "mark_finished_exports"),
     "app/flashvsr_work_queue.py": ("gt_pair_id", "drop_wrong_stage_pending", "class AddResult", "grok_id_dupes", "first_matching_version", "looks_like_finished_export", "seed_pipeline_fields"),

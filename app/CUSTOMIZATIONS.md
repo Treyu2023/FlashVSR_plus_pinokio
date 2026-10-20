@@ -1,6 +1,6 @@
 # FlashVSR+ Pinokio — Custom Configuration & Code Changes
 
-**Last updated:** 2026-09-22  
+**Last updated:** 2026-10-18  
 **Install path:** `C:\pinokio\api\FlashVSR_plus_pinokio.git\app`  
 **Purpose:** Persistent record of customizations applied outside stock FlashVSR (survives app rollback/reinstall). Re-apply or merge these after updating the Pinokio launcher.
 
@@ -10,6 +10,8 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-10-18 | **Session board:** color block bars above the tabs (files, batch, step), queue chips, stage pips, step-time sparkline, and a health lamp. THRASH only when a step is frozen, watts are low, and the memory bus is idle. Full VRAM alone stays HEALTHY. Named job profiles (`app/job_profiles.json`) save and restore knobs for the next Start / Resume. Folders are not part of a profile. The file already running keeps its settings. Needs a FlashVSR restart; do not restart mid-file. |
+| 2026-10-18 | **Open Output Folder ignored the old junction:** `app\outputs` is a junction to `D:\OUTPUTS\FlashVSR`. The button followed the Group Therapy work preview into that old folder. It now opens Ready for CIV while Group Therapy is running, and Ready for Toolbox for a plain video upscale. Image → upscaled images. Toolbox → Ready for CIV. Needs a FlashVSR restart; do not restart mid-file. |
 | 2026-09-22 | **DiT still thrashing on tile 2+:** Disk canvas + keeping DiT weights on GPU was in place, and tile 2 still packed the 4090 (23.8/24.5 GB, 100% util, ~110 W, DiT 60–170 s/step). Cause: all 30 blocks' stream KV plus the full per-layer LQ stack sit on the GPU together, and TCDecoder was moved on before DiT. Fix: park stream KV and LQ on CPU, copy one block back for that block, load TCDecoder only for VAE. Needs FlashVSR restart. |
 | 2026-09-18 | **WDDM thrash on tile 2+:** VAE was fine (2.9 GB, ~13 s/tile) but `unload_dit` actually memcpy'd the whole DiT to RAM (`enable_vram_management` → `cpu_offload`). Next tile copied it back while the float16 stitch canvas sat in RAM → 17 GB pagefile, 4090 packed 23/24.5 GB, 100% util / ~110 W, DiT 9 s/step → 40–57 s/step. Fix: drop stream KV only; keep DiT on the GPU; force stitch canvases `device="cpu"`. Needs FlashVSR restart. |
 | 2026-09-18 | **No reprocess of finished/partial pipeline files:** Toolbox finals (`_exported_Nw_Nq`) in NEW DOWNLOADS are moved to Ready for CIV and marked done. `_tiny_s2_` / `_Upscaled` / RIFE `_*Frames` names skip already-done stages (RIFE/export only). Watch reclaim no longer deletes those unless After already has that take. |
@@ -60,9 +62,10 @@
 | `webui_config` | **Created** — user defaults (pipeline folders + Group Therapy) |
 | `grok_id_index.py` | **Created** — Grok unique-ID catalog + ±2.5% original-size duplicate screen |
 | `naming_utils.py` | **Created** — output filename conventions |
-| `webui.py` | **Modified** — config, paths, Group Therapy, hygiene, 4K-safe, PID pairing; skip-reason logs; path_textbox + UI font/zoom; busy heartbeats; float16 stitch canvases; GPU cap retired |
+| `webui.py` | **Modified** — config, paths, Group Therapy, hygiene, 4K-safe, PID pairing; skip-reason logs; path_textbox + UI font/zoom; busy heartbeats; float16 stitch canvases; GPU cap retired; session board + job profiles |
+| `session_board.py` | **Created** — live bars, health lamp, accumulating session stats, named job profiles |
 | `gpu_headroom.py` | **Modified** — always Normal GPU/CPU scheduling (Idle / watt-cap retired) |
-| `src/busy_heartbeat.py` | **Created** — newline tqdm snapshots + 12s still-busy watchdog for Pinokio logs |
+| `src/busy_heartbeat.py` | **Created** — newline tqdm snapshots + 12s still-busy watchdog for Pinokio logs; `snapshot()` feeds the session board |
 | `group_therapy.py` | **Created** — grouped pipeline + flat `_PID_` pairing; unstarted groups packed newest→oldest; finished exports → After |
 | `flashvsr_work_queue.py` | **Modified** — size-dedupe, Group Therapy status, skip already-upscaled/exported, seed remaining stages |
 | `toolbox/toolbox.py` | **Modified** — FPS cap, no-video probe, HighFPS skip |

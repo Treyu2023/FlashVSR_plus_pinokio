@@ -27,6 +27,7 @@ from flashvsr_work_queue import (
     FlashVSRWorkQueue,
     VIDEO_EXTS,
     _file_mtime,
+    has_stage_output,
     looks_like_finished_export,
     looks_like_rife_output,
     looks_like_upscaled_output,
@@ -408,26 +409,25 @@ def get_queue(app_dir: str) -> FlashVSRWorkQueue:
 
 
 def item_in_progress(it: Dict[str, Any]) -> bool:
-    """True if this row has started a Group Therapy stage (keep its group together)."""
+    """True if this row has real work to finish with its group.
+
+    Running, or a stage file still on disk. A leftover ``gt_stage`` string
+    with no file is a stuck attempt and must not pin that old group in front
+    of newer downloads.
+    """
     if it.get("status") == "running":
         return True
-    st = str(it.get("gt_stage") or "").strip().lower()
-    if st in STAGES:
-        return True
-    for key in ("gt_upscale", "gt_rife1", "gt_rife2", "gt_export"):
-        p = (it.get(key) or "").strip()
-        if p and os.path.isfile(p):
-            return True
-    return False
+    return has_stage_output(it)
 
 
 def assign_groups(wq: FlashVSRWorkQueue, group_size: int, after_dir: str = "") -> int:
     """
     Pack unstarted pending files into groups newest → oldest by source mtime.
 
-    A group already mid-pipeline (any member running / has a stage output)
-    keeps its members so that batch can finish. Leftover unstarted rows are
-    regrouped so Start always works latest files first.
+    A group already mid-pipeline (any member running, or a stage file on disk)
+    keeps its members so that batch can finish. A stuck row whose only trace
+    is ``gt_stage`` is unstarted and gets regrouped. Leftover unstarted rows
+    pack so Start always works latest files first.
     """
     group_size = max(1, int(group_size or 10))
     data = wq.load()
@@ -463,7 +463,13 @@ def assign_groups(wq: FlashVSRWorkQueue, group_size: int, after_dir: str = "") -
                 )
                 assigned += 1
             continue
-        if it.get("status") not in ("pending", "failed"):
+        if it.get("status") == "failed":
+            # Gave-up / still-failed rows are not packed into a new newest-first
+            # group. Drop the stale id so they do not share a group with new work.
+            if g not in frozen_gids:
+                it["gt_group"] = None
+            continue
+        if it.get("status") != "pending":
             continue
         it["gt_group"] = None
         unstarted.append(it)
@@ -506,10 +512,14 @@ def assign_groups(wq: FlashVSRWorkQueue, group_size: int, after_dir: str = "") -
 
 
 def ordered_groups(items: Sequence[Dict[str, Any]]) -> List[int]:
-    """In-progress groups first, then unstarted groups newest → oldest."""
+    """Running group, then other real in-progress groups, then unstarted.
+
+    Inside each bucket, newest source mtime first. Group id is only a tie-break.
+    A bare ``gt_stage`` does not count as in progress (see ``item_in_progress``).
+    """
     meta: Dict[int, Dict[str, Any]] = {}
     for it in items:
-        if it.get("status") == "done":
+        if it.get("status") in ("done", "failed"):
             continue
         try:
             g = int(it.get("gt_group") or 0)
@@ -532,11 +542,32 @@ def ordered_groups(items: Sequence[Dict[str, Any]]) -> List[int]:
             bucket = 1
         else:
             bucket = 2
-        if bucket == 2:
-            return (bucket, -rec["mtime"], gid)
-        return (bucket, gid)
+        return (bucket, -rec["mtime"], gid)
 
     return sorted(meta, key=_key)
+
+
+def run_order(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Files in the order Start will process them (done rows omitted)."""
+    pending = [it for it in items if it.get("status") not in ("done", "failed")]
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for gid in ordered_groups(pending):
+        for it in group_members(pending, gid):
+            if it.get("status") == "done":
+                continue
+            key = os.path.normcase(it.get("path") or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(it)
+    for it in pending:
+        key = os.path.normcase(it.get("path") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
 
 
 def group_members(items: Sequence[Dict[str, Any]], gid: int) -> List[Dict[str, Any]]:

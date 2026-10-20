@@ -412,6 +412,21 @@ def _sort_paths_newest_first(paths: Sequence[Any]) -> List[Any]:
     )
 
 
+_STAGE_OUTPUT_KEYS = ("gt_upscale", "gt_rife1", "gt_rife2", "gt_export")
+
+
+def has_stage_output(it: Dict[str, Any]) -> bool:
+    """True when a Group Therapy stage wrote a file that is still on disk.
+
+    A leftover ``gt_stage`` label with no file is a crashed attempt, not progress.
+    """
+    for key in _STAGE_OUTPUT_KEYS:
+        p = str(it.get(key) or "").strip()
+        if p and os.path.isfile(p):
+            return True
+    return False
+
+
 def _atomic_write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".queue_", suffix=".json", dir=str(path.parent))
@@ -920,10 +935,12 @@ class FlashVSRWorkQueue:
             ST_DONE: 3,
         }
 
-        # --- requeue failed ---
+        # --- requeue failed (keep rows that already gave up) ---
         if requeue_failed:
             for it in items:
                 if it.get("status") == ST_FAILED:
+                    if it.get("gave_up"):
+                        continue
                     it["status"] = ST_PENDING
                     it["error"] = None
                     it["finished"] = None
@@ -1120,15 +1137,24 @@ class FlashVSRWorkQueue:
         self.save(data)
         return n
 
-    def requeue_failed(self) -> int:
+    def requeue_failed(self, *, include_gave_up: bool = False) -> int:
+        """Return failed rows to pending.
+
+        Rows marked ``gave_up`` (stuck too many times) stay failed unless the
+        user asked to retry them. Start must not undo that give-up.
+        """
         data = self.load()
         n = 0
         for it in data.get("items") or []:
-            if it.get("status") == ST_FAILED:
-                it["status"] = ST_PENDING
-                it["error"] = None
-                it["finished"] = None
-                n += 1
+            if it.get("status") != ST_FAILED:
+                continue
+            if it.get("gave_up") and not include_gave_up:
+                continue
+            it["status"] = ST_PENDING
+            it["error"] = None
+            it["finished"] = None
+            it.pop("gave_up", None)
+            n += 1
         if n:
             self.save(data)
         return n
@@ -1376,6 +1402,8 @@ class FlashVSRWorkQueue:
                 it["attempts"] = int(it.get("attempts") or 0) + 1
                 it["requeued_at"] = _now_iso()
                 it["finished"] = None
+                if not has_stage_output(it):
+                    it["gt_stage"] = None
             self.save(data)
             return len(stuck)
 
@@ -1388,15 +1416,21 @@ class FlashVSRWorkQueue:
             it["requeued_at"] = _now_iso()
             it["finished"] = None
             it["output"] = None
+            # No stage file → not mid-pipeline. Drop the label so assign_groups
+            # can pack this row by mtime instead of pinning the old group first.
+            if not has_stage_output(it):
+                it["gt_stage"] = None
             msg = "Stuck/interrupted while running — moved to end of queue"
             it["error"] = msg
             it["last_error"] = msg
             if attempts >= max(1, int(max_attempts)):
                 it["status"] = ST_FAILED
+                it["gave_up"] = True
                 it["finished"] = _now_iso()
                 it["error"] = f"{msg} (gave up after {attempts} attempt(s))"
             else:
                 it["status"] = ST_PENDING
+                it.pop("gave_up", None)
             others.append(it)
         data["items"] = others
         self.save(data)

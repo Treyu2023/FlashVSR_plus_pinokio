@@ -2,8 +2,9 @@
 Grok unique-ID catalog for FlashVSR duplicate screening.
 
 Extracts GROK / grok-video / leading X-post IDs from filenames, stores them
-with original file size, and flags new downloads whose ID matches exactly
-and whose size is within ±2.5% of the cataloged original.
+with original file size, and flags a re-download of the same Imagine take.
+Same take means the same id and the same Chrome ``(N)``. A different ``(N)``
+is another clip even when its size is within ±2.5% of the cataloged original.
 """
 from __future__ import annotations
 
@@ -371,25 +372,49 @@ def record_file(
 
 def match_file(path: str, index: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Duplicate if any extracted ID is in the catalog AND size is within ±2.5%
-    of that ID's cataloged original size.
+    Duplicate of a cataloged Imagine take.
+
+    UUID + Chrome ``(N)`` is one take. A different ``(N)`` is not a duplicate,
+    even when the byte size is within ±2.5%. Size tolerance still applies to
+    the unnumbered download, and to a legacy catalog row that has a size but
+    no original path.
     """
-    ids = extract_grok_ids(Path(path).name)
+    name = Path(path).name
+    ids = extract_grok_ids(name)
     if not ids:
         return None
     sz = _file_size(path)
+    cand_vk = version_key(name)
     catalog = (index or {}).get("ids") or {}
     for gid in ids:
         rec = catalog.get(gid)
         if not isinstance(rec, dict):
             continue
         orig = int(rec.get("original_size") or 0)
+        orig_path = str(rec.get("original_path") or "")
+        orig_vk = version_key(Path(orig_path).name) if orig_path else None
+        if cand_vk and orig_vk and cand_vk != orig_vk:
+            continue
+        if cand_vk and orig_vk and cand_vk == orig_vk:
+            return {
+                "id": gid,
+                "original_size": orig,
+                "file_size": sz,
+                "original_path": orig_path,
+                "outputs": rec.get("outputs") or [],
+                "reason": (
+                    f"same take {gid} chrome {cand_vk[1]}"
+                ),
+            }
+        # Numbered take vs a catalog row that does not name a Chrome copy.
+        if cand_vk and cand_vk[1] != 0 and orig_vk is None:
+            continue
         if orig > 0 and size_within_tolerance(sz, orig):
             return {
                 "id": gid,
                 "original_size": orig,
                 "file_size": sz,
-                "original_path": rec.get("original_path") or "",
+                "original_path": orig_path,
                 "outputs": rec.get("outputs") or [],
                 "reason": (
                     f"ID {gid} exact + size {sz} within ±2.5% of original {orig}"

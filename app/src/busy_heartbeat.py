@@ -289,6 +289,28 @@ def clear_session() -> None:
         _session["section"] = ""
 
 
+def snapshot() -> dict:
+    """Live file + step counters for the session board. Does not print."""
+    now = time.time()
+    with _prog_lock:
+        prog = dict(_prog)
+        sess = dict(_session)
+    start = prog.get("start_t")
+    elapsed = (now - float(start)) if start else None
+    return {
+        "step_done": prog.get("done"),
+        "step_total": prog.get("total"),
+        "step_label": prog.get("label") or "",
+        "step_elapsed": elapsed,
+        "file_done": sess.get("done"),
+        "file_total": sess.get("total"),
+        "file_index": sess.get("index"),
+        "file_name": sess.get("name") or "",
+        "section": sess.get("section") or "",
+        "stop_armed": stop_armed(),
+    }
+
+
 def _short_label(desc: str) -> str:
     d = (desc or "").strip()
     if d.startswith("[FlashVSR]"):

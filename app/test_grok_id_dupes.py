@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import os
 import tempfile
 import time
@@ -120,9 +121,83 @@ def test_preflight_keeps_distinct_takes() -> None:
         assert left == [f"{gid} (1).mp4", f"{gid} (2).mp4", f"{gid}.mp4"]
 
 
+def test_match_file_keeps_other_chrome_take() -> None:
+    gid = "grok-video-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        blob = b"q" * (40 * 1024)
+        numbered = root / f"{gid} (4).mp4"
+        plain = root / f"{gid}.mp4"
+        numbered.write_bytes(blob + b"y" * 100)  # within ±2.5%, different take
+        plain.write_bytes(blob + b"z" * 50)
+        index = {
+            "ids": {
+                gid: {
+                    "id": gid,
+                    "original_size": len(blob),
+                    "original_path": str(root / f"{gid}.mp4"),
+                    "outputs": [],
+                }
+            }
+        }
+        assert g.match_file(str(numbered), index) is None
+        hit = g.match_file(str(plain), index)
+        assert hit is not None and "same take" in hit["reason"]
+
+        legacy = {
+            "ids": {
+                gid: {
+                    "id": gid,
+                    "original_size": len(blob),
+                    "original_path": "",
+                    "outputs": [],
+                }
+            }
+        }
+        assert g.match_file(str(numbered), legacy) is None
+        assert g.match_file(str(plain), legacy) is not None
+
+
+def test_add_paths_queues_near_size_other_take() -> None:
+    gid = "grok-video-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        app = root / "app"
+        (app / "outputs").mkdir(parents=True)
+        inbox = root / "inbox"
+        inbox.mkdir()
+        blob = b"q" * (40 * 1024)
+        plain = inbox / f"{gid}.mp4"
+        other = inbox / f"{gid} (4).mp4"
+        plain.write_bytes(blob)
+        other.write_bytes(blob + b"y" * 100)
+        _age(plain)
+        _age(other)
+        index = {
+            "ids": {
+                gid: {
+                    "id": gid,
+                    "original_size": len(blob),
+                    "original_path": str(plain),
+                    "outputs": [],
+                }
+            }
+        }
+        (app / "outputs" / "grok_id_index.json").write_text(
+            json.dumps(index), encoding="utf-8"
+        )
+        wq = FlashVSRWorkQueue(str(app), name="group", extensions={".mp4"}, label="t")
+        scan = wq.add_folder(str(inbox))
+        names = sorted(Path(it["path"]).name for it in (wq.load().get("items") or []))
+        assert names == [f"{gid} (4).mp4"], scan.summary()
+        assert scan.added == 1
+
+
 if __name__ == "__main__":
     test_extract_and_rank()
     test_add_paths_keeps_distinct_imagine_takes()
     test_add_paths_skips_same_size_chrome_copy()
     test_preflight_keeps_distinct_takes()
+    test_match_file_keeps_other_chrome_take()
+    test_add_paths_queues_near_size_other_take()
     print("ok")

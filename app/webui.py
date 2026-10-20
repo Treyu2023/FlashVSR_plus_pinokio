@@ -103,6 +103,7 @@ from flashvsr_work_queue import (
 import grok_id_index
 import group_therapy as gt
 import gpu_headroom
+import session_board
 from naming_utils import (
     upscale_video_filename,
     upscale_image_filename,
@@ -3732,19 +3733,21 @@ def _run_group_therapy_body(
         log(note, message_type="warning")
         return None, wq.status_html(note)
 
-    items = [it for it in wq.all_items() if it.get("status") != "done"]
+    ordered = gt.run_order(wq.all_items())
     session_order = {
-        os.path.normcase(it.get("path") or ""): i + 1 for i, it in enumerate(items)
+        os.path.normcase(it.get("path") or ""): i + 1 for i, it in enumerate(ordered)
     }
-    session_total = len(items)
-    groups = gt.ordered_groups(items)
+    session_total = len(ordered)
+    groups = gt.ordered_groups(ordered)
     if not groups:
         note = f"Group Therapy empty — drop videos in {watch_folder or 'the original folder'}."
         return None, wq.status_html(note)
 
+    first_name = os.path.basename((ordered[0].get("path") if ordered else "") or "")
     log(
         f"Group Therapy: {len(groups)} group(s) × {group_size}  "
-        f"order=newest → oldest (in-progress group first)  "
+        f"order=newest → oldest (real in-progress group first)  "
+        f"first={first_name}  "
         f"stages={' → '.join(gt.STAGE_LABELS[s] for s in stages)}  "
         f"before={before_dir}  after={after_dir}",
         message_type="info",
@@ -3797,7 +3800,10 @@ def _run_group_therapy_body(
         )
 
     for g_i, gid in enumerate(groups):
-        members = [m for m in gt.group_members(wq.all_items(), gid) if m.get("status") != "done"]
+        members = [
+            m for m in gt.group_members(wq.all_items(), gid)
+            if m.get("status") not in ("done", "failed")
+        ]
         if not members:
             continue
         log(
@@ -3865,7 +3871,7 @@ def _run_group_therapy_body(
                     (x for x in wq.all_items() if os.path.normcase(x.get("path", "")) == os.path.normcase(path)),
                     item,
                 )
-                if item.get("status") == "done":
+                if item.get("status") in ("done", "failed"):
                     continue
                 if gt.stage_already_done(item, stage):
                     log(f"  skip {label} (already have output): {os.path.basename(path)}", message_type="info")
@@ -4056,8 +4062,12 @@ def _run_group_therapy_body(
                 log(note, message_type="warning")
                 return last_output, wq.status_html(note)
 
-            # refresh members after a stage
-            members = [m for m in gt.group_members(wq.all_items(), gid) if m.get("status") != "done"]
+            # refresh members after a stage (drop done and failed so a failed
+            # upscale is not interpolated from the raw download)
+            members = [
+                m for m in gt.group_members(wq.all_items(), gid)
+                if m.get("status") not in ("done", "failed")
+            ]
 
         log(f"══ Group {gid} complete ══", message_type="finish")
         gt.cleanup_empty_work(ROOT_DIR)
@@ -7276,40 +7286,94 @@ def open_folder(folder_path):
         return f'<div style="padding: 1px; background-color: #3f1d1d; border: 1px solid #7f1d1d; border-radius: 4px; color: #fca5a5;">❌ Error opening folder: {e}</div>'
 
 
+def _norm_real(path: str) -> str:
+    """Case-normalized absolute path. Follows the app\\outputs junction."""
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    try:
+        return os.path.normcase(os.path.normpath(os.path.realpath(text)))
+    except (OSError, ValueError):
+        try:
+            return os.path.normcase(os.path.normpath(os.path.abspath(text)))
+        except (OSError, ValueError):
+            return os.path.normcase(os.path.normpath(text))
+
+
+def _path_under(path: str, root: str) -> bool:
+    p = _norm_real(path)
+    r = _norm_real(root)
+    if not p or not r:
+        return False
+    return p == r or p.startswith(r + os.sep)
+
+
+def _coerce_media_path(file_or_dir) -> str:
+    """Pull a filesystem path out of a string or a Gradio video/file dict."""
+    raw = file_or_dir
+    for _ in range(4):
+        if not isinstance(raw, dict):
+            break
+        nested = raw.get("video")
+        raw = raw.get("path") or raw.get("name") or nested or ""
+    if raw is not None and not isinstance(raw, (str, os.PathLike, dict)):
+        raw = getattr(raw, "name", None) or ""
+    return str(raw or "").strip()
+
+
 def _looks_like_queue_log_dir(path: str) -> bool:
-    """True for app\\outputs work-queue / json / txt status folders — not media."""
+    """True for internal work dirs, not the folders finished videos are saved to.
+
+    app\\outputs is a junction to D:\\OUTPUTS\\FlashVSR (the old output folder).
+    Group Therapy work files live under that junction. Open Output Folder must
+    not open that tree.
+    """
     if not path:
         return True
-    p = os.path.normpath(os.path.abspath(str(path))).lower()
-    parts = p.replace("/", "\\").split("\\")
-    if any(x.startswith("work_queue") for x in parts):
+    parts = os.path.normpath(str(path)).replace("/", "\\").lower().split("\\")
+    if any(part.startswith("work_queue") for part in parts):
         return True
-    if "queue_logs" in parts or "batch_queues" in parts:
+    if any(part in ("queue_logs", "batch_queues", "group_therapy") for part in parts):
         return True
-    try:
-        if p == os.path.normpath(os.path.abspath(DEFAULT_OUTPUT_DIR)).lower():
-            return True
-        if p == os.path.normpath(os.path.abspath(TEMP_DIR)).lower():
-            return True
-        if p.startswith(os.path.normpath(os.path.abspath(TEMP_DIR)).lower() + os.sep):
-            return True
-    except Exception:
-        pass
+    if _path_under(path, DEFAULT_OUTPUT_DIR) or _path_under(path, TEMP_DIR):
+        return True
     return False
+
+
+def _video_output_fallback(file_or_dir=None) -> str:
+    """Folder the FlashVSR Open Output Folder button should use.
+
+    Group Therapy finals go to After (Ready for CIV). A plain video-queue
+    upscale goes to Ready for Toolbox. Never the old app\\outputs junction.
+    """
+    paths = get_workflow_paths()
+    cfg = load_config()
+    civ = str(cfg.get("gt_after_dir") or "").strip() or paths.get("toolbox_output_dir") or ""
+    handoff = paths.get("batch_upscale_handoff_dir") or get_output_dir()
+    active = ""
+    try:
+        active = get_exclusive_queue_lock().active_name() or ""
+    except Exception:
+        active = ""
+    raw = _coerce_media_path(file_or_dir)
+    if active == "group" or "group_therapy" in os.path.normpath(raw).lower():
+        return civ or handoff
+    return handoff
+
+
+def open_video_output_folder(file_or_dir=None):
+    """Open the current video deliverable folder, not the old outputs junction."""
+    return open_media_folder(file_or_dir, _video_output_fallback(file_or_dir))
 
 
 def open_media_folder(file_or_dir=None, fallback=None, as_html=True):
     """
-    Open Explorer at the actual videos/images, not queue JSON/TXT dirs.
-    If a just-saved file is passed, open that file's parent.
+    Open Explorer at finished videos/images.
+    A preview that still sits in temp or app\\outputs (D:\\OUTPUTS\\FlashVSR)
+    is ignored so the button opens the configured output folder instead.
     """
     folder = None
-    raw = file_or_dir
-    if isinstance(raw, dict):
-        raw = raw.get("path") or raw.get("name") or ""
-    elif raw is not None and not isinstance(raw, (str, os.PathLike)):
-        raw = getattr(raw, "name", None) or str(raw)
-    raw = str(raw or "").strip()
+    raw = _coerce_media_path(file_or_dir)
     if raw:
         if os.path.isfile(raw):
             folder = os.path.dirname(os.path.abspath(raw))
@@ -7319,6 +7383,9 @@ def open_media_folder(file_or_dir=None, fallback=None, as_html=True):
         folder = fallback or get_output_dir()
     if _looks_like_queue_log_dir(folder):
         folder = get_workflow_paths().get("batch_upscale_handoff_dir") or get_output_dir()
+    if _looks_like_queue_log_dir(folder):
+        cfg = load_config()
+        folder = str(cfg.get("gt_after_dir") or "").strip() or get_toolbox_output_dir()
     try:
         os.makedirs(folder, exist_ok=True)
     except OSError:
@@ -7803,6 +7870,54 @@ def create_ui():
     ) as demo:
         output_file_path = gr.State(None)
         completion_status = gr.State(None)
+
+        try:
+            _board_html = session_board.render(ROOT_DIR)
+        except Exception as exc:
+            _board_html = (
+                "<div style='color:#fca5a5;padding:8px'>Session board: "
+                + html.escape(str(exc))
+                + "</div>"
+            )
+        try:
+            _profile_names = session_board.list_profiles(ROOT_DIR)
+        except Exception:
+            _profile_names = []
+        with gr.Group(elem_id="session_board"):
+            session_board_html = gr.HTML(value=_board_html)
+            with gr.Row():
+                job_profile_name = gr.Textbox(
+                    label="Job profile",
+                    placeholder="Name to save, or pick one and Apply",
+                    scale=2,
+                    lines=1,
+                )
+                job_profile_pick = gr.Dropdown(
+                    label="Saved profiles",
+                    choices=_profile_names,
+                    value=None,
+                    scale=2,
+                    interactive=True,
+                )
+                job_profile_save = gr.Button("Save knobs", size="sm", scale=1)
+                job_profile_apply = gr.Button(
+                    "Apply to next run", size="sm", variant="primary", scale=1,
+                )
+                job_profile_delete = gr.Button("Delete", size="sm", variant="stop", scale=1)
+            job_profile_note = gr.Textbox(
+                label="Note",
+                placeholder="What this profile is for (draft, clarity, overnight…)",
+                lines=1,
+            )
+            job_profile_status = gr.Textbox(
+                label="Profile",
+                value=(
+                    "Profiles store knobs only. Folders stay on O: intake and the D: pipeline. "
+                    "The file already running keeps the settings it started with."
+                ),
+                lines=2,
+                interactive=False,
+            )
 
         with gr.Tabs(elem_id="main_tabs") as main_tabs:
             with gr.TabItem("FlashVSR", id=0):
@@ -9028,9 +9143,7 @@ def create_ui():
         )
         
         open_folder_button.click(
-            fn=lambda p: open_media_folder(
-                p, get_workflow_paths()["batch_upscale_handoff_dir"]
-            ),
+            fn=open_video_output_folder,
             inputs=[output_file_path],
             outputs=[save_status]
         ).then(
@@ -9395,7 +9508,7 @@ def create_ui():
 
         def handle_queue_requeue_failed():
             wq = get_flashvsr_work_queue()
-            n = wq.requeue_failed()
+            n = wq.requeue_failed(include_gave_up=True)
             return wq.status_html(f"Re-queued {n} failed item(s).")
 
         def handle_batch_processing(
@@ -9543,7 +9656,7 @@ def create_ui():
             return get_group_therapy_queue().status_html(f"Cleared entire queue ({n} items).")
 
         def _gt_q_requeue():
-            n = get_group_therapy_queue().requeue_failed()
+            n = get_group_therapy_queue().requeue_failed(include_gave_up=True)
             return get_group_therapy_queue().status_html(f"Re-queued {n} failed item(s).")
 
         def handle_group_therapy(
@@ -9612,17 +9725,244 @@ def create_ui():
             show_progress=False,
         )
 
+        _PROFILE_WIDGETS = [
+            ("mode", mode_radio),
+            ("model_version", model_version_radio),
+            ("scale", scale_slider),
+            ("tile_size", tile_size_slider),
+            ("tile_overlap", tile_overlap_slider),
+            ("tiled_dit", tiled_dit_checkbox),
+            ("tiled_vae", tiled_vae_checkbox),
+            ("unload_dit", unload_dit_checkbox),
+            ("enable_chunks", enable_chunk_processing),
+            ("chunk_duration", chunk_duration_slider),
+            ("quality", quality_slider),
+            ("sparse_ratio", sparse_ratio_slider),
+            ("local_range", local_range_slider),
+            ("kv_ratio", kv_ratio_slider),
+            ("attention_mode", attention_mode_radio),
+            ("dtype", dtype_radio),
+            ("color_fix", color_fix_checkbox),
+            ("batch_resize_preset", batch_resize_preset),
+            ("gt_group_size", gt_group_size),
+            ("gt_rife_mode", gt_rife_mode),
+            ("gt_rife_quality", gt_rife_quality),
+            ("gt_rife_streaming", gt_rife_streaming),
+            ("gt_export_quality", gt_export_quality),
+            ("gt_export_max_width", gt_export_max_width),
+            ("gt_do_upscale", gt_do_upscale),
+            ("gt_do_export", gt_do_export),
+        ]
+        _PROFILE_CHOICES = {
+            "mode": ("tiny", "full"),
+            "model_version": ("v1.0", "v1.1"),
+            "attention_mode": ("sage", "block"),
+            "dtype": ("fp16", "bf16"),
+            "gt_rife_mode": ("Off", "2x Frames", "4x Frames"),
+            "batch_resize_preset": (
+                "4K-safe (auto)", "No Resize", "512px", "768px",
+                "1024px", "1280px", "1920px",
+            ),
+        }
+        _PROFILE_INTS = {
+            "scale", "tile_size", "tile_overlap", "local_range", "kv_ratio",
+            "quality", "gt_group_size", "gt_rife_quality", "gt_export_quality",
+            "gt_export_max_width",
+        }
+        _PROFILE_FLOATS = {"sparse_ratio", "chunk_duration"}
+        _PROFILE_BOOLS = {
+            "tiled_dit", "tiled_vae", "unload_dit", "enable_chunks", "color_fix",
+            "gt_rife_streaming", "gt_do_upscale", "gt_do_export",
+        }
+        _IMAGE_MIRROR_KEYS = (
+            "mode", "model_version", "scale", "tiled_dit", "tile_size", "tile_overlap",
+            "quality", "sparse_ratio", "local_range", "kv_ratio", "attention_mode",
+            "dtype", "color_fix", "tiled_vae", "unload_dit", "batch_resize_preset",
+        )
+        _IMAGE_MIRROR_WIDGETS = [
+            img_mode, img_model_version, img_scale, img_tiled_dit,
+            img_tile_size, img_tile_overlap, img_quality, img_sparse_ratio,
+            img_local_range, img_kv_ratio, img_attention_mode, img_dtype,
+            img_color_fix, img_tiled_vae, img_unload_dit, img_batch_resize_preset,
+        ]
+
+        def _coerce_profile_value(key, raw):
+            if key in _PROFILE_BOOLS:
+                return bool(raw)
+            if key in _PROFILE_INTS:
+                try:
+                    return int(round(float(raw)))
+                except (TypeError, ValueError):
+                    return None
+            if key in _PROFILE_FLOATS:
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    return None
+            choices = _PROFILE_CHOICES.get(key)
+            if choices is not None and raw not in choices:
+                return None
+            return raw
+
+        def _widget_update(key, prof):
+            if key not in prof or prof.get(key) is None:
+                return gr.skip()
+            raw = _coerce_profile_value(key, prof.get(key))
+            if raw is None:
+                return gr.skip()
+            return gr.update(value=raw)
+
+        def _fresh_board():
+            try:
+                return session_board.render(ROOT_DIR)
+            except Exception as exc:
+                return (
+                    "<div style='color:#fca5a5'>Session board: "
+                    + html.escape(str(exc))
+                    + "</div>"
+                )
+
+        def _pick_job_profile(name):
+            title = str(name or "").strip()
+            prof = session_board.load_profile(ROOT_DIR, title) if title else {}
+            return title, str(prof.get("note") or "")
+
+        def _save_job_profile(name, note, *vals):
+            title = str(name or "").strip()
+            values = {}
+            for (key, _widget), raw in zip(_PROFILE_WIDGETS, vals):
+                coerced = _coerce_profile_value(key, raw)
+                if coerced is not None:
+                    values[key] = coerced
+            try:
+                names = session_board.save_profile(ROOT_DIR, title, values, note=note or "")
+            except ValueError as exc:
+                return gr.skip(), gr.skip(), str(exc), gr.skip()
+            return (
+                gr.update(choices=names, value=title),
+                gr.update(value=title),
+                (
+                    f"Saved {title}. Knobs only — folders were not changed. "
+                    "The file already running keeps its settings. "
+                    "Apply, then the next Start / Resume uses this profile."
+                ),
+                _fresh_board(),
+            )
+
+        def _apply_job_profile(picked, typed):
+            title = str(picked or typed or "").strip()
+            prof = session_board.load_profile(ROOT_DIR, title) if title else {}
+            blanks = len(_PROFILE_WIDGETS) + len(_IMAGE_MIRROR_KEYS) + 4
+            if not prof:
+                return (
+                    *([gr.skip()] * blanks),
+                    gr.skip(),
+                    "Pick or name a saved profile before Apply.",
+                    gr.skip(),
+                )
+            clean = {}
+            for key in session_board.PROFILE_KEYS:
+                if key not in prof:
+                    continue
+                coerced = _coerce_profile_value(key, prof.get(key))
+                if coerced is not None:
+                    clean[key] = coerced
+            cfg = load_config()
+            cfg.update(session_board.config_updates(clean))
+            save_config(cfg)
+            session_board.mark_active(ROOT_DIR, title)
+            video_updates = [_widget_update(key, clean) for key, _widget in _PROFILE_WIDGETS]
+            image_updates = [_widget_update(key, clean) for key in _IMAGE_MIRROR_KEYS]
+            tiled_on = clean.get("tiled_dit")
+            chunk_on = clean.get("enable_chunks")
+            vis_tiled = gr.update(visible=bool(tiled_on)) if tiled_on is not None else gr.skip()
+            vis_chunk = gr.update(visible=bool(chunk_on)) if chunk_on is not None else gr.skip()
+            return (
+                *video_updates,
+                *image_updates,
+                vis_tiled,
+                vis_tiled,
+                vis_chunk,
+                vis_chunk,
+                gr.update(choices=session_board.list_profiles(ROOT_DIR), value=title),
+                (
+                    f"Applied {title} to the open knobs and webui_config. "
+                    "The file already running keeps the settings it started with. "
+                    "The next Start / Resume uses this profile. "
+                    "Folder paths stayed on O: intake and the D: pipeline."
+                ),
+                _fresh_board(),
+            )
+
+        def _delete_job_profile(name):
+            title = str(name or "").strip()
+            if not title:
+                return gr.skip(), gr.skip(), gr.skip(), "Pick a profile to delete.", gr.skip()
+            names = session_board.delete_profile(ROOT_DIR, title)
+            return (
+                gr.update(choices=names, value=None),
+                gr.update(value=""),
+                gr.update(value=""),
+                f"Deleted {title}. Folders and the file already running were not changed.",
+                _fresh_board(),
+            )
+
+        job_profile_pick.change(
+            fn=_pick_job_profile,
+            inputs=[job_profile_pick],
+            outputs=[job_profile_name, job_profile_note],
+            queue=False,
+        )
+        job_profile_save.click(
+            fn=_save_job_profile,
+            inputs=[job_profile_name, job_profile_note] + [widget for _key, widget in _PROFILE_WIDGETS],
+            outputs=[job_profile_pick, job_profile_name, job_profile_status, session_board_html],
+            queue=False,
+        )
+        job_profile_apply.click(
+            fn=_apply_job_profile,
+            inputs=[job_profile_pick, job_profile_name],
+            outputs=(
+                [widget for _key, widget in _PROFILE_WIDGETS]
+                + _IMAGE_MIRROR_WIDGETS
+                + [
+                    tiled_dit_options, img_tiled_dit_options,
+                    chunk_settings_row, chunk_preview_display,
+                    job_profile_pick, job_profile_status, session_board_html,
+                ]
+            ),
+            queue=False,
+        )
+        job_profile_delete.click(
+            fn=_delete_job_profile,
+            inputs=[job_profile_name],
+            outputs=[
+                job_profile_pick, job_profile_name, job_profile_note,
+                job_profile_status, session_board_html,
+            ],
+            queue=False,
+        )
+
         def update_monitor():
             gpu_info, cpu_info = SystemMonitor.get_system_info()
             # Return same info for both video and image tabs, plus stop banners.
             panels = _stop_panel_updates()
-            return (gpu_info, cpu_info, gpu_info, cpu_info, *panels)
+            try:
+                board = session_board.render(ROOT_DIR)
+            except Exception as exc:
+                board = (
+                    "<div style='color:#fca5a5'>Session board: "
+                    + html.escape(str(exc))
+                    + "</div>"
+                )
+            return (gpu_info, cpu_info, gpu_info, cpu_info, board, *panels)
             
         monitor_timer = gr.Timer(2, active=True)
         monitor_timer.tick(
             fn=update_monitor,
             outputs=[
                 gpu_monitor, cpu_monitor, img_gpu_monitor, img_cpu_monitor,
+                session_board_html,
                 batch_stop_ack, gt_stop_ack, img_stop_ack, tb_stop_ack,
                 flashvsr_queue_status, gt_queue_status, img_queue_status, tb_queue_status,
             ],
@@ -9811,7 +10151,7 @@ def create_ui():
 
         def _img_q_requeue():
             wq = get_flashvsr_image_queue()
-            return wq.status_html(f"Re-queued {wq.requeue_failed()} failed.")
+            return wq.status_html(f"Re-queued {wq.requeue_failed(include_gave_up=True)} failed.")
 
         img_stop_queue_btn.click(fn=_img_q_stop, inputs=[], outputs=[img_stop_ack], queue=False)
         img_clear_done_btn.click(fn=_img_q_clear_done, outputs=[img_queue_status])
@@ -10145,7 +10485,7 @@ def create_ui():
 
         def _tb_q_requeue():
             wq = get_toolbox_work_queue()
-            return wq.status_html(f"Re-queued {wq.requeue_failed()} failed.")
+            return wq.status_html(f"Re-queued {wq.requeue_failed(include_gave_up=True)} failed.")
 
         tb_queue_stop_btn.click(fn=_tb_q_stop, inputs=[], outputs=[tb_stop_ack], queue=False)
         tb_queue_clear_done_btn.click(fn=_tb_q_clear_done, outputs=[tb_queue_status])

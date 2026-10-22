@@ -47,3 +47,17 @@ Local commit: <fill SHA after commit>, subject "FV-RESUME: keep finished chunks,
 
 Item B note: a commit that untracks files deletes them from any OTHER clone that pulls it. Back up both files to C:\_Archive\<date>-<worker>\ before any pull of this commit elsewhere.
 Save/reapply/rollback: same commands as above, with C:\_Archive\fvresume-patches; for B rollback also run `git add -f app/webui_config app/job_profiles.json`.
+
+---
+# FV-STATS (on top of a02b3900)
+
+Local commit: <fill SHA after commit>, subject "FV-STATS: per-section stats buckets (v3) with archived reset/undo".
+
+| Item | File | What |
+|---|---|---|
+| 1 | app/session_board.py | v3 store {v, buckets, archive, active_profile}; lock→bucket map; v2→group migration with one-time .v2.bak.json; reset_bucket/undo_reset |
+| 2 | app/webui.py | collapsed "Stats reset" accordion in the session_board group (Arm → Confirm, Undo) |
+| 3 | app/test_session_board.py | migration/.bak, isolation, no-lock skip, reset/undo/cap tests |
+
+Before deploy: queue idle; copy app/outputs/session_board_stats.json to C:\_Archive\<date>-<worker>\.
+Rollback: revert the commit (or `git apply -R`), then restore the stats file from app/outputs/session_board_stats.v2.bak.json (or the C:\_Archive copy). v2 code would read a v3 file as an empty flat record, so restore the .bak before restarting.

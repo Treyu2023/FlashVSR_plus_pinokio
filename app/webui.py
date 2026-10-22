@@ -8096,6 +8096,23 @@ def create_ui():
                 lines=2,
                 interactive=False,
             )
+            with gr.Accordion("Stats reset", open=False):
+                with gr.Row():
+                    stats_bucket_pick = gr.Dropdown(
+                        label="Section",
+                        choices=list(session_board.BUCKETS),
+                        value="group",
+                        scale=2,
+                        interactive=True,
+                    )
+                    stats_arm_btn = gr.Button("Arm reset", size="sm", scale=1)
+                    stats_confirm_btn = gr.Button(
+                        "Confirm reset", size="sm", variant="stop", scale=1, interactive=False,
+                    )
+                    stats_undo_btn = gr.Button("Undo last reset", size="sm", scale=1)
+                stats_reset_status = gr.Textbox(
+                    label="Stats", value="", lines=1, interactive=False, show_label=False,
+                )
 
         with gr.Tabs(elem_id="main_tabs") as main_tabs:
             with gr.TabItem("FlashVSR", id=0):
@@ -10119,6 +10136,37 @@ def create_ui():
                 job_profile_status, session_board_html,
             ],
             queue=False,
+        )
+
+        def _stats_arm(bucket):
+            return gr.update(interactive=True), f"Armed: Confirm resets {bucket} stats (archived, undoable)."
+
+        def _stats_disarm(_bucket):
+            return gr.update(interactive=False), ""
+
+        def _stats_confirm(bucket):
+            note = session_board.reset_bucket(ROOT_DIR, bucket)
+            return gr.update(interactive=False), note, session_board.render(ROOT_DIR)
+
+        def _stats_undo(bucket):
+            note = session_board.undo_reset(ROOT_DIR, bucket)
+            return gr.update(interactive=False), note, session_board.render(ROOT_DIR)
+
+        stats_arm_btn.click(
+            fn=_stats_arm, inputs=[stats_bucket_pick],
+            outputs=[stats_confirm_btn, stats_reset_status], queue=False,
+        )
+        stats_bucket_pick.change(
+            fn=_stats_disarm, inputs=[stats_bucket_pick],
+            outputs=[stats_confirm_btn, stats_reset_status], queue=False,
+        )
+        stats_confirm_btn.click(
+            fn=_stats_confirm, inputs=[stats_bucket_pick],
+            outputs=[stats_confirm_btn, stats_reset_status, session_board_html], queue=False,
+        )
+        stats_undo_btn.click(
+            fn=_stats_undo, inputs=[stats_bucket_pick],
+            outputs=[stats_confirm_btn, stats_reset_status, session_board_html], queue=False,
         )
 
         def update_monitor():

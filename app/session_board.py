@@ -329,8 +329,55 @@ def _stats_path(app_dir: Path) -> Path:
     return app_dir / "outputs" / "session_board_stats.json"
 
 
-def _load_stats(app_dir: Path, now: float) -> dict:
-    data = _read_json(_stats_path(app_dir)) or {}
+# v3 stats: one record per section, keyed from the ACTIVE_QUEUE.lock queue name.
+STATS_V = 3
+BUCKETS = ("group", "upscale", "image", "toolbox")
+LOCK_TO_BUCKET = {"group": "group", "video": "upscale", "image": "image", "toolbox": "toolbox"}
+ARCHIVE_MAX = 50
+
+
+def _bak_path(app_dir: Path) -> Path:
+    return app_dir / "outputs" / "session_board_stats.v2.bak.json"
+
+
+def _lock_bucket(app_dir: Path) -> Optional[str]:
+    """Bucket of the queue that holds the lock. None when no lock: that tick is not recorded."""
+    lock = _read_json(app_dir / "outputs" / "ACTIVE_QUEUE.lock") or {}
+    return LOCK_TO_BUCKET.get(str(lock.get("queue") or ""))
+
+
+def _read_store(app_dir: Path) -> dict:
+    """v3 store. Flat v2/unversioned record becomes buckets['group']; corrupt/missing is empty."""
+    raw = _read_json(_stats_path(app_dir)) or {}
+    if raw.get("v") == STATS_V:
+        buckets = raw.get("buckets") if isinstance(raw.get("buckets"), dict) else {}
+        archive = raw.get("archive") if isinstance(raw.get("archive"), list) else []
+        profile = str(raw.get("active_profile") or "")
+    else:
+        buckets = {"group": raw} if raw else {}
+        archive = []
+        profile = str(raw.get("active_profile") or "")
+    buckets = {k: v for k, v in buckets.items() if k in BUCKETS and isinstance(v, dict)}
+    return {"v": STATS_V, "buckets": buckets, "archive": archive, "active_profile": profile}
+
+
+def _write_store(app_dir: Path, store: dict) -> None:
+    """Before the first v3 write, keep one copy of the old file. Never overwrite the .bak."""
+    path = _stats_path(app_dir)
+    bak = _bak_path(app_dir)
+    if path.exists() and not bak.exists():
+        old = _read_json(path)
+        if not old or old.get("v") != STATS_V:
+            try:
+                bak.write_bytes(path.read_bytes())
+            except OSError:
+                pass
+    _write_json(path, store)
+
+
+def _bucket_stats(rec: Optional[dict], now: float) -> dict:
+    """Same rules as the flat record had: v2 trim, pid rollover, missing bucket is empty."""
+    data = dict(rec or {})
     base = _empty_stats(now)
     if not data:
         return base
@@ -352,6 +399,39 @@ def _load_stats(app_dir: Path, now: float) -> dict:
     base["step_seconds"] = list(base.get("step_seconds") or [])
     base["last_status"] = dict(base.get("last_status") or {})
     return base
+
+
+def reset_bucket(app_dir, bucket: str, now: Optional[float] = None) -> str:
+    """Archive one section's record, then empty it. Undo with undo_reset."""
+    app = Path(app_dir)
+    if bucket not in BUCKETS:
+        return f"Unknown section: {bucket}"
+    with _STATS_LOCK:
+        store = _read_store(app)
+        old = store["buckets"].get(bucket) or {}
+        store["archive"] = (store["archive"] + [{"bucket": bucket, "ts": _now(now), "record": old}])[-ARCHIVE_MAX:]
+        store["buckets"][bucket] = _empty_stats(_now(now))
+        _write_store(app, store)
+    return f"Reset {bucket} stats. Undo last reset brings them back."
+
+
+def undo_reset(app_dir, bucket: str) -> str:
+    """Restore the newest archived record for this section and drop it from the archive."""
+    app = Path(app_dir)
+    with _STATS_LOCK:
+        store = _read_store(app)
+        for i in range(len(store["archive"]) - 1, -1, -1):
+            entry = store["archive"][i]
+            if isinstance(entry, dict) and entry.get("bucket") == bucket:
+                store["buckets"][bucket] = dict(entry.get("record") or {})
+                del store["archive"][i]
+                _write_store(app, store)
+                return f"Restored {bucket} stats from the last reset."
+    return f"No reset to undo for {bucket}."
+
+
+def _load_stats(app_dir: Path, now: float, bucket: str = "group") -> dict:
+    return _bucket_stats(_read_store(app_dir)["buckets"].get(bucket), now)
 
 
 def _update_stats(stats: dict, items: List[dict], heartbeat: dict, now: float) -> dict:
@@ -563,14 +643,19 @@ def render(
     data = pack["data"]
     beat = heartbeat if heartbeat is not None else _heartbeat()
     machine = sample if sample is not None else sample_machine(now_v)
+    record_bucket = _lock_bucket(app)
+    show_bucket = record_bucket or LOCK_TO_BUCKET.get(active, "group")
     with _STATS_LOCK:
-        stats = _load_stats(app, now_v)
-        stats = _update_stats(stats, items, beat, now_v)
-        if persist:
-            try:
-                _write_json(_stats_path(app), stats)
-            except OSError:
-                pass
+        store = _read_store(app)
+        stats = _bucket_stats(store["buckets"].get(show_bucket), now_v)
+        if record_bucket:
+            stats = _update_stats(stats, items, beat, now_v)
+            store["buckets"][record_bucket] = stats
+            if persist:
+                try:
+                    _write_store(app, store)
+                except OSError:
+                    pass
 
     running = counts["running"] > 0 or bool(beat.get("file_name"))
     health = classify_health(machine, beat, stats, now_v, running)
@@ -588,7 +673,7 @@ def render(
     step_label = str(beat.get("step_label") or beat.get("section") or "step")
     step_times = [float(x) for x in (stats.get("step_seconds") or [])]
     current_name = batch.get("current_name") or beat.get("file_name") or ""
-    profile = str(stats.get("active_profile") or "")
+    profile = str(store.get("active_profile") or stats.get("active_profile") or "")
     lamp = _health_color(health["level"])
     stop = " &nbsp; <span style='color:#fca5a5;font-weight:700'>STOP ARMED</span>" if beat.get("stop_armed") else ""
     label = dict(QUEUE_ORDER).get(active, active)
@@ -806,12 +891,11 @@ def mark_active(app_dir, name: str) -> None:
 
 
 def _stamp_active(app_dir: Path, name: str) -> None:
-    path = _stats_path(app_dir)
     with _STATS_LOCK:
-        stats = _read_json(path) or _empty_stats(time.time())
-        stats["active_profile"] = name
+        store = _read_store(app_dir)
+        store["active_profile"] = name
         try:
-            _write_json(path, stats)
+            _write_store(app_dir, store)
         except OSError:
             pass
 

@@ -43,6 +43,7 @@ Local commit: <fill SHA after commit>, subject "FV-RESUME: keep finished chunks,
 | B | (index only) | - | `git rm --cached app/webui_config app/job_profiles.json` (local files stay) |
 | C | app/session_board.py | 318 (_empty_stats), after 335 (_load_stats) | one-time trim of file_seconds without marker file_seconds_v=2 |
 | R1c | app/webui.py | new `_chunk_resume_seed` before `_clear_chunk_resume_dir`; key tuple + call after `_chunk_resume_dir` | seed left out of the resume key; first run saves it to `<key>/seed.json`, resume reuses it (Randomize Seed stays on) |
+| FV-PANE | start.js | event regex (base 40); new shell.run before local.set (base 47); url (base 54) | event `/Running on local URL:\s+(http:\/\/\S+)/`, url `{{input.event[1]}}`; wait for HTTP 200 on http://127.0.0.1:7860 (60 x 1 s, app venv python) before the pane opens; on timeout open anyway |
 
 Item B note: a commit that untracks files deletes them from any OTHER clone that pulls it. Back up both files to C:\_Archive\<date>-<worker>\ before any pull of this commit elsewhere.
 Save/reapply/rollback: same commands as above, with C:\_Archive\fvresume-patches; for B rollback also run `git add -f app/webui_config app/job_profiles.json`.

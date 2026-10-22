@@ -259,8 +259,13 @@ class ExclusiveQueueLock:
             return False
         if pid <= 0:
             return False
+        if pid == os.getpid():
+            return True
+        if os.name == "nt":
+            # Never os.kill(pid, 0) on Windows: 0 == CTRL_C_EVENT, so it sends
+            # Ctrl+C to the console group and ends the web UI mid-file.
+            return _win_pid_alive(pid)
         try:
-            # Windows: os.kill(pid, 0) raises if process missing
             os.kill(pid, 0)
             return True
         except (OSError, SystemError):
@@ -334,6 +339,37 @@ class ExclusiveQueueLock:
             f"🔒 Active now: <b>{label}</b> (started {st.get('started', '?')}). "
             f"Only one queue at a time.</div>"
         )
+
+
+def _win_pid_alive(pid: int) -> bool:
+    """Read-only liveness check on Windows. Opens a query handle; never signals."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.GetExitCodeProcess.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        process_query_limited_information = 0x1000
+        still_active = 259
+        error_access_denied = 5
+        handle = k32.OpenProcess(process_query_limited_information, False, int(pid))
+        if not handle:
+            # Access denied means the pid exists (elevated or another user).
+            return ctypes.get_last_error() == error_access_denied
+        try:
+            code = wintypes.DWORD()
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == still_active
+        finally:
+            k32.CloseHandle(handle)
+    except Exception:
+        return False
 
 
 def queue_runner_alive(app_dir: str) -> bool:

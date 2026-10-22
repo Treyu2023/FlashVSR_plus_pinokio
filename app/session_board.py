@@ -386,6 +386,11 @@ def _update_stats(stats: dict, items: List[dict], heartbeat: dict, now: float) -
             if open_file and open_file.get("started"):
                 stats["file_seconds"] = (stats["file_seconds"] + [max(0.0, now - float(open_file["started"]))])[-40:]
             stats["open_file"] = {"name": name, "index": index, "started": now}
+    elif open_file and open_file.get("started"):
+        # No file in progress (between files, stopped, idle): close the open file
+        # now so the idle gap is not counted in file_seconds.
+        stats["file_seconds"] = (stats["file_seconds"] + [max(0.0, now - float(open_file["started"]))])[-40:]
+        stats["open_file"] = None
     step_key = (
         heartbeat.get("step_label"),
         heartbeat.get("step_done"),

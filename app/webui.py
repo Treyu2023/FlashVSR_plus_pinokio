@@ -3264,6 +3264,22 @@ def _clear_stale_stop_flags() -> None:
             pass
 
 
+def _requeue_stuck_at_startup() -> None:
+    """A fresh process is not running any file. Re-queue rows left 'running'."""
+    for wq in _stop_queues():
+        try:
+            if queue_runner_alive(str(wq.app_dir)):
+                continue
+            stuck = wq.reset_stuck_running()
+            if stuck:
+                log(
+                    f"{wq.label}: re-queued {stuck} interrupted (was running) item(s) at startup.",
+                    message_type="info",
+                )
+        except Exception:
+            pass
+
+
 def _stop_panel_updates():
     """Clear the red stop box in the open web UI once the file has actually stopped.
 
@@ -4684,7 +4700,7 @@ def _run_flashvsr_work_queue_body(
             if temp_output_path and os.path.exists(temp_output_path):
                 filename = os.path.basename(temp_output_path)
                 final_path = unique_dest_path(completed_dir, filename)
-                shutil.copy(temp_output_path, final_path)
+                _copy_verified(temp_output_path, final_path)
                 last_output_path = final_path
                 processed_this_run += 1
                 # Mark done BEFORE archiving so a crash mid-move cannot requeue a missing path
@@ -6559,6 +6575,33 @@ def resize_input_video(video_path, max_width, scale=4, progress=gr.Progress(), m
         return video_path
 
 _dur_fps_cache = {}
+
+
+def _copy_verified(src_path, final_path, tolerance=0.5):
+    """Copy to a temp name in the same folder, check duration, then os.replace.
+
+    A short or unreadable copy never lands under the final name. The temp file
+    is removed and the error is raised so the item is marked failed.
+    """
+    base, ext = os.path.splitext(final_path)
+    part_path = f"{base}.part{ext}"
+    shutil.copy(src_path, part_path)
+    src_dur, _ = _probe_dur_fps(src_path)
+    out_dur, _ = _probe_dur_fps(part_path)
+    _dur_fps_cache.pop(os.path.normcase(os.path.abspath(part_path)), None)
+    if out_dur <= 0 or (src_dur > 0 and abs(out_dur - src_dur) > tolerance):
+        try:
+            os.remove(part_path)
+        except OSError:
+            pass
+        msg = (
+            f"Output check failed for {os.path.basename(final_path)}: "
+            f"copy {out_dur:.2f}s vs source {src_dur:.2f}s. Temp file removed."
+        )
+        log(msg, message_type="error")
+        raise RuntimeError(msg)
+    os.replace(part_path, final_path)
+    return final_path
 
 
 def _probe_dur_fps(video_path):
@@ -11363,6 +11406,7 @@ if __name__ == "__main__":
     log("Models will be downloaded automatically when you start processing.", message_type="info")
     apply_saved_gpu_headroom()
     _clear_stale_stop_flags()
+    _requeue_stuck_at_startup()
     
     ui = create_ui()
     allowed_paths = get_gradio_allowed_paths()

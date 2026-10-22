@@ -30,3 +30,19 @@ Deploy ONLY when every FlashVSR queue is idle (no running item, no stop flag arm
     git revert <SHA>                             # keeps history
     # uncommitted: git apply -R <patch>
     # or: git checkout 89f0153 -- app/flashvsr_work_queue.py app/webui.py app/session_board.py
+
+---
+# FV-RESUME (on top of FV-STOP 77299662)
+
+Local commit: <fill SHA after commit>, subject "FV-RESUME: keep finished chunks, untrack runtime config, trim pre-fix file stats".
+
+| Item | File | Base lines (77299662) | What |
+|---|---|---|---|
+| A | app/webui.py | new helpers before 7130 (process_video_with_chunks); edits after 7159, 7169, at 7221, 7268, after 7296 | reuse finished chunks from app/_temp/chunk_resume/<key>/ |
+| B | .gitignore | 15-16 | ignore app/webui_config, app/job_profiles.json |
+| B | (index only) | - | `git rm --cached app/webui_config app/job_profiles.json` (local files stay) |
+| C | app/session_board.py | 318 (_empty_stats), after 335 (_load_stats) | one-time trim of file_seconds without marker file_seconds_v=2 |
+| R1c | app/webui.py | new `_chunk_resume_seed` before `_clear_chunk_resume_dir`; key tuple + call after `_chunk_resume_dir` | seed left out of the resume key; first run saves it to `<key>/seed.json`, resume reuses it (Randomize Seed stays on) |
+
+Item B note: a commit that untracks files deletes them from any OTHER clone that pulls it. Back up both files to C:\_Archive\<date>-<worker>\ before any pull of this commit elsewhere.
+Save/reapply/rollback: same commands as above, with C:\_Archive\fvresume-patches; for B rollback also run `git add -f app/webui_config app/job_profiles.json`.

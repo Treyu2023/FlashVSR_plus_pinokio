@@ -12,8 +12,10 @@ app/**/.cache/
 .DS_Store
 Thumbs.db
 
-# Local user config (machine-specific paths) — keep tracked example optional
-# app/webui_config is machine-specific; still useful — track it if present
+# Local user config (machine-specific paths), rewritten at runtime. Untracked with
+# git rm --cached; the app falls back to built-in defaults when they are missing.
+app/webui_config
+app/job_profiles.json
 
 # Local recovery snapshots (machine-specific; also mirrored under C:\pinokio\backups\)
 local-preserve/

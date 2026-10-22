@@ -7127,6 +7127,120 @@ def combine_video_chunks(chunk_paths, output_name_base, progress=gr.Progress()):
         log(f"Error combining chunks: {e}", message_type="error")
         return None
 
+CHUNK_RESUME_DIR = os.path.join(TEMP_DIR, "chunk_resume")
+CHUNK_RESUME_MAX_AGE_S = 7 * 24 * 3600
+CHUNK_RESUME_SEED_FILE = "seed.json"
+
+
+def _probe_dur_fresh(path):
+    """_probe_dur_fps without the cache, for files that change under one name."""
+    key = os.path.normcase(os.path.abspath(path))
+    _dur_fps_cache.pop(key, None)
+    dur, _ = _probe_dur_fps(path)
+    _dur_fps_cache.pop(key, None)
+    return dur
+
+
+def _chunk_resume_dir(input_path, settings):
+    """Folder for finished chunks, keyed by input content and every output-changing setting.
+
+    Content (size + sha256), not path/mtime: the resize step writes a new
+    timestamped temp copy each run. Old folders are moved to _archive.
+    """
+    import hashlib
+
+    try:
+        h = hashlib.sha256()
+        h.update(str(os.path.getsize(input_path)).encode())
+        with open(input_path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+        h.update(repr(settings).encode())
+        key = h.hexdigest()[:24]
+        os.makedirs(CHUNK_RESUME_DIR, exist_ok=True)
+        archive = os.path.join(CHUNK_RESUME_DIR, "_archive")
+        now = time.time()
+        for name in os.listdir(CHUNK_RESUME_DIR):
+            old = os.path.join(CHUNK_RESUME_DIR, name)
+            if name in ("_archive", key) or not os.path.isdir(old):
+                continue
+            if now - os.path.getmtime(old) > CHUNK_RESUME_MAX_AGE_S:
+                os.makedirs(archive, exist_ok=True)
+                shutil.move(old, os.path.join(archive, name))
+        path = os.path.join(CHUNK_RESUME_DIR, key)
+        os.makedirs(path, exist_ok=True)
+        return path
+    except Exception as e:
+        log(f"Chunk resume off for this file: {e}", message_type="warning")
+        return None
+
+
+def _chunk_done_ok(done_path, chunk_path, tolerance=0.5):
+    """A kept chunk is reusable when its duration matches the input chunk."""
+    if not done_path or not os.path.isfile(done_path):
+        return False
+    out_dur = _probe_dur_fresh(done_path)
+    src_dur = _probe_dur_fresh(chunk_path)
+    return out_dur > 0 and (src_dur <= 0 or abs(out_dur - src_dur) <= tolerance)
+
+
+def _keep_chunk(output_path, done_path):
+    """Move a finished chunk into the resume folder: .part, check, os.replace."""
+    if not done_path:
+        return output_path
+    base, ext = os.path.splitext(done_path)
+    part_path = f"{base}.part{ext}"
+    try:
+        shutil.copy(output_path, part_path)
+        want = _probe_dur_fresh(output_path)
+        got = _probe_dur_fresh(part_path)
+        if got <= 0 or abs(got - want) > 0.05:
+            os.remove(part_path)
+            return output_path
+        os.replace(part_path, done_path)
+        os.remove(output_path)
+        return done_path
+    except Exception as e:
+        log(f"Could not keep chunk for resume: {e}", message_type="warning")
+        return output_path
+
+
+def _chunk_resume_seed(resume_dir, seed):
+    """R1c: seed is not in the key; the first run saves it, a resume reuses it."""
+    if not resume_dir:
+        return seed
+    seed_path = os.path.join(resume_dir, CHUNK_RESUME_SEED_FILE)
+    try:
+        if os.path.isfile(seed_path):
+            with open(seed_path, "r", encoding="utf-8") as f:
+                saved = int(json.load(f)["seed"])
+            if saved != seed:
+                log(f"Resume: reusing saved seed {saved} (this run picked {seed})", message_type="info")
+            return saved
+        with open(seed_path, "w", encoding="utf-8") as f:
+            json.dump({"seed": int(seed)}, f)
+    except Exception as e:
+        log(f"Resume seed not saved/read: {e}", message_type="warning")
+    return seed
+
+
+def _clear_chunk_resume_dir(resume_dir, kept_paths):
+    """Remove only the chunk files this run kept, then the empty folder."""
+    if not resume_dir:
+        return
+    kept_paths = list(kept_paths) + [os.path.join(resume_dir, CHUNK_RESUME_SEED_FILE)]
+    for p in kept_paths:
+        try:
+            if os.path.dirname(os.path.abspath(p)) == os.path.abspath(resume_dir) and os.path.isfile(p):
+                os.remove(p)
+        except OSError:
+            pass
+    try:
+        os.rmdir(resume_dir)
+    except OSError:
+        pass
+
+
 def process_video_with_chunks(
     input_path, chunk_duration, mode, model_version, scale, color_fix, tiled_vae, tiled_dit,
     tile_size, tile_overlap, unload_dit, dtype_str, seed, device, fps_override,
@@ -7157,6 +7271,12 @@ def process_video_with_chunks(
     
     num_chunks = len(chunk_paths)
     log(f"Created {num_chunks} chunks, processing each...", message_type="info")
+    resume_dir = _chunk_resume_dir(input_path, (
+        "v1", chunk_duration, num_chunks, mode, model_version, scale, color_fix, tiled_vae,
+        tiled_dit, tile_size, tile_overlap, dtype_str, fps_override, quality,
+        attention_mode, sparse_ratio, kv_ratio, local_range,
+    ))
+    seed = _chunk_resume_seed(resume_dir, seed)
     
     # Step 2: Process each chunk (model reloaded each time for clean state)
     processed_chunks = []
@@ -7167,6 +7287,11 @@ def process_video_with_chunks(
         chunk_progress_start = 0.1 + (i / num_chunks) * 0.8
         chunk_progress_end = 0.1 + ((i + 1) / num_chunks) * 0.8
         
+        done_path = os.path.join(resume_dir, f"chunk{i+1:03d}.mp4") if resume_dir else None
+        if _chunk_done_ok(done_path, chunk_path):
+            processed_chunks.append(done_path)
+            log(f"⏭ Chunk {i+1}/{num_chunks} already done — reusing kept output", message_type="info")
+            continue
         log(f"Processing chunk {i+1}/{num_chunks}...", message_type="info")
         progress(chunk_progress_start, desc=f"Processing chunk {i+1}/{num_chunks}...")
         prev_section = set_section(f"chunk {i + 1}/{num_chunks}")
@@ -7218,7 +7343,7 @@ def process_video_with_chunks(
             )
             
             if output_path and os.path.exists(output_path):
-                processed_chunks.append(output_path)
+                processed_chunks.append(_keep_chunk(output_path, done_path))
                 log(f"✅ Chunk {i+1}/{num_chunks} processed successfully", message_type="finish")
             else:
                 log(f"❌ Failed to process chunk {i+1}/{num_chunks}", message_type="error")
@@ -7265,8 +7390,10 @@ def process_video_with_chunks(
         fallback_analysis = analyze_output_video(fallback_path) if fallback_path else gr.update(visible=False)
         return fallback_path, fallback_path, None, fallback_analysis
     
-    # Clean up individual processed chunks
+    # Clean up individual processed chunks (kept resume chunks wait for the final check)
     for chunk_path in processed_chunks:
+        if resume_dir and os.path.dirname(os.path.abspath(chunk_path)) == os.path.abspath(resume_dir):
+            continue
         try:
             if os.path.exists(chunk_path):
                 os.remove(chunk_path)
@@ -7294,6 +7421,14 @@ def process_video_with_chunks(
         merge_video_with_audio(combined_path, input_path, temp_output_path)
     else:
         shutil.move(combined_path, temp_output_path)
+
+    # Drop kept chunks only when every chunk made it and the joined file is full length
+    if resume_dir and len(processed_chunks) == num_chunks and os.path.isfile(temp_output_path):
+        final_dur = _probe_dur_fresh(temp_output_path)
+        if final_dur > 0 and (total_duration <= 0 or abs(final_dur - float(total_duration)) <= 1.0):
+            _clear_chunk_resume_dir(resume_dir, processed_chunks)
+        else:
+            log(f"Kept finished chunks for resume: joined file {final_dur:.1f}s vs source {float(total_duration or 0):.1f}s", message_type="warning")
     
     # Autosave if enabled
     output_dir = get_output_dir()

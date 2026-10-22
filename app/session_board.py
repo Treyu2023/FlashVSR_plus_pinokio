@@ -316,6 +316,7 @@ def _empty_stats(now: float) -> dict:
         "lifetime_done": 0,
         "last_status": {},
         "file_seconds": [],
+        "file_seconds_v": 2,
         "step_seconds": [],
         "open_file": None,
         "last_step_key": None,
@@ -333,6 +334,9 @@ def _load_stats(app_dir: Path, now: float) -> dict:
     base = _empty_stats(now)
     if not data:
         return base
+    if data.get("file_seconds_v") != 2:
+        # One-time trim: entries written before the FV-STOP idle-gap fix carry no marker.
+        data["file_seconds"] = []
     if int(data.get("pid") or 0) != os.getpid():
         base["lifetime_done"] = int(data.get("lifetime_done") or 0) + len(data.get("session_done") or [])
         base["active_profile"] = str(data.get("active_profile") or "")

@@ -167,6 +167,11 @@ def test_bucket_isolation_and_no_lock() -> None:
         assert (app / "outputs" / "session_board_stats.json").read_bytes() == raw
 
 
+def _arch(app: Path) -> list:
+    path = app / "outputs" / "session_board_stats_archive.json"
+    return json.loads(path.read_text(encoding="utf-8"))["archive"] if path.exists() else []
+
+
 def test_reset_undo_and_cap() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         app = Path(tmp)
@@ -177,21 +182,116 @@ def test_reset_undo_and_cap() -> None:
         assert _store(app)["buckets"]["group"]["file_seconds"] == [60.0]
         sb.reset_bucket(app, "group", now=80.0)
         st = _store(app)
+        assert "archive" not in st
         assert st["buckets"]["group"]["file_seconds"] == []
-        assert st["archive"][-1]["bucket"] == "group"
-        assert st["archive"][-1]["record"]["file_seconds"] == [60.0]
+        assert st["buckets"]["group"]["session_file_seconds"] == [60.0]  # session survives reset
+        assert _arch(app)[-1]["bucket"] == "group"
+        assert _arch(app)[-1]["record"]["file_seconds"] == [60.0]
         assert "No reset" in sb.undo_reset(app, "image")
         sb.undo_reset(app, "group")
-        st = _store(app)
-        assert st["buckets"]["group"]["file_seconds"] == [60.0]
-        assert st["archive"] == []
+        assert _store(app)["buckets"]["group"]["file_seconds"] == [60.0]
+        assert _arch(app) == []
         for i in range(55):
             sb.reset_bucket(app, "image", now=float(i))
-        st = _store(app)
-        assert len(st["archive"]) == 50
-        assert st["archive"][0]["ts"] == 5.0
+        assert len(_arch(app)) == 50
+        assert _arch(app)[0]["ts"] == 5.0
         assert "Unknown" in sb.reset_bucket(app, "nope")
 
+
+def test_tick_writes_only_on_change() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        _queue(app, "group", [])
+        _lock(app, "group")
+        _tick(app, "a.mp4", 10.0)
+        sb.reset_bucket(app, "group", now=11.0)
+        main = app / "outputs" / "session_board_stats.json"
+        arch = app / "outputs" / "session_board_stats_archive.json"
+        raw, mt = main.read_bytes(), main.stat().st_mtime_ns
+        araw, amt = arch.read_bytes(), arch.stat().st_mtime_ns
+        for t in (12.0, 14.0, 16.0):
+            _tick(app, "a.mp4", t)  # same open file: nothing changes
+        assert main.read_bytes() == raw and main.stat().st_mtime_ns == mt
+        sb.render(app, heartbeat={}, sample={}, now=30.0)  # change: file closes
+        assert main.read_bytes() != raw
+        assert arch.read_bytes() == araw and arch.stat().st_mtime_ns == amt  # ticks never write archive
+
+
+def test_in_file_archive_migrates() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        out = app / "outputs"
+        out.mkdir(parents=True)
+        old = {"v": 3, "buckets": {"group": {"file_seconds": [5.0], "file_seconds_v": 2}},
+               "archive": [{"bucket": "group", "ts": 1.0, "record": {"file_seconds": [9.0]}}], "active_profile": ""}
+        (out / "session_board_stats.json").write_text(json.dumps(old), encoding="utf-8")
+        _queue(app, "group", [])
+        _lock(app, "group")
+        _tick(app, "a.mp4", 10.0)
+        assert "archive" not in _store(app)
+        assert _arch(app) == old["archive"]
+        _tick(app, "b.mp4", 20.0)
+        assert _arch(app) == old["archive"]  # moved once, not duplicated
+        sb.undo_reset(app, "group")
+        assert _store(app)["buckets"]["group"]["file_seconds"] == [9.0]
+        assert _arch(app) == []
+
+
+def test_sessions() -> None:
+    import os
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        out = app / "outputs"
+        out.mkdir(parents=True)
+        hist = {"pid": os.getpid() + 1, "lifetime_done": 40, "file_seconds": [3000.0] * 10, "file_seconds_v": 2,
+                "session_file_seconds": [3000.0] * 10, "session_done": ["x"]}
+        (out / "session_board_stats.json").write_text(json.dumps({"v": 3, "buckets": {"upscale": hist}}), encoding="utf-8")
+        for q in ("video", "image"):
+            _queue(app, q, [])
+        _lock(app, "video")
+        # Restart (stored pid differs): session starts empty, history kept.
+        html = _tick(app, "a.mp4", 100.0)
+        up = _store(app)["buckets"]["upscale"]
+        assert up["session_file_seconds"] == [] and up["session_done"] == []
+        assert up["lifetime_done"] == 41 and len(up["file_seconds"]) == 10
+        assert "session 0" in html and "all-time 41" in html
+        # Session avg ignores history; ETA switches at SESSION_ETA_MIN files.
+        t = 100.0
+        for i in range(sb.SESSION_ETA_MIN):
+            t += 60.0
+            _tick(app, f"f{i}.mp4", t)
+        up = _store(app)["buckets"]["upscale"]
+        assert up["session_file_seconds"] == [60.0] * sb.SESSION_ETA_MIN
+        # Per-bucket: image session untouched by video ticks.
+        assert sb._load_stats(app, t, "image")["session_file_seconds"] == []
+        _lock(app, "image")
+        _tick(app, "i.png", t + 1)
+        sb.render(app, heartbeat={}, sample={}, now=t + 6)
+        assert _store(app)["buckets"]["image"]["session_file_seconds"] == [5.0]
+        assert _store(app)["buckets"]["upscale"]["session_file_seconds"] == [60.0] * sb.SESSION_ETA_MIN
+        # New session: clears session only, all-time kept.
+        sb.new_session(app, "upscale", now=t + 10)
+        up = _store(app)["buckets"]["upscale"]
+        assert up["session_file_seconds"] == [] and up["started"] == t + 10
+        assert len(up["file_seconds"]) == 10 + sb.SESSION_ETA_MIN
+        assert sb._load_stats(app, t, "image")["session_file_seconds"] == [5.0]
+
+
+def test_eta_threshold() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        _queue(app, "video", [{"path": f"p{i}", "status": "pending"} for i in range(10)])
+        _lock(app, "video")
+        st = sb._empty_stats(0.0)
+        st["file_seconds"] = [1000.0]
+        st["session_file_seconds"] = [100.0, 100.0]
+        (app / "outputs" / "session_board_stats.json").write_text(json.dumps({"v": 3, "buckets": {"upscale": st}}), encoding="utf-8")
+        html = sb.render(app, heartbeat={}, sample={}, now=1.0, persist=False)
+        assert "ETA 2h 46m" in html  # 2 session files < 3: all-time avg 1000 s × 10
+        st["session_file_seconds"] = [100.0, 100.0, 100.0]
+        (app / "outputs" / "session_board_stats.json").write_text(json.dumps({"v": 3, "buckets": {"upscale": st}}), encoding="utf-8")
+        html = sb.render(app, heartbeat={}, sample={}, now=1.0, persist=False)
+        assert "ETA 16m" in html  # 3 session files: session avg 100 s × 10
 
 if __name__ == "__main__":
     test_bars_and_session_count()
@@ -200,4 +300,8 @@ if __name__ == "__main__":
     test_migration_and_bak()
     test_bucket_isolation_and_no_lock()
     test_reset_undo_and_cap()
+    test_tick_writes_only_on_change()
+    test_in_file_archive_migrates()
+    test_sessions()
+    test_eta_threshold()
     print("session board checks ok")

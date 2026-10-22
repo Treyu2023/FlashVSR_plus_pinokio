@@ -317,6 +317,7 @@ def _empty_stats(now: float) -> dict:
         "last_status": {},
         "file_seconds": [],
         "file_seconds_v": 2,
+        "session_file_seconds": [],
         "step_seconds": [],
         "open_file": None,
         "last_step_key": None,
@@ -334,6 +335,23 @@ STATS_V = 3
 BUCKETS = ("group", "upscale", "image", "toolbox")
 LOCK_TO_BUCKET = {"group": "group", "video": "upscale", "image": "image", "toolbox": "toolbox"}
 ARCHIVE_MAX = 50
+SESSION_ETA_MIN = 3  # ETA uses the session avg once this many session files exist
+ALLTIME_KEYS = ("lifetime_done", "file_seconds", "file_seconds_v", "step_seconds")
+
+
+def _archive_path(app_dir: Path) -> Path:
+    return app_dir / "outputs" / "session_board_stats_archive.json"
+
+
+def _read_archive(app_dir: Path, store: dict) -> list:
+    """Reset archive from its own file, plus any legacy in-file archive (older, first)."""
+    data = _read_json(_archive_path(app_dir)) or {}
+    arch = data.get("archive") if isinstance(data.get("archive"), list) else []
+    return (list(store.get("legacy_archive") or []) + arch)[-ARCHIVE_MAX:]
+
+
+def _write_archive(app_dir: Path, archive: list) -> None:
+    _write_json(_archive_path(app_dir), {"archive": archive[-ARCHIVE_MAX:]})
 
 
 def _bak_path(app_dir: Path) -> Path:
@@ -351,14 +369,14 @@ def _read_store(app_dir: Path) -> dict:
     raw = _read_json(_stats_path(app_dir)) or {}
     if raw.get("v") == STATS_V:
         buckets = raw.get("buckets") if isinstance(raw.get("buckets"), dict) else {}
-        archive = raw.get("archive") if isinstance(raw.get("archive"), list) else []
+        legacy = raw.get("archive") if isinstance(raw.get("archive"), list) else []
         profile = str(raw.get("active_profile") or "")
     else:
         buckets = {"group": raw} if raw else {}
-        archive = []
+        legacy = []
         profile = str(raw.get("active_profile") or "")
     buckets = {k: v for k, v in buckets.items() if k in BUCKETS and isinstance(v, dict)}
-    return {"v": STATS_V, "buckets": buckets, "archive": archive, "active_profile": profile}
+    return {"v": STATS_V, "buckets": buckets, "active_profile": profile, "legacy_archive": legacy}
 
 
 def _write_store(app_dir: Path, store: dict) -> None:
@@ -372,7 +390,17 @@ def _write_store(app_dir: Path, store: dict) -> None:
                 bak.write_bytes(path.read_bytes())
             except OSError:
                 pass
-    _write_json(path, store)
+    if store.get("legacy_archive"):
+        # One-time move of an in-file archive (3288a69c layout) to its own file.
+        _write_archive(app_dir, _read_archive(app_dir, store))
+    payload = {"v": STATS_V, "buckets": store.get("buckets") or {}, "active_profile": store.get("active_profile") or ""}
+    text = json.dumps(payload, indent=2)
+    try:
+        if path.read_text(encoding="utf-8") == text:
+            return  # unchanged: no write
+    except (OSError, UnicodeError):
+        pass
+    _write_json(path, payload)
 
 
 def _bucket_stats(rec: Optional[dict], now: float) -> dict:
@@ -396,6 +424,7 @@ def _bucket_stats(rec: Optional[dict], now: float) -> dict:
     base["session_done"] = list(base.get("session_done") or [])
     base["session_failed"] = list(base.get("session_failed") or [])
     base["file_seconds"] = list(base.get("file_seconds") or [])
+    base["session_file_seconds"] = list(base.get("session_file_seconds") or [])
     base["step_seconds"] = list(base.get("step_seconds") or [])
     base["last_status"] = dict(base.get("last_status") or {})
     return base
@@ -409,10 +438,15 @@ def reset_bucket(app_dir, bucket: str, now: Optional[float] = None) -> str:
     with _STATS_LOCK:
         store = _read_store(app)
         old = store["buckets"].get(bucket) or {}
-        store["archive"] = (store["archive"] + [{"bucket": bucket, "ts": _now(now), "record": old}])[-ARCHIVE_MAX:]
-        store["buckets"][bucket] = _empty_stats(_now(now))
+        archive = _read_archive(app, store) + [{"bucket": bucket, "ts": _now(now), "record": old}]
+        _write_archive(app, archive)
+        store["legacy_archive"] = []
+        # All-time only: the current session's numbers stay.
+        rec = _bucket_stats(old, _now(now))
+        rec.update({"lifetime_done": 0, "file_seconds": [], "file_seconds_v": 2, "step_seconds": []})
+        store["buckets"][bucket] = rec
         _write_store(app, store)
-    return f"Reset {bucket} stats. Undo last reset brings them back."
+    return f"Reset {bucket} all-time stats. Undo last reset brings them back."
 
 
 def undo_reset(app_dir, bucket: str) -> str:
@@ -420,18 +454,46 @@ def undo_reset(app_dir, bucket: str) -> str:
     app = Path(app_dir)
     with _STATS_LOCK:
         store = _read_store(app)
-        for i in range(len(store["archive"]) - 1, -1, -1):
-            entry = store["archive"][i]
+        archive = _read_archive(app, store)
+        for i in range(len(archive) - 1, -1, -1):
+            entry = archive[i]
             if isinstance(entry, dict) and entry.get("bucket") == bucket:
-                store["buckets"][bucket] = dict(entry.get("record") or {})
-                del store["archive"][i]
+                saved = dict(entry.get("record") or {})
+                rec = dict(store["buckets"].get(bucket) or {})
+                for key in ALLTIME_KEYS:
+                    if key in saved:
+                        rec[key] = saved[key]
+                store["buckets"][bucket] = rec
+                del archive[i]
+                _write_archive(app, archive)
+                store["legacy_archive"] = []
                 _write_store(app, store)
-                return f"Restored {bucket} stats from the last reset."
+                return f"Restored {bucket} all-time stats from the last reset."
     return f"No reset to undo for {bucket}."
+
+
+def new_session(app_dir, bucket: str, now: Optional[float] = None) -> str:
+    """Start a fresh session for one section. Done files fold into the all-time count."""
+    app = Path(app_dir)
+    if bucket not in BUCKETS:
+        return f"Unknown section: {bucket}"
+    with _STATS_LOCK:
+        store = _read_store(app)
+        rec = _bucket_stats(store["buckets"].get(bucket), _now(now))
+        rec["lifetime_done"] = int(rec.get("lifetime_done") or 0) + len(rec.get("session_done") or [])
+        rec.update({"session_done": [], "session_failed": [], "session_file_seconds": [], "started": _now(now)})
+        store["buckets"][bucket] = rec
+        _write_store(app, store)
+    return f"New {bucket} session started."
 
 
 def _load_stats(app_dir: Path, now: float, bucket: str = "group") -> dict:
     return _bucket_stats(_read_store(app_dir)["buckets"].get(bucket), now)
+
+
+def _add_file_seconds(stats: dict, secs: float) -> None:
+    stats["file_seconds"] = (list(stats.get("file_seconds") or []) + [secs])[-40:]
+    stats["session_file_seconds"] = (list(stats.get("session_file_seconds") or []) + [secs])[-500:]
 
 
 def _update_stats(stats: dict, items: List[dict], heartbeat: dict, now: float) -> dict:
@@ -468,12 +530,12 @@ def _update_stats(stats: dict, items: List[dict], heartbeat: dict, now: float) -
         key = (name, index)
         if not open_file or (open_file.get("name"), open_file.get("index")) != key:
             if open_file and open_file.get("started"):
-                stats["file_seconds"] = (stats["file_seconds"] + [max(0.0, now - float(open_file["started"]))])[-40:]
+                _add_file_seconds(stats, max(0.0, now - float(open_file["started"])))
             stats["open_file"] = {"name": name, "index": index, "started": now}
     elif open_file and open_file.get("started"):
         # No file in progress (between files, stopped, idle): close the open file
         # now so the idle gap is not counted in file_seconds.
-        stats["file_seconds"] = (stats["file_seconds"] + [max(0.0, now - float(open_file["started"]))])[-40:]
+        _add_file_seconds(stats, max(0.0, now - float(open_file["started"])))
         stats["open_file"] = None
     step_key = (
         heartbeat.get("step_label"),
@@ -665,9 +727,13 @@ def render(
     session_failed = len(stats.get("session_failed") or [])
     file_times = [float(x) for x in (stats.get("file_seconds") or []) if float(x) > 1]
     avg_file = (sum(file_times) / len(file_times)) if file_times else None
-    elapsed_h = max(1 / 3600, (now_v - float(stats.get("started") or now_v)) / 3600)
+    sess_times = [float(x) for x in (stats.get("session_file_seconds") or []) if float(x) > 1]
+    sess_avg = (sum(sess_times) / len(sess_times)) if sess_times else None
+    elapsed_s = max(0.0, now_v - float(stats.get("started") or now_v))
+    elapsed_h = max(1 / 3600, elapsed_s / 3600)
     per_hour = (session_done / elapsed_h) if session_done else None
-    eta = (avg_file * max(0, left - (1 if counts["running"] else 0))) if avg_file else None
+    eta_avg = sess_avg if len(sess_times) >= SESSION_ETA_MIN else avg_file
+    eta = (eta_avg * max(0, left - (1 if counts["running"] else 0))) if eta_avg else None
     step_done = int(beat.get("step_done") or 0)
     step_total = int(beat.get("step_total") or 0)
     step_label = str(beat.get("step_label") or beat.get("section") or "step")
@@ -716,11 +782,11 @@ def render(
     if "gpu_util" in machine:
         machine_bits.append(f"GPU {machine['gpu_util']:.0f}%")
     stat_bits = [
+        f"session {session_done} · avg {_fmt_eta(sess_avg)} · busy {_fmt_eta(sum(sess_times))} / {_fmt_eta(elapsed_s)}",
+        f"all-time {int(stats.get('lifetime_done') or 0) + session_done} · avg {_fmt_eta(avg_file)}",
         f"rate {per_hour:.1f}/h" if per_hour else "rate —",
-        f"avg {_fmt_eta(avg_file)}/file" if avg_file else "avg —",
         f"ETA {_fmt_eta(eta)}",
         f"step {step_times[-1]:.1f}s" if step_times else "step —",
-        f"lifetime {int(stats.get('lifetime_done') or 0) + session_done}",
         f"session fails {session_failed}",
     ]
     stat_bits.extend(machine_bits)

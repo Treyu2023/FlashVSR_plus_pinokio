@@ -8110,6 +8110,7 @@ def create_ui():
                         "Confirm reset", size="sm", variant="stop", scale=1, interactive=False,
                     )
                     stats_undo_btn = gr.Button("Undo last reset", size="sm", scale=1)
+                    stats_session_btn = gr.Button("New session", size="sm", scale=1)
                 stats_reset_status = gr.Textbox(
                     label="Stats", value="", lines=1, interactive=False, show_label=False,
                 )
@@ -10167,6 +10168,14 @@ def create_ui():
         stats_undo_btn.click(
             fn=_stats_undo, inputs=[stats_bucket_pick],
             outputs=[stats_confirm_btn, stats_reset_status, session_board_html], queue=False,
+        )
+
+        def _stats_new_session(bucket):
+            return session_board.new_session(ROOT_DIR, bucket), session_board.render(ROOT_DIR)
+
+        stats_session_btn.click(
+            fn=_stats_new_session, inputs=[stats_bucket_pick],
+            outputs=[stats_reset_status, session_board_html], queue=False,
         )
 
         def update_monitor():

@@ -61,3 +61,17 @@ Local commit: <fill SHA after commit>, subject "FV-STATS: per-section stats buck
 
 Before deploy: queue idle; copy app/outputs/session_board_stats.json to C:\_Archive\<date>-<worker>\.
 Rollback: revert the commit (or `git apply -R`), then restore the stats file from app/outputs/session_board_stats.v2.bak.json (or the C:\_Archive copy). v2 code would read a v3 file as an empty flat record, so restore the .bak before restarting.
+
+---
+# FV-STATS-2 (on top of 3288a69c)
+
+Local commit: <fill SHA after commit>, subject "FV-STATS-2: per-bucket session stats, archive in its own file, write only on change".
+
+| File | What |
+|---|---|
+| app/session_board.py | session_file_seconds per bucket; new_session(); session vs all-time line; ETA uses session avg at >= 3 session files; reset/undo touch all-time keys only; archive moved to outputs/session_board_stats_archive.json (written on reset/undo only); stats file written only when its JSON changes |
+| app/webui.py | "New session" button in the Stats reset accordion |
+| app/test_session_board.py | session, ETA threshold, no-change tick, archive file, in-file archive migration tests |
+
+Before deploy: queue idle; copy app/outputs/session_board_stats*.json to C:\_Archive\<date>-<worker>\.
+Rollback: revert (or `git apply -R fvstats2-ALL.diff`), then restore the stats JSON from the C:\_Archive copy (3288a69c expects the archive inside the main file).

@@ -1755,6 +1755,7 @@ def init_pipeline(mode, device, dtype, model_version="v1.0"):
     
     ckpt_path, vae_path, lq_path, tcd_path, prompt_path = [os.path.join(model_path, f) for f in ["diffusion_pytorch_model_streaming_dmd.safetensors", "Wan2.1_VAE.pth", "LQ_proj_in.ckpt", "TCDecoder.ckpt", "../posi_prompt.pth"]]
     busy(f"loading weights for {mode} {model_version} (DiT/VAE to GPU — can sit here a minute)")
+    _prev_section = set_section("loading model")
     mm = ModelManager(torch_dtype=dtype, device="cpu")
     if mode == "full":
         mm.load_models([ckpt_path, vae_path]); pipe = FlashVSRFullPipeline.from_model_manager(mm, device=device)
@@ -1768,6 +1769,7 @@ def init_pipeline(mode, device, dtype, model_version="v1.0"):
     if os.path.exists(lq_path): pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(lq_path, map_location="cpu", weights_only=False), strict=True)
     pipe.to(device, dtype=dtype); pipe.enable_vram_management(); pipe.init_cross_kv(prompt_path=prompt_path); pipe.load_models_to_device(["dit", "vae"])
     busy(f"pipeline ready ({mode} {model_version})")
+    set_section(_prev_section)
     return pipe
 
 def is_cuda_oom(exc):
@@ -2354,6 +2356,7 @@ def run_flashvsr_single(
         del frames
         clean_vram()
         _fm(out_w=int(final_output_tensor.shape[2]), out_h=int(final_output_tensor.shape[1]))
+        set_section("encoding")
         save_video(final_output_tensor, temp_video_path, fps=_fps, quality=quality)
         del final_output_tensor
         clean_vram()
@@ -2363,6 +2366,7 @@ def run_flashvsr_single(
 
     if is_video(input_path):
         progress(0.95, desc="Merging audio...")
+        set_section("encoding")
         merge_video_with_audio(temp_video_path, input_path, temp_output_path)
     else:
         shutil.move(temp_video_path, temp_output_path)
@@ -8178,6 +8182,7 @@ def create_ui():
         except Exception:
             _profile_names = []
         with gr.Group(elem_id="session_board"):
+            job_card_html = gr.HTML(value=_safe_board(session_board.render_job))
             session_board_html = gr.HTML(value=_board_html)
             with gr.Accordion("Recent files", open=False):
                 recent_files_html = gr.HTML(value=_safe_board(session_board.render_recent))
@@ -10187,16 +10192,17 @@ def create_ui():
                     + html.escape(str(exc))
                     + "</div>"
                 )
+            job = _safe_board(session_board.render_job)
             recent = _safe_board(session_board.render_recent)
             compare = _safe_board(session_board.render_compare)
-            return (gpu_info, cpu_info, gpu_info, cpu_info, board, recent, compare, *panels)
+            return (gpu_info, cpu_info, gpu_info, cpu_info, job, board, recent, compare, *panels)
             
         monitor_timer = gr.Timer(2, active=True)
         monitor_timer.tick(
             fn=update_monitor,
             outputs=[
                 gpu_monitor, cpu_monitor, img_gpu_monitor, img_cpu_monitor,
-                session_board_html, recent_files_html, settings_compare_html,
+                job_card_html, session_board_html, recent_files_html, settings_compare_html,
                 batch_stop_ack, gt_stop_ack, img_stop_ack, tb_stop_ack,
                 flashvsr_queue_status, gt_queue_status, img_queue_status, tb_queue_status,
             ],

@@ -429,6 +429,36 @@ def test_tolerant_reads() -> None:
         assert "This session" in html and "Overall" in html
 
 
+def test_render_job_steps() -> None:
+    lab = sb.job_step_label
+    assert lab({}, [{"status": "pending"}]) == "queued"
+    assert lab({}, [{"status": "done"}]) == "idle"
+    beat = {"file_name": "a.mp4", "file_index": 2, "file_done": 1, "file_total": 4}
+    assert lab(dict(beat, section="loading model")) == "loading model"
+    assert lab(dict(beat, section="chunk 2/5")) == "chunk 2/5"
+    assert lab(dict(beat, section="encoding")) == "encoding"
+    assert lab(dict(beat, section="encoding", file_metrics={"finished": 1.0})) == "done"
+    assert lab(dict(beat, section="upscale", step_label="tiles")) == "tiles"
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        _queue(app, "video", [{"path": "a.mp4", "status": "running"}])
+        assert "No active job" in sb.render_job(app, heartbeat=beat)
+        _lock(app, "video")
+        st = sb._empty_stats(0.0)
+        st["file_seconds"] = [100.0]
+        (app / "outputs" / "session_board_stats.json").write_text(
+            json.dumps({"v": 3, "buckets": {"upscale": st}}), encoding="utf-8")
+        raw = (app / "outputs" / "session_board_stats.json").read_bytes()
+        html = sb.render_job(app, heartbeat=dict(beat, step_done=5, step_total=20, step_elapsed=50.0,
+                                                 file_metrics=dict(_SET, num_tiles=6)))
+        assert "a.mp4" in html and "2/4" in html and "25%" in html
+        assert "ETA 2m" in html  # step: 50/5*15 = 150 s
+        assert "ETA 5m" in html and "all-time avg" in html  # files: 100 s x 3 left
+        assert "<details" in html and sb.cfg_key(_SET) in html
+        assert (app / "outputs" / "session_board_stats.json").read_bytes() == raw  # read-only
+        assert "queued" in sb.job_card_html("upscale", {}, {}, [{"status": "pending"}])
+
+
 if __name__ == "__main__":
     test_bars_and_session_count()
     test_health_levels()
@@ -447,4 +477,5 @@ if __name__ == "__main__":
     test_recent_cap_and_finished_once()
     test_reset_undo_new_session_v4()
     test_tolerant_reads()
+    test_render_job_steps()
     print("session board checks ok")

@@ -1057,6 +1057,89 @@ def render_compare(app_dir, bucket: Optional[str] = None, now: Optional[float] =
     return compare_html(_bucket_stats(store["buckets"].get(b), _now(now)))
 
 
+def job_step_label(heartbeat: dict, items: Optional[List[dict]] = None) -> str:
+    """Pure: queued / loading model / chunk x/y / encoding / done (else the live step)."""
+    beat = heartbeat or {}
+    metrics = beat.get("file_metrics") if isinstance(beat.get("file_metrics"), dict) else {}
+    section = str(beat.get("section") or "").strip()
+    low = section.lower()
+    if not beat.get("file_name"):
+        waiting = any(isinstance(i, dict) and i.get("status") in ("pending", "running") for i in (items or []))
+        return "queued" if waiting else "idle"
+    if metrics.get("finished"):
+        return "done"
+    if low.startswith("loading model"):
+        return "loading model"
+    if low.startswith("encoding"):
+        return "encoding"
+    if low.startswith("chunk"):
+        return section
+    return str(beat.get("step_label") or section or "working")
+
+
+def job_card_html(bucket: str, heartbeat: dict, stats: dict, items: Optional[List[dict]] = None) -> str:
+    """Pure: one job card from a heartbeat snapshot, a bucket stats record and its queue items."""
+    beat = heartbeat or {}
+    stats = stats or {}
+    metrics = beat.get("file_metrics") if isinstance(beat.get("file_metrics"), dict) else {}
+    label = dict(QUEUE_ORDER).get({v: k for k, v in LOCK_TO_BUCKET.items()}.get(bucket, bucket), bucket)
+    step = job_step_label(beat, items)
+    name = str(beat.get("file_name") or "")
+    f_done = int(beat.get("file_done") or 0)
+    f_total = int(beat.get("file_total") or 0)
+    f_index = int(beat.get("file_index") or 0)
+    title = f"{_esc(name) or '—'}" + (f" &nbsp; <span style='color:#94a3b8'>{f_index}/{f_total}</span>" if f_total else "")
+    s_done = int(beat.get("step_done") or 0)
+    s_total = int(beat.get("step_total") or 0)
+    s_pct = f"{100 * min(s_done, s_total) / s_total:.0f}%" if s_total else "—"
+    elapsed = beat.get("step_elapsed")
+    s_eta = None
+    if s_total and s_done and elapsed:
+        s_eta = float(elapsed) / s_done * max(0, s_total - s_done)
+    file_times = [float(x) for x in (stats.get("file_seconds") or []) if float(x) > 1]
+    sess_times = [float(x) for x in (stats.get("session_file_seconds") or []) if float(x) > 1]
+    if len(sess_times) >= SESSION_ETA_MIN:
+        avg, src = sum(sess_times) / len(sess_times), "session avg"
+    elif file_times:
+        avg, src = sum(file_times) / len(file_times), "all-time avg"
+    else:
+        avg, src = None, ""
+    f_eta = avg * max(0, f_total - f_done) if (avg and f_total) else None
+    vram = _vram_peak(metrics)
+    settings = cfg_key(metrics) or "—"
+    adv = (
+        "<details style='margin-top:4px;color:#94a3b8;font-size:11px'><summary>Advanced</summary>"
+        f"step: {_esc(beat.get('step_label') or '—')} · section: {_esc(beat.get('section') or '—')}"
+        f" · tiles: {_num(metrics.get('num_tiles'))} · VRAM so far: {_num(vram or None, '{:.0f}', ' MB')}"
+        f"<br>settings: <code>{_esc(settings)}</code></details>"
+    )
+    return (
+        "<div style='border:1px solid #1e293b;border-radius:6px;padding:8px 10px;margin:4px 0;"
+        "font-family:ui-monospace,monospace;color:#e2e8f0;font-size:12px'>"
+        f"<div><b style='color:#7dd3fc'>{_esc(label)}</b> &nbsp; {title}</div>"
+        f"<div style='margin-top:2px'>step: <b>{_esc(step)}</b></div>"
+        f"<div>{glyph_bar(s_done, s_total, 30)} {s_pct} · ETA {_fmt_eta(s_eta)}</div>"
+        f"<div>files {glyph_bar(f_done, f_total, 30)} {f_done}/{f_total or '—'} · ETA {_fmt_eta(f_eta)}"
+        + (f" <span style='color:#64748b'>({src})</span>" if src else "")
+        + f"</div>{adv}</div>"
+    )
+
+
+def render_job(app_dir, heartbeat: Optional[dict] = None, now: Optional[float] = None) -> str:
+    """Job card for the bucket holding the live ACTIVE_QUEUE.lock. Reads only, never writes."""
+    app = Path(app_dir)
+    bucket = _lock_bucket(app)
+    if not bucket:
+        return "<div style='color:#94a3b8;font-size:12px;padding:4px 8px'>No active job.</div>"
+    beat = _heartbeat() if heartbeat is None else heartbeat
+    with _STATS_LOCK:
+        store = _read_store(app)
+    stats = _bucket_stats(store["buckets"].get(bucket), _now(now))
+    queue = {v: k for k, v in LOCK_TO_BUCKET.items()}.get(bucket, bucket)
+    items = _load_queues(app).get(queue, {}).get("items") or []
+    return job_card_html(bucket, beat, stats, items)
+
+
 def _profiles_path(app_dir: Path) -> Path:
     return app_dir / "job_profiles.json"
 

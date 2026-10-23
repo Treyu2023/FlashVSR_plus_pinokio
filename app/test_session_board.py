@@ -293,6 +293,142 @@ def test_eta_threshold() -> None:
         html = sb.render(app, heartbeat={}, sample={}, now=1.0, persist=False)
         assert "ETA 16m" in html  # 3 session files: session avg 100 s × 10
 
+
+_SET = {"mode": "full", "model_version": "v1.1", "scale": 4, "dtype_str": "bf16", "attention_mode": "sage",
+        "tiled_dit": True, "tiled_vae": False, "tile_size": 256, "tile_overlap": 24}
+
+
+def _mtick(app: Path, name: str, now: float, **metrics) -> str:
+    hb = {"file_name": name, "file_index": 1, "file_metrics": metrics}
+    return sb.render(app, heartbeat=hb, sample={}, now=now)
+
+
+def test_v3_to_v4_bak_once() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        out = app / "outputs"
+        out.mkdir()
+        v3 = {"v": 3, "buckets": {"group": {"lifetime_done": 7, "file_seconds": [5.0]}}}
+        (out / "session_board_stats.json").write_text(json.dumps(v3), encoding="utf-8")
+        _queue(app, "group", [])
+        _lock(app, "group")
+        _tick(app, "a.mp4", 1.0)
+        bak3 = out / "session_board_stats.v3.bak.json"
+        assert json.loads(bak3.read_text(encoding="utf-8")) == v3
+        assert not (out / "session_board_stats.v2.bak.json").exists()
+        st = _store(app)
+        assert st["v"] == 3 and st["v4"]["stats_v"] == 4
+        assert "recent_files" not in st["buckets"]["group"]  # buckets stay v3-shaped
+        assert st["buckets"]["group"]["lifetime_done"] == 7
+        bak3.write_text("KEEP", encoding="utf-8")
+        _tick(app, "b.mp4", 5.0)
+        assert bak3.read_text(encoding="utf-8") == "KEEP"
+
+
+def test_v2_still_v2_bak() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        out = app / "outputs"
+        out.mkdir()
+        flat = {"lifetime_done": 3, "file_seconds": [9.0]}
+        (out / "session_board_stats.json").write_text(json.dumps(flat), encoding="utf-8")
+        _queue(app, "group", [])
+        _lock(app, "group")
+        _tick(app, "a.mp4", 1.0)
+        assert json.loads((out / "session_board_stats.v2.bak.json").read_text(encoding="utf-8")) == flat
+        assert not (out / "session_board_stats.v3.bak.json").exists()
+
+
+def test_v4_unchanged_skip() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        _queue(app, "group", [])
+        _lock(app, "group")
+        _mtick(app, "a.mp4", 101.0, **_SET, s_per_frame=1.0)
+        main = app / "outputs" / "session_board_stats.json"
+        raw, mt = main.read_bytes(), main.stat().st_mtime_ns
+        for t in (102.0, 103.0):
+            _mtick(app, "a.mp4", t, **_SET, s_per_frame=1.0)
+        assert main.read_bytes() == raw and main.stat().st_mtime_ns == mt
+
+
+def test_cfg_key_and_by_cfg() -> None:
+    assert sb.cfg_key(_SET) == "full|v1.1|x4|bf16|sage|t256/24|chunk0"
+    assert sb.cfg_key(dict(_SET, tiled_dit=False, chunk_s=10.25)) == "full|v1.1|x4|bf16|sage|t0/24|chunk10.25"
+    assert sb.cfg_key({}) is None
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        _queue(app, "group", [])
+        _lock(app, "group")
+        _mtick(app, "a.mp4", 100.0, **_SET, s_per_frame=1.0, vram_reserved_peak_mb=1000)
+        _mtick(app, "b.mp4", 110.0, **_SET, s_per_frame=3.0, vram_alloc_peak_mb=3000)
+        _mtick(app, "c.mp4", 120.0)  # b closes; c has no metrics
+        sb.render(app, heartbeat={}, sample={}, now=130.0)
+        g = sb._read_store(app)["buckets"]["group"]
+        row = g["by_cfg"][sb.cfg_key(_SET)]
+        assert row["n"] == 2 and row["sum_spf"] == 4.0
+        assert row["vram_peak_mb_max"] == 3000 and row["sum_vram_peak"] == 4000
+        assert g["session_by_cfg"] == g["by_cfg"]
+        assert [e["name"] for e in g["recent_files"]] == ["a.mp4", "b.mp4"]
+        assert g["recent_files"][0]["secs"] == 10.0
+        html = sb.compare_html(g)
+        assert "2.00" in html and "3000 MB" in html
+
+
+def test_recent_cap_and_finished_once() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        _queue(app, "group", [])
+        _lock(app, "group")
+        for i in range(25):
+            _mtick(app, f"f{i}.mp4", 100.0 + i * 10, **_SET, s_per_frame=1.0)
+        _mtick(app, "last.mp4", 400.0, **_SET, s_per_frame=2.0, finished=405.0, ok=True)
+        _mtick(app, "last.mp4", 410.0, **_SET, s_per_frame=2.0, finished=405.0, ok=True)
+        sb.render(app, heartbeat={}, sample={}, now=420.0)
+        g = sb._read_store(app)["buckets"]["group"]
+        names = [e["name"] for e in g["recent_files"]]
+        assert len(names) == 20 and names[-1] == "last.mp4" and names.count("last.mp4") == 1
+        assert g["recent_files"][-1]["secs"] == 5.0
+        assert g["by_cfg"][sb.cfg_key(_SET)]["n"] == 26
+        html = sb.recent_files_html(g)
+        assert html.count("<tr>") == 21 and "last.mp4" in html
+
+
+def test_reset_undo_new_session_v4() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        _queue(app, "group", [])
+        _lock(app, "group")
+        _mtick(app, "a.mp4", 100.0, **_SET, s_per_frame=1.0)
+        sb.render(app, heartbeat={}, sample={}, now=110.0)
+        k = sb.cfg_key(_SET)
+        sb.new_session(app, "group", now=111.0)
+        g = sb._read_store(app)["buckets"]["group"]
+        assert g["session_by_cfg"] == {} and g["by_cfg"][k]["n"] == 1 and len(g["recent_files"]) == 1
+        sb.reset_bucket(app, "group", now=112.0)
+        g = sb._read_store(app)["buckets"]["group"]
+        assert g["by_cfg"] == {} and g["recent_files"] == []
+        sb.undo_reset(app, "group")
+        g = sb._read_store(app)["buckets"]["group"]
+        assert g["by_cfg"][k]["n"] == 1 and len(g["recent_files"]) == 1
+
+
+def test_tolerant_reads() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        out = app / "outputs"
+        out.mkdir()
+        (out / "session_board_stats.json").write_text(
+            json.dumps({"v": 3, "buckets": {"group": {"lifetime_done": 1}}, "v4": "junk"}), encoding="utf-8")
+        g = sb._bucket_stats(sb._read_store(app)["buckets"]["group"], 0.0)
+        assert g["recent_files"] == [] and g["by_cfg"] == {} and g["session_by_cfg"] == {}
+        assert "No finished" in sb.render_recent(app, "group")
+        assert "No settings" in sb.render_compare(app, "group")
+        assert "—" in sb.recent_files_html({"recent_files": [{"name": "x"}]})
+        html = sb.render(app, heartbeat={}, sample={}, now=1.0, persist=False)
+        assert "This session" in html and "Overall" in html
+
+
 if __name__ == "__main__":
     test_bars_and_session_count()
     test_health_levels()
@@ -304,4 +440,11 @@ if __name__ == "__main__":
     test_in_file_archive_migrates()
     test_sessions()
     test_eta_threshold()
+    test_v3_to_v4_bak_once()
+    test_v2_still_v2_bak()
+    test_v4_unchanged_skip()
+    test_cfg_key_and_by_cfg()
+    test_recent_cap_and_finished_once()
+    test_reset_undo_new_session_v4()
+    test_tolerant_reads()
     print("session board checks ok")

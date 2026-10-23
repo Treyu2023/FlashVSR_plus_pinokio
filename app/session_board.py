@@ -323,6 +323,9 @@ def _empty_stats(now: float) -> dict:
         "last_step_key": None,
         "last_step_advance": now,
         "active_profile": "",
+        "recent_files": [],
+        "by_cfg": {},
+        "session_by_cfg": {},
     }
 
 
@@ -331,12 +334,17 @@ def _stats_path(app_dir: Path) -> Path:
 
 
 # v3 stats: one record per section, keyed from the ACTIVE_QUEUE.lock queue name.
-STATS_V = 3
+# v4 (FV-UI) keeps the v3 file layout ("v": 3, same buckets) so a v3 reader still
+# reads it; the per-file stats sit under the extra top-level key "v4", which v3 ignores.
+STATS_V = 4
+STATS_FILE_V = 3
+V4_KEYS = ("recent_files", "by_cfg", "session_by_cfg")
+RECENT_MAX = 20
 BUCKETS = ("group", "upscale", "image", "toolbox")
 LOCK_TO_BUCKET = {"group": "group", "video": "upscale", "image": "image", "toolbox": "toolbox"}
 ARCHIVE_MAX = 50
 SESSION_ETA_MIN = 3  # ETA uses the session avg once this many session files exist
-ALLTIME_KEYS = ("lifetime_done", "file_seconds", "file_seconds_v", "step_seconds")
+ALLTIME_KEYS = ("lifetime_done", "file_seconds", "file_seconds_v", "step_seconds", "by_cfg", "recent_files")
 
 
 def _archive_path(app_dir: Path) -> Path:
@@ -358,6 +366,10 @@ def _bak_path(app_dir: Path) -> Path:
     return app_dir / "outputs" / "session_board_stats.v2.bak.json"
 
 
+def _bak_v3_path(app_dir: Path) -> Path:
+    return app_dir / "outputs" / "session_board_stats.v3.bak.json"
+
+
 def _lock_bucket(app_dir: Path) -> Optional[str]:
     """Bucket of the queue that holds the lock. None when no lock: that tick is not recorded."""
     lock = _read_json(app_dir / "outputs" / "ACTIVE_QUEUE.lock") or {}
@@ -365,10 +377,26 @@ def _lock_bucket(app_dir: Path) -> Optional[str]:
 
 
 def _read_store(app_dir: Path) -> dict:
-    """v3 store. Flat v2/unversioned record becomes buckets['group']; corrupt/missing is empty."""
+    """v3/v4 store. Flat v2/unversioned record becomes buckets['group']; corrupt/missing is empty.
+
+    A v3 file loads unchanged; v4 extras come from the top-level "v4" key when present.
+    """
     raw = _read_json(_stats_path(app_dir)) or {}
-    if raw.get("v") == STATS_V:
+    if raw.get("v") == STATS_FILE_V:
         buckets = raw.get("buckets") if isinstance(raw.get("buckets"), dict) else {}
+        ext = raw.get("v4") if isinstance(raw.get("v4"), dict) else {}
+        ext_b = ext.get("buckets") if isinstance(ext.get("buckets"), dict) else {}
+        merged = {}
+        for k, v in buckets.items():
+            if not isinstance(v, dict):
+                continue
+            rec = dict(v)
+            extra = ext_b.get(k) if isinstance(ext_b.get(k), dict) else {}
+            for key in V4_KEYS:
+                if key in extra:
+                    rec[key] = extra[key]
+            merged[k] = rec
+        buckets = merged
         legacy = raw.get("archive") if isinstance(raw.get("archive"), list) else []
         profile = str(raw.get("active_profile") or "")
     else:
@@ -380,20 +408,35 @@ def _read_store(app_dir: Path) -> dict:
 
 
 def _write_store(app_dir: Path, store: dict) -> None:
-    """Before the first v3 write, keep one copy of the old file. Never overwrite the .bak."""
+    """Before the first v3/v4 write, keep one copy of the old file. Never overwrite a .bak."""
     path = _stats_path(app_dir)
     bak = _bak_path(app_dir)
-    if path.exists() and not bak.exists():
+    bak3 = _bak_v3_path(app_dir)
+    if path.exists() and (not bak.exists() or not bak3.exists()):
         old = _read_json(path)
-        if not old or old.get("v") != STATS_V:
+        if not old or old.get("v") != STATS_FILE_V:
+            target = bak  # v2/unversioned/corrupt -> v2.bak
+        elif "v4" not in old:
+            target = bak3  # plain v3 -> v3.bak, once
+        else:
+            target = None
+        if target is not None and not target.exists():
             try:
-                bak.write_bytes(path.read_bytes())
+                target.write_bytes(path.read_bytes())
             except OSError:
                 pass
     if store.get("legacy_archive"):
         # One-time move of an in-file archive (3288a69c layout) to its own file.
         _write_archive(app_dir, _read_archive(app_dir, store))
-    payload = {"v": STATS_V, "buckets": store.get("buckets") or {}, "active_profile": store.get("active_profile") or ""}
+    buckets = store.get("buckets") or {}
+    v3_buckets = {k: {f: x for f, x in v.items() if f not in V4_KEYS} for k, v in buckets.items()}
+    ext = {k: {f: v[f] for f in V4_KEYS if f in v} for k, v in buckets.items()}
+    payload = {
+        "v": STATS_FILE_V,
+        "buckets": v3_buckets,
+        "active_profile": store.get("active_profile") or "",
+        "v4": {"stats_v": STATS_V, "buckets": ext},
+    }
     text = json.dumps(payload, indent=2)
     try:
         if path.read_text(encoding="utf-8") == text:
@@ -417,6 +460,8 @@ def _bucket_stats(rec: Optional[dict], now: float) -> dict:
         base["active_profile"] = str(data.get("active_profile") or "")
         base["file_seconds"] = list(data.get("file_seconds") or [])[-40:]
         base["step_seconds"] = list(data.get("step_seconds") or [])[-40:]
+        base["recent_files"] = list(data.get("recent_files") or [])[-RECENT_MAX:]
+        base["by_cfg"] = dict(data.get("by_cfg") or {})
         return base
     for key in base:
         if key in data:
@@ -427,6 +472,9 @@ def _bucket_stats(rec: Optional[dict], now: float) -> dict:
     base["session_file_seconds"] = list(base.get("session_file_seconds") or [])
     base["step_seconds"] = list(base.get("step_seconds") or [])
     base["last_status"] = dict(base.get("last_status") or {})
+    base["recent_files"] = list(base.get("recent_files") or [])[-RECENT_MAX:]
+    base["by_cfg"] = dict(base.get("by_cfg") or {})
+    base["session_by_cfg"] = dict(base.get("session_by_cfg") or {})
     return base
 
 
@@ -443,7 +491,7 @@ def reset_bucket(app_dir, bucket: str, now: Optional[float] = None) -> str:
         store["legacy_archive"] = []
         # All-time only: the current session's numbers stay.
         rec = _bucket_stats(old, _now(now))
-        rec.update({"lifetime_done": 0, "file_seconds": [], "file_seconds_v": 2, "step_seconds": []})
+        rec.update({"lifetime_done": 0, "file_seconds": [], "file_seconds_v": 2, "step_seconds": [], "by_cfg": {}, "recent_files": []})
         store["buckets"][bucket] = rec
         _write_store(app, store)
     return f"Reset {bucket} all-time stats. Undo last reset brings them back."
@@ -481,7 +529,7 @@ def new_session(app_dir, bucket: str, now: Optional[float] = None) -> str:
         store = _read_store(app)
         rec = _bucket_stats(store["buckets"].get(bucket), _now(now))
         rec["lifetime_done"] = int(rec.get("lifetime_done") or 0) + len(rec.get("session_done") or [])
-        rec.update({"session_done": [], "session_failed": [], "session_file_seconds": [], "started": _now(now)})
+        rec.update({"session_done": [], "session_failed": [], "session_file_seconds": [], "session_by_cfg": {}, "started": _now(now)})
         store["buckets"][bucket] = rec
         _write_store(app, store)
     return f"New {bucket} session started."
@@ -494,6 +542,66 @@ def _load_stats(app_dir: Path, now: float, bucket: str = "group") -> dict:
 def _add_file_seconds(stats: dict, secs: float) -> None:
     stats["file_seconds"] = (list(stats.get("file_seconds") or []) + [secs])[-40:]
     stats["session_file_seconds"] = (list(stats.get("session_file_seconds") or []) + [secs])[-500:]
+
+
+def cfg_key(rec: dict) -> Optional[str]:
+    """Comparison key for a file record. None when the record has no settings."""
+    if not isinstance(rec, dict) or not rec.get("mode"):
+        return None
+    tile = rec.get("tile_size") if (rec.get("tiled_dit") or rec.get("tiled_vae")) else 0
+    return (
+        f"{rec.get('mode')}|{rec.get('model_version')}|x{rec.get('scale')}|{rec.get('dtype_str')}|"
+        f"{rec.get('attention_mode')}|t{tile}/{rec.get('tile_overlap')}|chunk{rec.get('chunk_s') or 0}"
+    )
+
+
+def _vram_peak(rec: dict) -> float:
+    try:
+        return float(rec.get("vram_reserved_peak_mb") or rec.get("vram_alloc_peak_mb") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fold_cfg(table: dict, key: str, entry: dict) -> dict:
+    out = dict(table or {})
+    row = dict(out.get(key) or {"n": 0, "sum_spf": 0.0, "vram_peak_mb_max": 0.0, "sum_vram_peak": 0.0})
+    vram = _vram_peak(entry)
+    row["n"] = int(row.get("n") or 0) + 1
+    row["sum_spf"] = float(row.get("sum_spf") or 0) + float(entry["s_per_frame"])
+    row["vram_peak_mb_max"] = max(float(row.get("vram_peak_mb_max") or 0), vram)
+    row["sum_vram_peak"] = float(row.get("sum_vram_peak") or 0) + vram
+    out[key] = row
+    return out
+
+
+def _record_file(stats: dict, open_file: dict, now: float) -> None:
+    """Append the closed file to recent_files and fold it into by_cfg / session_by_cfg."""
+    metrics = dict(open_file.get("metrics") or {})
+    if not metrics:
+        return
+    ended = float(metrics.get("finished") or now)
+    entry = {k: v for k, v in metrics.items() if k not in ("finished", "ok")}
+    entry.update({
+        "name": open_file.get("name"),
+        "ended": ended,
+        "ok": metrics.get("ok"),
+        "secs": max(0.0, ended - float(open_file.get("started") or ended)),
+        "cfg_key": cfg_key(metrics),
+    })
+    stats["recent_files"] = (list(stats.get("recent_files") or []) + [entry])[-RECENT_MAX:]
+    try:
+        spf_ok = entry["cfg_key"] and float(entry.get("s_per_frame") or 0) > 0
+    except (TypeError, ValueError):
+        spf_ok = False
+    if spf_ok:
+        stats["by_cfg"] = _fold_cfg(stats.get("by_cfg"), entry["cfg_key"], entry)
+        stats["session_by_cfg"] = _fold_cfg(stats.get("session_by_cfg"), entry["cfg_key"], entry)
+
+
+def _close_file(stats: dict, open_file: dict, now: float) -> None:
+    _add_file_seconds(stats, max(0.0, now - float(open_file["started"])))
+    if not open_file.get("recorded"):
+        _record_file(stats, open_file, now)
 
 
 def _update_stats(stats: dict, items: List[dict], heartbeat: dict, now: float) -> dict:
@@ -526,16 +634,23 @@ def _update_stats(stats: dict, items: List[dict], heartbeat: dict, now: float) -
     name = str(heartbeat.get("file_name") or "")
     index = heartbeat.get("file_index")
     open_file = stats.get("open_file")
+    metrics = heartbeat.get("file_metrics") if isinstance(heartbeat.get("file_metrics"), dict) else {}
     if name:
         key = (name, index)
         if not open_file or (open_file.get("name"), open_file.get("index")) != key:
             if open_file and open_file.get("started"):
-                _add_file_seconds(stats, max(0.0, now - float(open_file["started"])))
+                _close_file(stats, open_file, now)
             stats["open_file"] = {"name": name, "index": index, "started": now}
+        open_file = stats["open_file"]
+        if metrics:
+            open_file["metrics"] = dict(metrics)  # refreshed every tick while the file is open
+        if metrics.get("finished") and not open_file.get("recorded"):
+            _record_file(stats, open_file, now)  # file_finished: close the record with final values
+            open_file["recorded"] = True
     elif open_file and open_file.get("started"):
         # No file in progress (between files, stopped, idle): close the open file
         # now so the idle gap is not counted in file_seconds.
-        _add_file_seconds(stats, max(0.0, now - float(open_file["started"])))
+        _close_file(stats, open_file, now)
         stats["open_file"] = None
     step_key = (
         heartbeat.get("step_label"),
@@ -781,9 +896,9 @@ def render(
         )
     if "gpu_util" in machine:
         machine_bits.append(f"GPU {machine['gpu_util']:.0f}%")
+    session_row = f"session {session_done} · avg {_fmt_eta(sess_avg)} · busy {_fmt_eta(sum(sess_times))} / {_fmt_eta(elapsed_s)}"
+    overall_row = f"all-time {int(stats.get('lifetime_done') or 0) + session_done} · avg {_fmt_eta(avg_file)}"
     stat_bits = [
-        f"session {session_done} · avg {_fmt_eta(sess_avg)} · busy {_fmt_eta(sum(sess_times))} / {_fmt_eta(elapsed_s)}",
-        f"all-time {int(stats.get('lifetime_done') or 0) + session_done} · avg {_fmt_eta(avg_file)}",
         f"rate {per_hour:.1f}/h" if per_hour else "rate —",
         f"ETA {_fmt_eta(eta)}",
         f"step {step_times[-1]:.1f}s" if step_times else "step —",
@@ -819,6 +934,10 @@ def render(
         f"<div style='margin-top:6px;font-family:Consolas,ui-monospace,monospace;font-size:14px;'>"
         f"step time {spark}</div>"
         "<div style='margin-top:6px;color:#cbd5e1;font-size:12px;line-height:1.45;'>"
+        f"<b style='color:#7dd3fc'>This session</b> &nbsp; {session_row}</div>"
+        "<div style='color:#cbd5e1;font-size:12px;line-height:1.45;'>"
+        f"<b style='color:#94a3b8'>Overall</b> &nbsp; {overall_row}</div>"
+        "<div style='margin-top:4px;color:#cbd5e1;font-size:12px;line-height:1.45;'>"
         + " &nbsp;·&nbsp; ".join(stat_bits)
         + "</div>"
         f"<div style='margin-top:6px;color:{lamp};font-size:13px;line-height:1.4;'>"
@@ -832,6 +951,110 @@ def render(
         "</div>"
         "</div>"
     )
+
+
+def _num(value: Any, fmt: str = "{:.0f}", suffix: str = "") -> str:
+    try:
+        if value is None or value == "":
+            return "—"
+        return fmt.format(float(value)) + suffix
+    except (TypeError, ValueError):
+        return "—"
+
+
+_TABLE = "width:100%;border-collapse:collapse;font-size:12px;color:#e2e8f0;"
+_TH = "text-align:left;padding:3px 6px;color:#7dd3fc;border-bottom:1px solid #1e293b;"
+_TD = "padding:3px 6px;border-bottom:1px solid #111827;"
+
+
+def _table(head: List[str], rows: List[List[str]], empty: str) -> str:
+    if not rows:
+        return f"<div style='color:#94a3b8;font-size:12px;padding:6px'>{_esc(empty)}</div>"
+    th = "".join(f"<th style='{_TH}'>{_esc(h)}</th>" for h in head)
+    body = "".join("<tr>" + "".join(f"<td style='{_TD}'>{c}</td>" for c in r) + "</tr>" for r in rows)
+    return f"<table style='{_TABLE}'><tr>{th}</tr>{body}</table>"
+
+
+def recent_files_html(stats: dict) -> str:
+    """Pure: the last RECENT_MAX files of one bucket record, newest first."""
+    rows = []
+    for e in reversed(list((stats or {}).get("recent_files") or [])[-RECENT_MAX:]):
+        if not isinstance(e, dict):
+            continue
+        io = "—"
+        if e.get("in_w") and e.get("in_h"):
+            io = f"{int(e['in_w'])}x{int(e['in_h'])}"
+            if e.get("out_w") and e.get("out_h"):
+                io += f"→{int(e['out_w'])}x{int(e['out_h'])}"
+        chunks = f"{int(e['chunk_count'])}×{_num(e.get('chunk_s'), '{:g}')}s" if e.get("chunk_count") else "—"
+        rows.append([
+            _esc(e.get("name") or "?") + ("" if e.get("ok") is not False else " <span style='color:#fca5a5'>fail</span>"),
+            _num(e.get("secs"), "{:.0f}", "s"),
+            _num(e.get("s_per_frame"), "{:.2f}"),
+            _num(e.get("fps_processed"), "{:.2f}"),
+            io,
+            _num(_vram_peak(e) or None, "{:.0f}", " MB"),
+            _num(e.get("ram_peak_mb"), "{:.0f}", " MB"),
+            f"{_num(e.get('load_s'), '{:.0f}', 's')}/{_num(e.get('process_s'), '{:.0f}', 's')}",
+            chunks,
+            _num(e.get("num_tiles"), "{:.0f}"),
+        ])
+    return _table(
+        ["name", "s", "s/frame", "fps", "in→out", "VRAM peak", "RAM peak", "load/proc", "chunks", "tiles"],
+        rows, "No finished files with stats yet.",
+    )
+
+
+def compare_html(stats: dict) -> str:
+    """Pure: averages per cfg_key, this session next to overall."""
+    stats = stats or {}
+    allc = dict(stats.get("by_cfg") or {})
+    sess = dict(stats.get("session_by_cfg") or {})
+
+    def cols(row):
+        if not isinstance(row, dict) or not row.get("n"):
+            return ["—", "—", "—", "—"]
+        n = int(row["n"])
+        return [
+            str(n),
+            _num(float(row.get("sum_spf") or 0) / n, "{:.2f}"),
+            _num(float(row.get("sum_vram_peak") or 0) / n, "{:.0f}", " MB"),
+            _num(row.get("vram_peak_mb_max"), "{:.0f}", " MB"),
+        ]
+
+    keys = sorted(set(allc) | set(sess), key=lambda k: -int((allc.get(k) or sess.get(k) or {}).get("n") or 0))
+    rows = [[f"<code>{_esc(k)}</code>"] + cols(sess.get(k)) + cols(allc.get(k)) for k in keys]
+    return _table(
+        ["settings", "session n", "s/frame", "VRAM avg", "VRAM max", "overall n", "s/frame", "VRAM avg", "VRAM max"],
+        rows, "No settings compared yet.",
+    )
+
+
+def _show_bucket(app: Path, bucket: Optional[str]) -> str:
+    if bucket in BUCKETS:
+        return bucket
+    lock = _lock_bucket(app)
+    if lock:
+        return lock
+    return LOCK_TO_BUCKET.get(_active_name(app, _load_queues(app)), "group")
+
+
+def render_recent(app_dir, bucket: Optional[str] = None, now: Optional[float] = None) -> str:
+    """Recent files table for one bucket. Reads the stats file, never writes."""
+    app = Path(app_dir)
+    with _STATS_LOCK:
+        store = _read_store(app)
+    b = _show_bucket(app, bucket)
+    return recent_files_html(_bucket_stats(store["buckets"].get(b), _now(now)))
+
+
+def render_compare(app_dir, bucket: Optional[str] = None, now: Optional[float] = None) -> str:
+    """Settings comparison table for one bucket. Reads the stats file, never writes."""
+    app = Path(app_dir)
+    with _STATS_LOCK:
+        store = _read_store(app)
+    b = _show_bucket(app, bucket)
+    return compare_html(_bucket_stats(store["buckets"].get(b), _now(now)))
 
 
 def _profiles_path(app_dir: Path) -> Path:

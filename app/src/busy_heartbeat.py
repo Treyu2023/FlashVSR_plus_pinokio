@@ -114,6 +114,7 @@ _session = {
     "name": "",
     "section": "",
 }
+_file_metrics: dict = {}  # per-file stats for the session board (FV-UI); guarded by _prog_lock
 
 
 def _short_file(name: str, limit: int = 36) -> str:
@@ -250,6 +251,8 @@ def set_session(
     left_f = _f(chunks_left)
     with _prog_lock:
         changed = (index_i, short) != (_session["index"], _session["name"])
+        if changed:
+            _file_metrics.clear()
         _session["done"] = int(done)
         _session["total"] = int(total) if total else None
         _session["index"] = index_i
@@ -287,6 +290,22 @@ def clear_session() -> None:
         _session["index"] = None
         _session["name"] = ""
         _session["section"] = ""
+        _file_metrics.clear()
+
+
+def set_file_metrics(**kw) -> None:
+    """Merge numeric/str/bool fields into this file's metrics. Others are ignored."""
+    with _prog_lock:
+        for key, value in kw.items():
+            if value is None or isinstance(value, (bool, int, float, str)):
+                _file_metrics[str(key)] = value
+
+
+def file_finished(ok: bool) -> None:
+    """Stamp the end of this file so the board can close its record with final values."""
+    with _prog_lock:
+        _file_metrics["finished"] = time.time()
+        _file_metrics["ok"] = bool(ok)
 
 
 def snapshot() -> dict:
@@ -295,6 +314,7 @@ def snapshot() -> dict:
     with _prog_lock:
         prog = dict(_prog)
         sess = dict(_session)
+        metrics = dict(_file_metrics)
     start = prog.get("start_t")
     elapsed = (now - float(start)) if start else None
     return {
@@ -308,6 +328,7 @@ def snapshot() -> dict:
         "file_name": sess.get("name") or "",
         "section": sess.get("section") or "",
         "stop_armed": stop_armed(),
+        "file_metrics": metrics,
     }
 
 

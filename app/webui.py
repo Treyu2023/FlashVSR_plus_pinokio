@@ -70,7 +70,7 @@ from einops import rearrange
 from src.busy_heartbeat import (
     HeartbeatTqdm, busy, BusySpan, WATCH, force_line_buffering,
     set_stop_check, tick_stop_banner, set_session, set_section, clear_session,
-    chunk_tenths,
+    chunk_tenths, set_file_metrics, file_finished, snapshot as hb_snapshot,
 )
 
 force_line_buffering()
@@ -1926,6 +1926,93 @@ def release_pipeline(pipe):
     clean_vram()
     log_vram_status("after-release")
 
+# --- FV-UI per-file stats (best effort: a stats failure never breaks a run) ---
+_FM_T_READY = None
+
+
+def _fm(**kw):
+    try:
+        set_file_metrics(**kw)
+    except Exception:
+        pass
+
+
+def _fm_get() -> dict:
+    try:
+        return dict(hb_snapshot().get("file_metrics") or {})
+    except Exception:
+        return {}
+
+
+def _fm_ram():
+    try:
+        mi = psutil.Process().memory_info()
+        cur = (getattr(mi, "peak_wset", None) or mi.rss) / 2**20
+        _fm(ram_peak_mb=max(float(_fm_get().get("ram_peak_mb") or 0), cur))
+    except Exception:
+        pass
+
+
+def _fm_load_start():
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+    return time.time()
+
+
+def _fm_load_end(t0):
+    global _FM_T_READY
+    try:
+        now = time.time()
+        _FM_T_READY = now
+        m = _fm_get()
+        load_s = now - t0
+        if m.get("chunk_mode"):
+            load_s += float(m.get("load_s") or 0)
+        _fm(load_s=load_s)
+    except Exception:
+        pass
+
+
+def _fm_frames(frames, fps, **settings):
+    try:
+        m = _fm_get()
+        n = int(frames.shape[0])
+        _fm(**settings)
+        _fm(
+            frames=n + (int(m.get("frames") or 0) if m.get("chunk_mode") else 0),
+            in_w=int(frames.shape[2]), in_h=int(frames.shape[1]), fps=float(fps or 0),
+        )
+    except Exception:
+        pass
+    _fm_ram()
+
+
+def _fm_done():
+    try:
+        m = _fm_get()
+        now = time.time()
+        process_s = (now - _FM_T_READY) if _FM_T_READY else 0.0
+        if m.get("chunk_mode"):
+            process_s += float(m.get("process_s") or 0)
+        frames_n = int(m.get("frames") or 0)
+        upd = {"process_s": process_s}
+        if frames_n and process_s > 0:
+            upd["s_per_frame"] = process_s / frames_n
+            upd["fps_processed"] = frames_n / process_s
+        if torch.cuda.is_available():
+            upd["vram_alloc_peak_mb"] = max(float(m.get("vram_alloc_peak_mb") or 0), torch.cuda.max_memory_allocated() / 2**20)
+            upd["vram_reserved_peak_mb"] = max(float(m.get("vram_reserved_peak_mb") or 0), torch.cuda.max_memory_reserved() / 2**20)
+        _fm(**upd)
+        _fm_ram()
+        if not m.get("chunk_mode"):
+            file_finished(True)
+    except Exception:
+        pass
+
+
 # --- Integrated Core Logic Function (Updated) ---
 def run_flashvsr_single(
     input_path,
@@ -1989,6 +2076,12 @@ def run_flashvsr_single(
     log(f"Loading frames from {input_path}...", message_type='info')
     frames, original_fps = prepare_tensors(input_path, dtype=dtype)
     _fps = original_fps if is_video(input_path) else fps_override
+    _fm_frames(
+        frames, _fps, mode=mode, model_version=model_version, scale=scale, dtype_str=dtype_str,
+        attention_mode=attention_mode, sparse_ratio=sparse_ratio, kv_ratio=kv_ratio,
+        local_range=local_range, color_fix=color_fix, tiled_dit=bool(tiled_dit), tiled_vae=bool(tiled_vae),
+        tile_size=tile_size, tile_overlap=tile_overlap,
+    )
     if frames.shape[0] < 21: raise gr.Error(f"Input must have at least 21 frames, but got {frames.shape[0]} frames.")
     log("Video frames loaded successfully.", message_type="finish")
     busy(
@@ -2011,6 +2104,10 @@ def run_flashvsr_single(
         tile_size = profile["tile_size"]
         tile_overlap = profile["tile_overlap"]
         unload_dit = profile["unload_dit"]
+        _fm(
+            tile_size=tile_size, tile_overlap=tile_overlap, tiled_vae=tiled_vae,
+            tiled_dit=tiled_dit, unload_dit=unload_dit, profile=str(profile.get("label") or ""),
+        )
 
         if attempt_idx > 0:
             log(
@@ -2058,12 +2155,16 @@ def run_flashvsr_single(
                 N, H, W, C = frames.shape
                 tile_coords = calculate_tile_coords(H, W, tile_size, tile_overlap)
                 num_tiles = len(tile_coords)
+                _fm(num_tiles=num_tiles)
+                _fm_ram()
                 busy(
                     f"{num_tiles} tiles on {W}x{H} (tile {tile_size}/{tile_overlap}, "
                     f"{N} frames). Each tile is DiT then VAE — VAE is the quiet stretch."
                 )
                 progress(0.1, desc="Initializing model pipeline...")
+                _fm_t0 = _fm_load_start()
                 pipe = init_pipeline(mode, _device, dtype, model_version=model_version)
+                _fm_load_end(_fm_t0)
 
                 if mode == "tiny-long":
                     local_temp_dir = os.path.join(TEMP_DIR, str(uuid.uuid4()))
@@ -2158,7 +2259,9 @@ def run_flashvsr_single(
                         release_host_cache()
             else:  # Non-tiled mode
                 progress(0.1, desc="Initializing model pipeline...")
+                _fm_t0 = _fm_load_start()
                 pipe = init_pipeline(mode, _device, dtype, model_version=model_version)
+                _fm_load_end(_fm_t0)
                 log(f"Processing {frames.shape[0]} frames...", message_type='info')
 
                 N, H, W, C = frames.shape
@@ -2236,6 +2339,7 @@ def run_flashvsr_single(
         del frames
         clean_vram()
         release_host_cache()
+        _fm(out_w=int(W) * scale, out_h=int(H) * scale)
         try:
             save_disk_stitch(
                 stitch, temp_video_path, fps=_fps, quality=quality,
@@ -2249,6 +2353,7 @@ def run_flashvsr_single(
         progress(0.9, desc="Saving final video...")
         del frames
         clean_vram()
+        _fm(out_w=int(final_output_tensor.shape[2]), out_h=int(final_output_tensor.shape[1]))
         save_video(final_output_tensor, temp_video_path, fps=_fps, quality=quality)
         del final_output_tensor
         clean_vram()
@@ -2288,6 +2393,7 @@ def run_flashvsr_single(
     
     progress(1, desc="Done!")
     busy(f"upscale finished: {temp_output_path}")
+    _fm_done()
     WATCH.stop()
     
     # Always display the upscaled output video (not the comparison)
@@ -7269,6 +7375,7 @@ def process_video_with_chunks(
         return None, None, None, gr.update(visible=False)
     
     num_chunks = len(chunk_paths)
+    _fm(chunk_mode=True, chunk_count=num_chunks, chunk_s=chunk_duration, frames=0, load_s=0.0, process_s=0.0)
     log(f"Created {num_chunks} chunks, processing each...", message_type="info")
     resume_dir = _chunk_resume_dir(input_path, (
         "v1", chunk_duration, num_chunks, mode, model_version, scale, color_fix, tiled_vae,
@@ -7437,6 +7544,10 @@ def process_video_with_chunks(
         log(f"Chunk processing complete! Auto-saved to: {final_save_path}", message_type="finish")
     else:
         log(f"Chunk processing complete! Use 'Save Output' to save to outputs folder.", message_type="finish")
+    try:
+        file_finished(True)
+    except Exception:
+        pass
     
     progress(1.0, desc="Done!")
     
@@ -8048,6 +8159,12 @@ def create_ui():
         output_file_path = gr.State(None)
         completion_status = gr.State(None)
 
+        def _safe_board(fn):
+            try:
+                return fn(ROOT_DIR)
+            except Exception as exc:
+                return "<div style='color:#fca5a5'>Session board: " + html.escape(str(exc)) + "</div>"
+
         try:
             _board_html = session_board.render(ROOT_DIR)
         except Exception as exc:
@@ -8062,6 +8179,10 @@ def create_ui():
             _profile_names = []
         with gr.Group(elem_id="session_board"):
             session_board_html = gr.HTML(value=_board_html)
+            with gr.Accordion("Recent files", open=False):
+                recent_files_html = gr.HTML(value=_safe_board(session_board.render_recent))
+            with gr.Accordion("Settings comparison", open=False):
+                settings_compare_html = gr.HTML(value=_safe_board(session_board.render_compare))
             with gr.Row():
                 job_profile_name = gr.Textbox(
                     label="Job profile",
@@ -10066,14 +10187,16 @@ def create_ui():
                     + html.escape(str(exc))
                     + "</div>"
                 )
-            return (gpu_info, cpu_info, gpu_info, cpu_info, board, *panels)
+            recent = _safe_board(session_board.render_recent)
+            compare = _safe_board(session_board.render_compare)
+            return (gpu_info, cpu_info, gpu_info, cpu_info, board, recent, compare, *panels)
             
         monitor_timer = gr.Timer(2, active=True)
         monitor_timer.tick(
             fn=update_monitor,
             outputs=[
                 gpu_monitor, cpu_monitor, img_gpu_monitor, img_cpu_monitor,
-                session_board_html,
+                session_board_html, recent_files_html, settings_compare_html,
                 batch_stop_ack, gt_stop_ack, img_stop_ack, tb_stop_ack,
                 flashvsr_queue_status, gt_queue_status, img_queue_status, tb_queue_status,
             ],

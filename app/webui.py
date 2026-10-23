@@ -85,6 +85,7 @@ from src.models.utils import get_device_list, clean_vram, Buffer_LQ4x_Proj, Caus
 from stitch_canvas import DiskStitchCanvas, frames_to_fp16_cpu, release_host_cache
 
 from toolbox.system_monitor import SystemMonitor
+from toolbox import thrash_alert
 from toolbox.toolbox import ToolboxProcessor
 from toolbox.batch_queue import (
     write_live_batch_progress,
@@ -8183,6 +8184,8 @@ def create_ui():
             _profile_names = []
         with gr.Group(elem_id="session_board"):
             job_card_html = gr.HTML(value=_safe_board(session_board.render_job))
+            thrash_overlay_html = gr.HTML(value="", elem_id="fv_thrash_overlay")
+            thrash_mute = gr.Checkbox(label="Mute GPU thrash alert", value=False, container=False)
             session_board_html = gr.HTML(value=_board_html)
             with gr.Accordion("Recent files", open=False):
                 recent_files_html = gr.HTML(value=_safe_board(session_board.render_recent))
@@ -10180,7 +10183,21 @@ def create_ui():
             outputs=[stats_reset_status, session_board_html], queue=False,
         )
 
-        def update_monitor():
+        _thrash_cfg = thrash_alert.load_config()
+        _thrash_steps = thrash_alert.StepTracker(_thrash_cfg.get("rolling_steps", 8))
+
+        def _thrash_overlay(muted):
+            try:
+                m = SystemMonitor.last_metrics or {}
+                r = {"vram_used_gb": m.get("memory_used_gb"), "vram_total_gb": m.get("memory_total_gb"),
+                     "util_pct": m.get("utilization"), "power_w": m.get("power_w")}
+                r.update(_thrash_steps.update(hb_snapshot()))
+                score, why = thrash_alert.thrash_score(r, _thrash_cfg)
+                return thrash_alert.render_overlay(score, why, _thrash_cfg, muted=bool(muted))
+            except Exception:
+                return ""
+
+        def update_monitor(thrash_muted=False):
             gpu_info, cpu_info = SystemMonitor.get_system_info()
             # Return same info for both video and image tabs, plus stop banners.
             panels = _stop_panel_updates()
@@ -10195,14 +10212,17 @@ def create_ui():
             job = _safe_board(session_board.render_job)
             recent = _safe_board(session_board.render_recent)
             compare = _safe_board(session_board.render_compare)
-            return (gpu_info, cpu_info, gpu_info, cpu_info, job, board, recent, compare, *panels)
+            return (gpu_info, cpu_info, gpu_info, cpu_info, job, board, recent, compare,
+                    _thrash_overlay(thrash_muted), *panels)
             
         monitor_timer = gr.Timer(2, active=True)
         monitor_timer.tick(
             fn=update_monitor,
+            inputs=[thrash_mute],
             outputs=[
                 gpu_monitor, cpu_monitor, img_gpu_monitor, img_cpu_monitor,
                 job_card_html, session_board_html, recent_files_html, settings_compare_html,
+                thrash_overlay_html,
                 batch_stop_ack, gt_stop_ack, img_stop_ack, tb_stop_ack,
                 flashvsr_queue_status, gt_queue_status, img_queue_status, tb_queue_status,
             ],

@@ -137,7 +137,7 @@ h. Restore the items in section 4 (not in git).
 | `app/src/models/wan_video_vae.py` | Heartbeat progress during VAE encode/decode so long steps show in the terminal. | CRITICAL |
 | `app/src/models/TCDecoder.py` | Sequential decode sends finished frames to CPU (no 249-frame GPU stack); heartbeat spans. | CRITICAL |
 | `app/toolbox/toolbox.py` | FPS cap, no-video-stream probe, HighFPS skip, medium export preset, NVENC p6/hq with source colour tags. | `_choose_interp_factor`, `_has_video_stream` |
-| `app/toolbox/batch_queue.py` | 20-file work packs, done-vs-pending by output scan, import crashed batches, atomic manifests and CSV/PENDING/FAILED/DONE lists. | CRITICAL |
+| `app/toolbox/batch_queue.py` | BATCH_PROGRESS/INPUTS writers only (live BATCH_PROGRESS.json/.txt, REMAINING.txt, INPUTS.txt); the old batch queue UI was removed in FV-UI. | CRITICAL |
 | `app/toolbox/rife_core.py` | RIFE model loading for Toolbox/Group Therapy; model in `app/toolbox/model_rife/`. | CRITICAL |
 | `app/webui_config` | 66-key machine config; see Settings. Tracked (R-5). | `gt_before_dir=`, `batch_watch_folder=`, `randomize_seed=True`, `chunk_duration=10.25` |
 | `app/webui_config.bak` | Minimal 5-key fallback config; restored only if missing. | CONFIG_FILES |

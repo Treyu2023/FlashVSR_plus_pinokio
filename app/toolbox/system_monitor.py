@@ -9,6 +9,8 @@ NumericValue = Union[int, float]
 MetricsDict = Dict[str, NumericValue]
 
 class SystemMonitor:
+    last_metrics: MetricsDict = {}
+
     @staticmethod
     def get_nvidia_gpu_info() -> Tuple[str, MetricsDict, Optional[str]]:
         """Get NVIDIA GPU information and metrics for GPU 0."""
@@ -35,7 +37,7 @@ class SystemMonitor:
         # Query for memory.used, memory.total, memory.reserved, temperature.gpu, utilization.gpu
         nvidia_smi_common_args = [
             'nvidia-smi',
-            '--query-gpu=memory.used,memory.total,memory.reserved,temperature.gpu,utilization.gpu',
+            '--query-gpu=memory.used,memory.total,memory.reserved,temperature.gpu,utilization.gpu,power.draw',
             '--format=csv,nounits,noheader'
         ]
 
@@ -71,8 +73,8 @@ class SystemMonitor:
 
         if smi_output_str:
             parts = smi_output_str.strip().split(',')
-            if len(parts) == 5: # memory.used, memory.total, memory.reserved, temp, util
-                memory_used_mib, memory_total_mib, memory_reserved_mib, temp, util = map(float, parts)
+            if len(parts) in (5, 6): # memory.used, memory.total, memory.reserved, temp, util[, power.draw]
+                memory_used_mib, memory_total_mib, memory_reserved_mib, temp, util = map(float, parts[:5])
                 metrics = {
                     'memory_used_gb': memory_used_mib / 1024,
                     'memory_total_gb': memory_total_mib / 1024,
@@ -80,6 +82,9 @@ class SystemMonitor:
                     'temperature': temp,
                     'utilization': util
                 }
+                if len(parts) == 6:  # power.draw may be "[N/A]" on some boards
+                    try: metrics['power_w'] = float(parts[5])
+                    except ValueError: pass
             else:
                 # print(f"Unexpected nvidia-smi output format: {smi_output_str}. Parts: {len(parts)}")
                 warning_message = "nvidia-smi output format unexpected. Some GPU stats may be missing or inaccurate."
@@ -307,6 +312,7 @@ class SystemMonitor:
                 gpu_name_display, metrics, gpu_warning = cls.get_amd_gpu_info()
             else: # No specific GPU detected by these primary checks
                 pass
+            cls.last_metrics = dict(metrics)  # raw numbers for the thrash alert
 
             # Format GPU info with better visual structure
             if gpu_name_display:

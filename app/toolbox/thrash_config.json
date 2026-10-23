@@ -1,0 +1,16 @@
+{
+  "_doc": "FlashVSR thrash alert thresholds. Each signal maps to 0..1 linearly between its 'start' (0) and 'full' (1) value; the score is the weighted sum (weights sum to 1). Alert state 'thrash' when score >= thrash_at, 'near' when >= near_at. Delete this file to fall back to the built-in defaults in thrash_alert.py.",
+  "vram_pct_start": 85.0,
+  "vram_pct_full": 96.0,
+  "util_min_pct": 90.0,
+  "watts_per_util_start": 2.5,
+  "watts_per_util_full": 1.0,
+  "step_slowdown_start": 2.0,
+  "step_slowdown_full": 6.0,
+  "silent_start_s": 120.0,
+  "silent_full_s": 900.0,
+  "rolling_steps": 8,
+  "weights": {"vram": 0.30, "power": 0.20, "slowdown": 0.25, "silent": 0.25},
+  "near_at": 0.45,
+  "thrash_at": 0.75
+}

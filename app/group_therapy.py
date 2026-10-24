@@ -424,10 +424,11 @@ def assign_groups(wq: FlashVSRWorkQueue, group_size: int, after_dir: str = "") -
     """
     Pack unstarted pending files into groups newest → oldest by source mtime.
 
-    A group already mid-pipeline (any member running, or a stage file on disk)
-    keeps its members so that batch can finish. A stuck row whose only trace
-    is ``gt_stage`` is unstarted and gets regrouped. Leftover unstarted rows
-    pack so Start always works latest files first.
+    A row that is actually mid-pipeline (running, or a stage file still on
+    disk) keeps its group so that partial can finish before newer raw files.
+    Unstarted siblings in that same group do not. They pack with the other
+    pending files, newest first. A stuck row whose only trace is ``gt_stage``
+    is unstarted and gets regrouped.
     """
     group_size = max(1, int(group_size or 10))
     data = wq.load()
@@ -455,7 +456,9 @@ def assign_groups(wq: FlashVSRWorkQueue, group_size: int, after_dir: str = "") -
             g = int(it.get("gt_group") or 0)
         except (TypeError, ValueError):
             g = 0
-        if g in frozen_gids:
+        # Only the rows that already have real stage output stay ahead.
+        # The rest of an old group is raw work and must take a newest-first slot.
+        if g in frozen_gids and item_in_progress(it):
             if not it.get("gt_pair_id"):
                 ensure_pair_id(it, after_dir=after_dir)
                 it["gt_pair_folder"] = pair_folder_name(
@@ -466,12 +469,13 @@ def assign_groups(wq: FlashVSRWorkQueue, group_size: int, after_dir: str = "") -
         if it.get("status") == "failed":
             # Gave-up / still-failed rows are not packed into a new newest-first
             # group. Drop the stale id so they do not share a group with new work.
-            if g not in frozen_gids:
-                it["gt_group"] = None
+            it["gt_group"] = None
             continue
         if it.get("status") != "pending":
             continue
         it["gt_group"] = None
+        if not has_stage_output(it):
+            it["gt_stage"] = None
         unstarted.append(it)
 
     unstarted.sort(
@@ -516,6 +520,8 @@ def ordered_groups(items: Sequence[Dict[str, Any]]) -> List[int]:
 
     Inside each bucket, newest source mtime first. Group id is only a tie-break.
     A bare ``gt_stage`` does not count as in progress (see ``item_in_progress``).
+    ``assign_groups`` peels unstarted siblings out of an in-progress group first,
+    so those raw files are not pulled ahead of newer downloads.
     """
     meta: Dict[int, Dict[str, Any]] = {}
     for it in items:

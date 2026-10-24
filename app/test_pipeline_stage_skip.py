@@ -195,6 +195,64 @@ def test_bare_stage_does_not_beat_newest() -> None:
         assert order[-1] == "old.mp4", order
 
 
+def test_unstarted_sibling_does_not_beat_newest() -> None:
+    """A raw file sharing an old group must not upscale ahead of a newer download.
+
+    Only the row that already has a stage file stays in front.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        app = root / "app"
+        app.mkdir()
+        old = root / "old.mp4"
+        sibling = root / "old-sibling.mp4"
+        new = root / "new.mp4"
+        partial = root / "old_upscaled.mp4"
+        old.write_bytes(b"o" * (40 * 1024))
+        sibling.write_bytes(b"s" * (43 * 1024))
+        new.write_bytes(b"n" * (41 * 1024))
+        partial.write_bytes(b"u" * (42 * 1024))
+        old_ts = time.time() - 86400 * 40
+        sib_ts = time.time() - 86400 * 30
+        new_ts = time.time() - 120
+        os.utime(old, (old_ts, old_ts))
+        os.utime(sibling, (sib_ts, sib_ts))
+        os.utime(new, (new_ts, new_ts))
+        os.utime(partial, (old_ts, old_ts))
+        wq = FlashVSRWorkQueue(str(app), name="group", extensions={".mp4"}, label="t")
+        data = wq.load()
+        data["items"] = [
+            {
+                "path": str(old),
+                "status": "pending",
+                "gt_group": 3,
+                "gt_stage": "upscale",
+                "gt_upscale": str(partial),
+                "size": old.stat().st_size,
+            },
+            {
+                "path": str(sibling),
+                "status": "pending",
+                "gt_group": 3,
+                "size": sibling.stat().st_size,
+            },
+            {
+                "path": str(new),
+                "status": "pending",
+                "gt_group": 9,
+                "size": new.stat().st_size,
+            },
+        ]
+        wq.save(data)
+        gt.assign_groups(wq, 5)
+        rows = {Path(it["path"]).name: it for it in wq.all_items()}
+        assert rows["old.mp4"]["gt_group"] == 3
+        assert rows["old-sibling.mp4"]["gt_group"] != 3
+        assert rows["new.mp4"]["gt_group"] != 3
+        order = [Path(it["path"]).name for it in gt.run_order(wq.all_items())]
+        assert order == ["old.mp4", "new.mp4", "old-sibling.mp4"], order
+
+
 def test_real_partial_still_finishes_before_newer() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -274,6 +332,7 @@ if __name__ == "__main__":
     test_reclaim_moves_export_keeps_tiny()
     test_mark_finished_exports_queue_row()
     test_bare_stage_does_not_beat_newest()
+    test_unstarted_sibling_does_not_beat_newest()
     test_real_partial_still_finishes_before_newer()
     test_gave_up_stays_failed_on_start_requeue()
     print("ok")

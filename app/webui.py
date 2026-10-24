@@ -364,8 +364,8 @@ TIPS = {
     "tb_inbox_folder": "Step 5 — Toolbox watches / picks from here (usually same as Step 3).",
     "gt_group_size": (
         "Group Therapy size — how many originals go through one full pipeline pass "
-        "before the next group starts. Groups run newest → oldest (in-progress group "
-        "finishes first). Default 5."
+        "before the next group starts. Groups run newest → oldest. A file that already "
+        "has a stage output finishes first. Other files in that old group do not. Default 5."
     ),
     "gt_before_dir": "Before folder (flat) — originals land here as name_PID_xxxxxxxx.mp4 (same id as After). Title metadata is also set to PID_xxxxxxxx; Media Center tags are not touched.",
     "gt_after_dir": "After folder (flat) — finals land here as name_PID_xxxxxxxx.mp4 (same id as Before). No per-file subfolders.",
@@ -3872,7 +3872,7 @@ def _run_group_therapy_body(
     first_name = os.path.basename((ordered[0].get("path") if ordered else "") or "")
     log(
         f"Group Therapy: {len(groups)} group(s) × {group_size}  "
-        f"order=newest → oldest (real in-progress group first)  "
+        f"order=newest → oldest (only files already mid-pipeline go first)  "
         f"first={first_name}  "
         f"stages={' → '.join(gt.STAGE_LABELS[s] for s in stages)}  "
         f"before={before_dir}  after={after_dir}",
@@ -8435,8 +8435,9 @@ def create_ui():
                                 gr.Markdown(
                                     "**Group Therapy** — take **N** files from the original folder, "
                                     "run that group **start to finish** (upscale → RIFE → RIFE → export), "
-                                    "then the next N. Default order is **newest → oldest** "
-                                    "(a group already in progress finishes first).\n\n"
+                                    "then the next N. Default order is **newest → oldest**. "
+                                    "A file that already has a stage output finishes first. "
+                                    "Other files that were only sitting in that old group do not.\n\n"
                                     "After each file finishes: **keep only the original + the end file**. "
                                     "Everything else (resized, `_Upscaled`, RIFE temps) is deleted.\n\n"
                                     "Each pair is tagged **`_PID_xxxxxxxx`** at the end of the filename "
@@ -8450,7 +8451,7 @@ def create_ui():
                                     info=(
                                         "Intake is O:\\New Downloads ODrive Media. "
                                         "Newest files first, oldest last. "
-                                        "An in-progress group finishes before newer files."
+                                        "Only a file that already has a stage output stays ahead of newer downloads."
                                     ),
                                 )
                                 gt_group_size = gr.Slider(

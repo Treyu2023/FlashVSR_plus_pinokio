@@ -1940,6 +1940,14 @@ def _fm(**kw):
         pass
 
 
+def _fm_size(path, key):
+    try:
+        if path and os.path.isfile(path):
+            _fm(**{key: os.path.getsize(path)})
+    except Exception:
+        pass
+
+
 def _fm_get() -> dict:
     try:
         return dict(hb_snapshot().get("file_metrics") or {})
@@ -1954,6 +1962,21 @@ def _fm_ram():
         _fm(ram_peak_mb=max(float(_fm_get().get("ram_peak_mb") or 0), cur))
     except Exception:
         pass
+
+
+def _proc_rss_mb() -> float:
+    """Current process RAM. Stage stamps use this, not the lifetime peak."""
+    try:
+        return psutil.Process().memory_info().rss / 2**20
+    except Exception:
+        return 0.0
+
+
+def _gt_stage_fields(stage: str, started: float) -> dict:
+    try:
+        return session_board.stage_usage_fields(stage, started, time.time(), _proc_rss_mb())
+    except Exception:
+        return {}
 
 
 def _fm_load_start():
@@ -2070,6 +2093,7 @@ def run_flashvsr_single(
     output_path = os.path.join(output_dir, output_filename)
     temp_video_path = os.path.join(TEMP_DIR, f"video_only_{output_filename}")
     final_output_location = os.path.join(output_dir, output_filename) if autosave else os.path.join(TEMP_DIR, output_filename)
+    _fm_size(input_path, "in_bytes")
 
     # Reclaim leftover GPU memory before loading frames (common after prior OOM).
     ensure_vram_headroom(min_free_mb=2000)
@@ -2083,7 +2107,7 @@ def run_flashvsr_single(
         frames, _fps, mode=mode, model_version=model_version, scale=scale, dtype_str=dtype_str,
         attention_mode=attention_mode, sparse_ratio=sparse_ratio, kv_ratio=kv_ratio,
         local_range=local_range, color_fix=color_fix, tiled_dit=bool(tiled_dit), tiled_vae=bool(tiled_vae),
-        tile_size=tile_size, tile_overlap=tile_overlap,
+        tile_size=tile_size, tile_overlap=tile_overlap, quality=quality,
     )
     if frames.shape[0] < 21: raise gr.Error(f"Input must have at least 21 frames, but got {frames.shape[0]} frames.")
     log("Video frames loaded successfully.", message_type="finish")
@@ -2398,6 +2422,7 @@ def run_flashvsr_single(
     
     progress(1, desc="Done!")
     busy(f"upscale finished: {temp_output_path}")
+    _fm_size(temp_output_path, "out_bytes")
     _fm_done()
     WATCH.stop()
     
@@ -3924,6 +3949,31 @@ def _run_group_therapy_body(
             f"   id: {folder}\n   before: {before_p}\n   after:  {after_p}",
             message_type="finish",
         )
+        try:
+            def _sz(one):
+                try:
+                    return os.path.getsize(one) if one and os.path.isfile(one) else None
+                except OSError:
+                    return None
+            _fm_size(before_p or path, "in_bytes")
+            _fm_size(after_p, "out_bytes")
+            session_board.annotate_settled(
+                ROOT_DIR,
+                os.path.basename(path),
+                in_bytes=_sz(before_p) or _sz(path),
+                out_bytes=_sz(after_p),
+                gt_rife_mode=cfg.get("gt_rife_mode"),
+                gt_rife_quality=frames_q,
+                gt_group_size=group_size,
+                gt_export_quality=export_q,
+                gt_export_max_width=export_w,
+                quality=quality,
+                scale=scale,
+                mode=mode,
+                model_version=model_version,
+            )
+        except Exception:
+            pass
 
     for g_i, gid in enumerate(groups):
         members = [
@@ -4020,12 +4070,14 @@ def _run_group_therapy_body(
                 wq.set_item_status(path, "running")
                 pair_id = gt.ensure_pair_id(item, after_dir=after_dir)
                 pair_folder = item.get("gt_pair_folder") or gt.pair_folder_name(pair_id, path)
+                stage_t0 = time.time()
                 wq.update_item(
                     path,
                     gt_stage=stage,
                     gt_group=gid,
                     gt_pair_id=pair_id,
                     gt_pair_folder=pair_folder,
+                    gt_stage_started=stage_t0,
                 )
                 if not item.get("gt_original"):
                     wq.update_item(path, gt_original=path)
@@ -4041,6 +4093,17 @@ def _run_group_therapy_body(
                             chunk_duration,
                         ),
                     )
+                    _fm(
+                        mode=mode, model_version=model_version, scale=scale, dtype_str=dtype_str,
+                        attention_mode=attention_mode, sparse_ratio=sparse_ratio, kv_ratio=kv_ratio,
+                        local_range=local_range, color_fix=bool(color_fix), quality=quality,
+                        tiled_dit=bool(tiled_dit), tiled_vae=bool(tiled_vae),
+                        tile_size=tile_size, tile_overlap=tile_overlap, unload_dit=bool(unload_dit),
+                        gt_rife_mode=cfg.get("gt_rife_mode"), gt_rife_quality=frames_q,
+                        gt_group_size=group_size, gt_export_quality=export_q, gt_export_max_width=export_w,
+                        chunk_s=float(chunk_duration or 0) if enable_chunks else 0,
+                    )
+                    _fm_size(path, "in_bytes")
                     if stage == "upscale":
                         out, resized = _gt_upscale_one(
                             src,
@@ -4069,7 +4132,10 @@ def _run_group_therapy_body(
                         if not out or not os.path.isfile(out):
                             raise RuntimeError("upscale produced no file")
                         kept = _gt_copy_into(out, str(gt.stage_dir(ROOT_DIR, "upscale")))
-                        wq.update_item(path, gt_upscale=kept or out, gt_resized=resized, gt_stage="upscale")
+                        wq.update_item(
+                            path, gt_upscale=kept or out, gt_resized=resized, gt_stage="upscale",
+                            **_gt_stage_fields("upscale", stage_t0),
+                        )
                         log(f"✅ Upscale → {kept or out}", message_type="finish")
                     elif stage in ("rife1", "rife2"):
                         cur_fps = probe_file_fps(src)
@@ -4083,7 +4149,10 @@ def _run_group_therapy_body(
                                 f"{cur_fps:.0f} FPS (4× would be {cur_fps * 2:.0f})",
                                 message_type="info",
                             )
-                            wq.update_item(path, gt_rife2=src, gt_stage="rife2")
+                            wq.update_item(
+                                path, gt_rife2=src, gt_stage="rife2",
+                                **_gt_stage_fields("rife2", stage_t0),
+                            )
                             if last_stage == "rife2":
                                 _settle_item(item)
                             continue
@@ -4092,7 +4161,10 @@ def _run_group_therapy_body(
                             raise RuntimeError(f"{stage} produced no file")
                         kept = _gt_copy_into(out, str(gt.stage_dir(ROOT_DIR, stage)))
                         field = "gt_rife1" if stage == "rife1" else "gt_rife2"
-                        wq.update_item(path, **{field: kept or out, "gt_stage": stage})
+                        wq.update_item(
+                            path,
+                            **{field: kept or out, "gt_stage": stage, **_gt_stage_fields(stage, stage_t0)},
+                        )
                         log(f"✅ {label} → {kept or out}", message_type="finish")
                     elif stage == "export":
                         export_into = after_dir
@@ -4131,7 +4203,10 @@ def _run_group_therapy_body(
                             gt.stamp_title_pid(out, pid)
                         except Exception:
                             pass
-                        wq.update_item(path, gt_export=out, gt_stage="export")
+                        wq.update_item(
+                            path, gt_export=out, gt_stage="export",
+                            **_gt_stage_fields("export", stage_t0),
+                        )
                         log(f"✅ Export → {out}", message_type="finish")
 
                     wq.set_item_status(path, "pending")
@@ -7380,7 +7455,8 @@ def process_video_with_chunks(
         return None, None, None, gr.update(visible=False)
     
     num_chunks = len(chunk_paths)
-    _fm(chunk_mode=True, chunk_count=num_chunks, chunk_s=chunk_duration, frames=0, load_s=0.0, process_s=0.0)
+    _fm(chunk_mode=True, chunk_count=num_chunks, chunk_s=chunk_duration, frames=0, load_s=0.0, process_s=0.0, quality=quality)
+    _fm_size(input_path, "in_bytes")
     log(f"Created {num_chunks} chunks, processing each...", message_type="info")
     resume_dir = _chunk_resume_dir(input_path, (
         "v1", chunk_duration, num_chunks, mode, model_version, scale, color_fix, tiled_vae,
@@ -7550,6 +7626,7 @@ def process_video_with_chunks(
     else:
         log(f"Chunk processing complete! Use 'Save Output' to save to outputs folder.", message_type="finish")
     try:
+        _fm_size(temp_output_path, "out_bytes")
         file_finished(True)
     except Exception:
         pass
@@ -7932,6 +8009,14 @@ CSS_BASE = """
 .prose, .gradio-html, .html-container {
     color: #e2e8f0;
 }
+/* Gradio fades HTML/Markdown text to 20% while a refresh is pending.
+   The 2s stats timer must leave the live boxes at full strength. */
+.html-container.pending,
+.prose.pending,
+div.padding.pending {
+    opacity: 1 !important;
+    transition: none !important;
+}
 /* Gradio textboxes used for paths / notes — dark fill when theme leaves them light */
 textarea, input[type="text"], input[type="number"], input[type="search"] {
     background-color: #0f1419 !important;
@@ -8239,8 +8324,46 @@ def create_ui():
                     )
                     stats_undo_btn = gr.Button("Undo last reset", size="sm", scale=1)
                     stats_session_btn = gr.Button("New session", size="sm", scale=1)
+                with gr.Row():
+                    stats_hist_unlock = gr.Checkbox(
+                        label="Unlock history clear",
+                        value=False,
+                        info="Cleared running totals move to History and stay there. This switch is the only way to make Clear history available.",
+                    )
+                    stats_hist_clear = gr.Button(
+                        "Clear history", size="sm", variant="stop", scale=1, interactive=False,
+                    )
                 stats_reset_status = gr.Textbox(
                     label="Stats", value="", lines=1, interactive=False, show_label=False,
+                )
+            _board_colors = session_board.load_stage_colors(ROOT_DIR)
+            _color_choices = list(session_board.STAGE_COLOR_CHOICES)
+            with gr.Accordion("Bar colors", open=False):
+                gr.Markdown(
+                    "Pick the color for each stage. The group and queue bars use it, "
+                    "and each file's finished time and RAM for that stage use the same color."
+                )
+                with gr.Row():
+                    color_upscale = gr.Dropdown(
+                        label="Upscale",
+                        choices=_color_choices,
+                        value=_board_colors["upscale"],
+                        scale=1,
+                    )
+                    color_rife = gr.Dropdown(
+                        label="RIFE",
+                        choices=_color_choices,
+                        value=_board_colors["rife"],
+                        scale=1,
+                    )
+                    color_saved = gr.Dropdown(
+                        label="Saved",
+                        choices=_color_choices,
+                        value=_board_colors["saved"],
+                        scale=1,
+                    )
+                color_status = gr.Textbox(
+                    label="Colors", value="", lines=1, interactive=False, show_label=False,
                 )
 
         with gr.Tabs(elem_id="main_tabs") as main_tabs:
@@ -8669,6 +8792,8 @@ def create_ui():
                         with gr.Tabs() as flashvsr_output_tab:
                             with gr.TabItem("Processed Video"):                        
                                 video_output = gr.Video(label="Output Result", interactive=False, elem_classes="video-window")
+                                with gr.Accordion("Tag legend", open=False):
+                                    gr.HTML(value=session_board.legend_html())
                         
                         with gr.Group():
                             with gr.Row():                            
@@ -10146,7 +10271,10 @@ def create_ui():
         )
 
         def _stats_arm(bucket):
-            return gr.update(interactive=True), f"Armed: Confirm resets {bucket} stats (archived, undoable)."
+            return gr.update(interactive=True), (
+                f"Armed: Confirm moves {bucket} running totals into History. "
+                "History stays locked until Unlock history clear is on."
+            )
 
         def _stats_disarm(_bucket):
             return gr.update(interactive=False), ""
@@ -10179,10 +10307,37 @@ def create_ui():
         def _stats_new_session(bucket):
             return session_board.new_session(ROOT_DIR, bucket), session_board.render(ROOT_DIR)
 
+        def _hist_unlock(on):
+            return gr.update(interactive=bool(on))
+
+        def _hist_clear(bucket, unlocked):
+            note = session_board.clear_history(ROOT_DIR, bucket, unlocked=bool(unlocked))
+            return note, session_board.render(ROOT_DIR)
+
+        stats_hist_unlock.change(
+            fn=_hist_unlock, inputs=[stats_hist_unlock],
+            outputs=[stats_hist_clear], queue=False,
+        )
+        stats_hist_clear.click(
+            fn=_hist_clear, inputs=[stats_bucket_pick, stats_hist_unlock],
+            outputs=[stats_reset_status, session_board_html], queue=False,
+        )
         stats_session_btn.click(
             fn=_stats_new_session, inputs=[stats_bucket_pick],
             outputs=[stats_reset_status, session_board_html], queue=False,
         )
+
+        def _save_bar_colors(upscale, rife, saved):
+            session_board.save_stage_colors(ROOT_DIR, upscale, rife, saved)
+            return "Bar colors saved.", session_board.render(ROOT_DIR)
+
+        for _color_widget in (color_upscale, color_rife, color_saved):
+            _color_widget.change(
+                fn=_save_bar_colors,
+                inputs=[color_upscale, color_rife, color_saved],
+                outputs=[color_status, session_board_html],
+                queue=False,
+            )
 
         _thrash_cfg = thrash_alert.load_config()
         _thrash_steps = thrash_alert.StepTracker(_thrash_cfg.get("rolling_steps", 8))
@@ -10227,6 +10382,7 @@ def create_ui():
                 batch_stop_ack, gt_stop_ack, img_stop_ack, tb_stop_ack,
                 flashvsr_queue_status, gt_queue_status, img_queue_status, tb_queue_status,
             ],
+            show_progress="hidden",
         ) 
         
         def send_to_toolbox(video_path):

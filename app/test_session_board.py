@@ -38,7 +38,8 @@ def test_bars_and_session_count() -> None:
         assert "Group" in html
         assert "+0" in html  # historical done is not this session
         assert "█" in html and "░" in html
-        assert "Upscale" in html and "RIFE 1" in html
+        assert "▶ Upscale" in html and "RIFE 1" in html
+        assert "stage <b style='color:#7dd3fc'>Upscale</b>" in html
         items[2]["status"] = "done"
         _queue(app, "group", items)
         html2 = sb.render(
@@ -426,7 +427,199 @@ def test_tolerant_reads() -> None:
         assert "No settings" in sb.render_compare(app, "group")
         assert "—" in sb.recent_files_html({"recent_files": [{"name": "x"}]})
         html = sb.render(app, heartbeat={}, sample={}, now=1.0, persist=False)
-        assert "This session" in html and "Overall" in html
+        assert ">Session<" in html and ">Total<" in html
+        assert "session 0" in html and "all-time 1" in html
+
+
+def test_stage_colors_and_per_file_time_ram() -> None:
+    fields = sb.stage_usage_fields("upscale", 1_000.0, 1_125.0, 22_000.0)
+    assert fields["gt_upscale_secs"] == 125.0
+    assert fields["gt_upscale_ram_mb"] == 22000.0
+    assert sb.stage_usage_fields("nope", 0, 1, 1) == {}
+
+    item = {
+        "path": r"O:\in\b clip.mp4",
+        "status": "pending",
+        "gt_group": 2,
+        "gt_upscale": r"O:\stage\b.mp4",
+        "gt_upscale_secs": 125.0,
+        "gt_upscale_ram_mb": 22000.0,
+        "gt_rife1_secs": 80.0,
+        "gt_rife1_ram_mb": 9000.0,
+    }
+    lines = sb.stage_lines(item, now=2_000.0)
+    assert lines[0][0] == "upscale" and "RAM 21.5 GB" in lines[0][1]
+    assert lines[1][0] == "rife" and "RIFE 1" in lines[1][1]
+    colors = {"upscale": "#fbbf24", "rife": "#c084fc", "saved": "#86efac"}
+    html = sb.stage_stats_html([item], colors, now=2_000.0, group_id=2)
+    assert "b clip.mp4" in html
+    assert "color:#fbbf24" in html and "RAM 21.5 GB" in html
+    assert "color:#c084fc" in html and "RIFE 1" in html
+    running = {
+        "path": r"O:\in\c.mp4",
+        "status": "running",
+        "gt_group": 2,
+        "gt_stage": "rife2",
+        "gt_stage_started": 1_900.0,
+        "gt_upscale_secs": 10.0,
+        "gt_upscale_ram_mb": 1000.0,
+    }
+    live = sb.stage_lines(running, now=2_000.0, live_ram=1500.0)
+    assert any(key == "rife" and "so far" in text and "RIFE 2" in text for key, text in live)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        saved = sb.save_stage_colors(app, "#fbbf24", "not-a-color", "#86efac")
+        assert saved["upscale"] == "#fbbf24"
+        assert saved["rife"] == "#c084fc"
+        assert sb.load_stage_colors(app)["upscale"] == "#fbbf24"
+        _queue(app, "group", [item], gt_current_group=2, gt_current_stage="rife1")
+        _lock(app, "group")
+        board = sb.render(
+            app,
+            heartbeat={"file_name": "b clip.mp4", "section": "RIFE pass 1 (2×)"},
+            sample={},
+            now=2_000.0,
+            persist=False,
+        )
+        assert "STAGE TIME AND RAM" in board
+        assert "color:#fbbf24'>█" in board or "color:#fbbf24" in board
+        assert "RAM 21.5 GB" in board
+
+
+def test_plain_text_says_which_file_of_how_many() -> None:
+    members = [
+        {"path": r"O:\in\a.mp4", "status": "pending", "gt_group": 2, "gt_upscale": r"O:\stage\a.mp4"},
+        {"path": r"O:\in\b clip.mp4", "status": "running", "gt_group": 2},
+        {"path": r"O:\in\c.mp4", "status": "pending", "gt_group": 2},
+        {"path": r"O:\in\d.mp4", "status": "pending", "gt_group": 2},
+        {"path": r"O:\in\e.mp4", "status": "pending", "gt_group": 2},
+    ]
+    assert sb.file_place(members, "upscale", "b clip.mp4") == (2, 5)
+    rife_rows = [
+        {"path": r"O:\in\a.mp4", "status": "running", "gt_upscale": "u"},
+        *[{"path": rf"O:\in\{i}.mp4", "status": "pending", "gt_upscale": "u"} for i in range(4)],
+    ]
+    assert sb.file_place(rife_rows, "rife1", "a.mp4") == (1, 5)
+    assert sb.queue_file_place(members, {"file_index": 7, "file_total": 25}, "b clip.mp4") == (7, 25)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        _queue(app, "group", members, gt_current_group=2, gt_current_stage="upscale")
+        _lock(app, "group")
+        html = sb.render(
+            app,
+            heartbeat={
+                "file_name": "b clip.mp4",
+                "file_index": 7,
+                "file_total": 25,
+                "section": "Upscale",
+                "step_done": 2,
+                "step_total": 10,
+            },
+            sample={},
+            now=1.0,
+            persist=False,
+        )
+        assert "File 2 of 5" in html
+        assert "b clip.mp4" in html
+        assert "queue file 7 of 25" in html
+        assert "File 2 of 5 in this group" in html
+        assert "File 7 of 25 in the queue" in html
+        # The filename is a visible line, not only a tooltip.
+        assert "font-size:20px" in html and "font-size:28px" in html
+
+
+def test_stage_colors_fill_as_files_finish_each_wave() -> None:
+    """One file of five upscaled is a blue fifth. RIFE turns that fifth purple. Save turns it green."""
+    waiting = [{"path": f"O:\\in\\{i}.mp4", "status": "pending", "gt_group": 2} for i in range(4)]
+    up_only = [{"path": r"O:\in\up.mp4", "status": "pending", "gt_group": 2, "gt_upscale": r"O:\stage\up.mp4"}]
+    mix = sb.stage_mix(up_only + waiting)
+    assert mix["upscale"] == 1 and mix["rife"] == 0 and mix["saved"] == 0 and mix["total"] == 5
+    bar = sb.stage_bar(mix, width=10)
+    assert bar.count("█") == 2 and bar.count("░") == 8
+    assert "#38bdf8" in bar and "#c084fc" not in bar and "#86efac" not in bar
+    # The batch meter is 24 blocks. One file of five is five blue blocks.
+    assert sb.stage_bar(mix, width=24).count("█") == 5
+    assert sb.stage_pct(mix) == "7%"
+
+    # Still inside upscale: the stage label alone is not a finished file.
+    running = sb.stage_mix([{"status": "running", "gt_stage": "upscale", "gt_group": 2}])
+    assert running["upscale"] == 0 and running["wait"] == 1
+
+    # Failed work does not paint the bar.
+    dead = sb.stage_mix([{"status": "failed", "gt_upscale": r"O:\stage\x.mp4"}])
+    assert dead["failed"] == 1 and dead["upscale"] == 0
+
+    rife = [{"path": r"O:\in\r.mp4", "status": "pending", "gt_group": 2, "gt_upscale": "u", "gt_rife1": "r"}]
+    saved = [{"path": r"O:\in\s.mp4", "status": "done", "gt_group": 1, "gt_export": "e", "gt_rife1": "r", "gt_upscale": "u"}]
+    mixed = sb.stage_mix(saved + rife + up_only + waiting[:2])
+    assert mixed == {"saved": 1, "rife": 1, "upscale": 1, "wait": 2, "failed": 0, "total": 5}
+    stacked = sb.stage_bar(mixed, width=10)
+    assert stacked.index("#86efac") < stacked.index("#c084fc") < stacked.index("#38bdf8")
+    assert sb.stage_pct(mixed) == "40%"
+    # RIFE 2 with no pass-1 path is still the purple band.
+    assert sb.stage_mix([{"status": "pending", "gt_rife2": "r2", "gt_upscale": "u"}])["rife"] == 1
+
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        items = saved + rife + up_only + waiting[:2]
+        _queue(app, "group", items, gt_current_group=2, gt_current_stage="rife1")
+        _lock(app, "group")
+        html = sb.render(
+            app,
+            heartbeat={"file_name": "r.mp4", "section": "RIFE pass 1 (2×)", "step_done": 1, "step_total": 4},
+            sample={},
+            now=1.0,
+            persist=False,
+        )
+        assert "THIS BATCH" in html and "QUEUE" in html
+        assert "#86efac" in html and "#c084fc" in html and "#38bdf8" in html
+        batch_at = html.index("THIS BATCH")
+        queue_at = html.index("QUEUE")
+        batch_html = html[batch_at:queue_at]
+        queue_html = html[queue_at:]
+        # Current group is 2: one purple, one blue, two waiting. The saved file is group 1.
+        assert "color:#c084fc'>█" in batch_html and "color:#38bdf8'>█" in batch_html
+        assert "color:#86efac'>█" not in batch_html
+        assert batch_html.index("color:#c084fc'>█") < batch_html.index("color:#38bdf8'>█")
+        assert "1</b> up" in batch_html and "1</b> rife" in batch_html
+        assert queue_html.index("color:#86efac'>█") < queue_html.index("color:#c084fc'>█") < queue_html.index("color:#38bdf8'>█")
+        assert "40%" in queue_html
+
+
+def test_stage_row_follows_rife_and_export() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        (app / "outputs").mkdir()
+        (app / "outputs" / "ACTIVE_QUEUE.lock").write_text(
+            json.dumps({"queue": "group"}), encoding="utf-8"
+        )
+        # Queue label still says upscale. The running row and the heartbeat are on RIFE 1.
+        _queue(app, "group", [
+            {"path": r"O:\in\b.mp4", "status": "running", "gt_group": 2, "gt_stage": "rife1"},
+        ])
+        html = sb.render(
+            app,
+            heartbeat={"file_name": "b.mp4", "section": "RIFE pass 1 (2×)", "step_label": "frames"},
+            sample={},
+            now=1.0,
+            persist=False,
+        )
+        assert "▶ RIFE 1" in html and "✓ Upscale" in html
+        assert "RIFE 2" in html and "Export" in html
+        assert "stage <b style='color:#7dd3fc'>RIFE 1</b>" in html
+        _queue(app, "group", [
+            {"path": r"O:\in\b.mp4", "status": "running", "gt_group": 2, "gt_stage": "export"},
+        ], gt_current_stage="export")
+        html = sb.render(
+            app,
+            heartbeat={"file_name": "b.mp4", "section": "Export / interpolation"},
+            sample={},
+            now=2.0,
+            persist=False,
+        )
+        assert "▶ Export" in html and "✓ RIFE 2" in html and "✓ RIFE 1" in html
 
 
 def test_render_job_steps() -> None:
@@ -453,10 +646,57 @@ def test_render_job_steps() -> None:
                                                  file_metrics=dict(_SET, num_tiles=6)))
         assert "a.mp4" in html and "2/4" in html and "25%" in html
         assert "ETA 2m" in html  # step: 50/5*15 = 150 s
-        assert "ETA 5m" in html and "all-time avg" in html  # files: 100 s x 3 left
-        assert "<details" in html and sb.cfg_key(_SET) in html
+        assert "ETA 5m" in html  # files: 100 s x 3 left, all-time avg
+        assert ">Session<" in html and ">Total<" in html
+        assert "avg —" in html and "avg 1m" in html  # no session samples; all-time is 100s
+        assert "all-time 0" in html
+        assert "Advanced" in html and "<details" not in html and sb.cfg_key(_SET) in html
         assert (app / "outputs" / "session_board_stats.json").read_bytes() == raw  # read-only
-        assert "queued" in sb.job_card_html("upscale", {}, {}, [{"status": "pending"}])
+        blank = sb.job_card_html("upscale", {}, {}, [{"status": "pending"}])
+        assert "queued" in blank and ">Session<" in blank and ">Total<" in blank
+
+
+def test_tags_rollup_and_locked_history() -> None:
+    assert ("R4", "RIFE 4× frames (two 2× passes)") in sb.config_tags({"gt_rife_mode": "4x Frames"})
+    assert sb.config_tags({"gt_rife_mode": "2x Frames"})[0][0] == "R2"
+    assert any(short == "T320" for short, _tip in sb.config_tags({"tiled_dit": True, "tile_size": 320, "tile_overlap": 32}))
+    legend = sb.legend_html()
+    assert "R4" in legend and "RIFE 4×" in legend and "<table" in legend
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        _queue(app, "group", [])
+        _lock(app, "group")
+        _mtick(
+            app, "a.mp4", 100.0, **_SET, s_per_frame=1.0, secs_hint=1,
+            in_bytes=1_000_000, out_bytes=4_000_000, num_tiles=8, frames=80,
+            in_w=100, in_h=50, out_w=400, out_h=200, gt_rife_mode="4x Frames",
+        )
+        sb.render(app, heartbeat={}, sample={}, now=110.0)
+        g = sb._read_store(app)["buckets"]["group"]
+        roll = g["rollup"]
+        assert roll["n"] == 1 and roll["n_in"] == 1 and roll["n_out"] == 1
+        assert roll["sum_pct"] == 300.0
+        assert roll["n_steps"] == 1 and roll["sum_steps"] == 8
+        assert "R4" in sb.recent_files_html(g)
+        html = sb.render(app, heartbeat={"file_metrics": {"gt_rife_mode": "4x Frames", "mode": "tiny"}}, sample={}, now=120.0, persist=False)
+        assert "THIS FILE" in html and "THIS BATCH" in html and "QUEUE" in html
+        assert "R4" in html and "History" in html and "nothing parked yet" in html
+        assert "in → out" in html
+        sb.reset_bucket(app, "group", now=130.0)
+        parked = sb.render(app, heartbeat={}, sample={}, now=140.0, persist=False)
+        assert "1 era" in parked and "locked" in parked
+        assert "History is locked" in sb.clear_history(app, "group", unlocked=False)
+        assert "1 era" in sb.render(app, heartbeat={}, sample={}, now=150.0, persist=False)
+        assert "Cleared 1" in sb.clear_history(app, "group", unlocked=True)
+        assert "nothing parked yet" in sb.render(app, heartbeat={}, sample={}, now=160.0, persist=False)
+        _mtick(app, "b.mp4", 200.0, **_SET, s_per_frame=2.0, in_bytes=100, finished=205.0, ok=True)
+        sb.render(app, heartbeat={}, sample={}, now=210.0)
+        note = sb.annotate_settled(app, "b.mp4", in_bytes=200, out_bytes=800, gt_rife_mode="4x Frames")
+        assert note == "updated the finished file"
+        g = sb._read_store(app)["buckets"]["group"]
+        assert g["rollup"]["n_pct"] == 1
+        assert g["rollup"]["sum_in"] == 200
+        assert g["recent_files"][-1]["out_bytes"] == 800
 
 
 if __name__ == "__main__":
@@ -477,5 +717,10 @@ if __name__ == "__main__":
     test_recent_cap_and_finished_once()
     test_reset_undo_new_session_v4()
     test_tolerant_reads()
+    test_stage_colors_and_per_file_time_ram()
+    test_plain_text_says_which_file_of_how_many()
+    test_stage_colors_fill_as_files_finish_each_wave()
+    test_stage_row_follows_rife_and_export()
     test_render_job_steps()
+    test_tags_rollup_and_locked_history()
     print("session board checks ok")

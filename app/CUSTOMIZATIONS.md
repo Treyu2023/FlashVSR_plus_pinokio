@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-10-28 | **Reapply keeps the current fork:** `env_guard` now requires the stage-color board, per-file metrics, raw-file regroup, and the thrash alert. A snapshot from before those strings cannot be copied back over the live files. |
 | 2026-10-26 | **Stage time and RAM:** Bar colors accordion on the session board picks the upscale, RIFE, and saved colors. Each file lists the finished time and RAM for that stage in the same color. Group Therapy writes those numbers when the stage completes. Needs a FlashVSR restart; do not restart mid-file. |
 | 2026-10-26 | **Session board file line:** the top of the board says the open file in plain text, large: `File 2 of 5 · Upscale`, the filename on its own line, and `queue file 8 of 25`. The same line sits on the file, group, and queue cards. Needs a FlashVSR restart; do not restart mid-file. |
 | 2026-10-26 | **Session board stage colors:** Group Therapy batch and queue bars fill as each file finishes a wave, not only when it is saved. Blue is upscale done, purple is RIFE done, green is saved. One file of five upscaled paints one fifth of that bar blue. A later color stays to the left of an earlier one, so a group in RIFE next to an already-saved group reads green, then purple, then blue. The percent above those two bars is progress through the three waves. Needs a FlashVSR restart; do not restart mid-file. |

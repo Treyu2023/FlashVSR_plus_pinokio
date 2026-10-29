@@ -7,9 +7,12 @@ import time
 from pathlib import Path
 
 import group_therapy as gt
+from datetime import datetime, timedelta
+
 from flashvsr_work_queue import (
     FlashVSRWorkQueue,
     ST_PENDING,
+    lock_holder_matches,
     looks_like_finished_export,
     looks_like_rife_output,
     looks_like_upscaled_output,
@@ -325,6 +328,24 @@ def test_gave_up_stays_failed_on_start_requeue() -> None:
         assert wq.load()["items"][0]["status"] == "pending"
 
 
+def test_reused_pid_does_not_hold_the_queue() -> None:
+    started = datetime(2026, 10, 28, 13, 3, 58)
+    status = {
+        "queue": "group",
+        "started": started.isoformat(timespec="seconds"),
+        "pid": 4132,
+    }
+    assert lock_holder_matches(status, 34040, "svchost.exe", None) is False
+    assert lock_holder_matches(
+        status, 34040, "python.exe", started + timedelta(hours=3)
+    ) is False
+    assert lock_holder_matches(
+        status, 34040, "python.exe", started - timedelta(minutes=5)
+    ) is True
+    assert lock_holder_matches(status, 4132, None, None) is True
+    assert lock_holder_matches(status, 34040, None, None) is False
+
+
 if __name__ == "__main__":
     test_classifiers()
     test_group_keeps_tiny_skips_export()
@@ -335,4 +356,5 @@ if __name__ == "__main__":
     test_unstarted_sibling_does_not_beat_newest()
     test_real_partial_still_finishes_before_newer()
     test_gave_up_stays_failed_on_start_requeue()
+    test_reused_pid_does_not_hold_the_queue()
     print("ok")

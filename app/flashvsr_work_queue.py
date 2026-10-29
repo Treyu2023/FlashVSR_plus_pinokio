@@ -13,7 +13,7 @@ import os
 import re
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
@@ -273,6 +273,28 @@ class ExclusiveQueueLock:
         except Exception:
             return False
 
+    def _holder_live(self, status: Dict[str, Any]) -> bool:
+        """True only when the lock pid is still the process that took it.
+
+        Windows reuses pids. A dead webui's number can belong to svchost an
+        hour later; OpenProcess then says the pid exists and the queue stays
+        blocked. The image name and the process start time catch that.
+        """
+        try:
+            pid = int(status.get("pid"))
+        except (TypeError, ValueError):
+            return False
+        if os.name != "nt":
+            return self._pid_alive(pid)
+        info = _win_process_info(pid)
+        if info is None:
+            return False
+        if info.get("unknown"):
+            return self._pid_alive(pid)
+        return lock_holder_matches(
+            status, os.getpid(), info.get("exe"), info.get("created")
+        )
+
     def try_acquire(self, queue_name: str) -> Tuple[bool, str]:
         """
         Try to become the sole running queue.
@@ -284,8 +306,9 @@ class ExclusiveQueueLock:
             label = QUEUE_LABELS.get(who, who)
             started = current.get("started") or "?"
             pid = current.get("pid")
-            # Crash recovery: clear lock if the process that held it is gone
-            if pid is not None and not self._pid_alive(pid):
+            # Crash recovery: clear lock if that process is gone, or if Windows
+            # gave its pid to something else (svchost, another python).
+            if not self._holder_live(current):
                 self.release()
                 current = None
             elif who == queue_name and pid == os.getpid():
@@ -305,6 +328,11 @@ class ExclusiveQueueLock:
             "started": _now_iso(),
             "pid": os.getpid(),
         }
+        if os.name == "nt":
+            me = _win_process_info(os.getpid()) or {}
+            created = me.get("created")
+            if created is not None:
+                payload["pid_started"] = created.isoformat(timespec="seconds")
         try:
             _atomic_write_json(self.lock_path, payload)
             return True, f"Running exclusively: {payload['label']}"
@@ -339,6 +367,161 @@ class ExclusiveQueueLock:
             f"🔒 Active now: <b>{label}</b> (started {st.get('started', '?')}). "
             f"Only one queue at a time.</div>"
         )
+
+
+def _parse_lock_time(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def lock_holder_matches(
+    status: Dict[str, Any],
+    self_pid: int,
+    exe: Optional[str],
+    created: Optional[datetime],
+) -> bool:
+    """True when status['pid'] is still the process that acquired the lock.
+
+    exe is None when that pid is not running. created is the process start
+    in local time. A pid reused by svchost, or by a python that started after
+    the lock, does not match.
+    """
+    try:
+        pid = int(status.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if pid == int(self_pid):
+        return True
+    if not exe:
+        return False
+    if not exe.lower().endswith(("python.exe", "pythonw.exe")):
+        return False
+    started = _parse_lock_time(status.get("started"))
+    if created is not None and started is not None and created > started + timedelta(seconds=2):
+        return False
+    token = status.get("pid_started")
+    if token and created is not None and str(token) != created.isoformat(timespec="seconds"):
+        return False
+    return True
+
+
+def _win_process_info(pid: int) -> Optional[Dict[str, Any]]:
+    """{'exe', 'created'} when pid exists. None when it does not.
+
+    {'unknown': True} when the process list cannot be read.
+    """
+    found = _win_toolhelp_exe(pid)
+    if found is None:
+        return {"unknown": True, "exe": None, "created": None}
+    if found == "":
+        return None
+    created = None
+    if found.lower().endswith(("python.exe", "pythonw.exe")):
+        created = _win_creation_time(pid)
+    return {"exe": found, "created": created}
+
+
+def _win_toolhelp_exe(pid: int) -> Optional[str]:
+    """Image name for pid. '' if the pid is absent. None if the snapshot fails."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        k32.Process32FirstW.restype = wintypes.BOOL
+        k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        k32.Process32NextW.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        snap = k32.CreateToolhelp32Snapshot(0x00000002, 0)
+        if not snap or snap == wintypes.HANDLE(-1).value:
+            return None
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+            if not ok:
+                return None
+            while ok:
+                if int(entry.th32ProcessID) == int(pid):
+                    return str(entry.szExeFile)
+                ok = k32.Process32NextW(snap, ctypes.byref(entry))
+            return ""
+        finally:
+            k32.CloseHandle(snap)
+    except Exception:
+        return None
+
+
+def _win_creation_time(pid: int) -> Optional[datetime]:
+    """Local start time of pid, or None when it cannot be queried."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [
+                ("dwLowDateTime", wintypes.DWORD),
+                ("dwHighDateTime", wintypes.DWORD),
+            ]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+        ]
+        k32.GetProcessTimes.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        handle = k32.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            return None
+        try:
+            created = FILETIME()
+            unused = FILETIME()
+            if not k32.GetProcessTimes(
+                handle,
+                ctypes.byref(created),
+                ctypes.byref(unused),
+                ctypes.byref(unused),
+                ctypes.byref(unused),
+            ):
+                return None
+            ticks = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+            unix = ticks / 10_000_000 - 11644473600
+            return datetime.fromtimestamp(unix)
+        finally:
+            k32.CloseHandle(handle)
+    except Exception:
+        return None
 
 
 def _win_pid_alive(pid: int) -> bool:
@@ -378,7 +561,7 @@ def queue_runner_alive(app_dir: str) -> bool:
     st = lock.status()
     if not st:
         return False
-    return bool(lock._pid_alive(st.get("pid")))
+    return bool(lock._holder_live(st))
 
 
 def release_finished_stop(wq: "FlashVSRWorkQueue") -> bool:

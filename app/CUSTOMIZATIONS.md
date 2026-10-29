@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-10-28 | **Stale queue lock:** Group Therapy stayed “running” after its process died because Windows reused that pid (svchost at 4:27 PM). A lock now counts only while that pid is still python and started before the lock. |
 | 2026-10-28 | **Reapply keeps the current fork:** `env_guard` now requires the stage-color board, per-file metrics, raw-file regroup, and the thrash alert. A snapshot from before those strings cannot be copied back over the live files. |
 | 2026-10-26 | **Stage time and RAM:** Bar colors accordion on the session board picks the upscale, RIFE, and saved colors. Each file lists the finished time and RAM for that stage in the same color. Group Therapy writes those numbers when the stage completes. Needs a FlashVSR restart; do not restart mid-file. |
 | 2026-10-26 | **Session board file line:** the top of the board says the open file in plain text, large: `File 2 of 5 · Upscale`, the filename on its own line, and `queue file 8 of 25`. The same line sits on the file, group, and queue cards. Needs a FlashVSR restart; do not restart mid-file. |

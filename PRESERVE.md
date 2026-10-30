@@ -41,8 +41,11 @@ Reapply **never** copies a stale snapshot that lacks current markers (e.g. `with
 | Location | Survives |
 |----------|----------|
 | `local-preserve/latest/` (in repo, gitignored) | Reset deletes `app/` only — this folder stays |
-| `C:\pinokio\backups\FlashVSR_plus_pinokio\<timestamp>\` | Full project delete / reinstall |
+| `C:\pinokio\backups\FlashVSR_plus_pinokio\<timestamp>\` | Full project delete, if `C:\pinokio` itself is kept |
+| `%LOCALAPPDATA%\FAFO\FlashVSR-preserve\` | Pinokio uninstall / a new `C:\pinokio` |
 | Git remote `mine` | Machine loss (after you push) |
+
+`app\models` is a junction to `O:\MODELS`. `app\outputs` is a junction to `D:\OUTPUTS\FlashVSR`. Reset `rmdir`s those links first, then deletes `app\`, so the disks stay. Install runs `mklink /J` again before torch/pip. Settings (`webui_config`) and job profiles are copied back only when the live file is missing or stock. A logon task, `FAFO\FlashVSR Restore`, runs `scripts\Restore-After-Core-Reinstall.ps1 -Auto`. If a registry reinstall cloned stock FlashVSR and `webui.py` is not running, it checks out `mine/main` and reapplies the fork. It does not create the app folder; pass `-Clone` for that.
 
 **FlashVSR+ is the only install.** The old VIDUpscaler milestone copy is retired; recover from `git push/pull mine` and `local-preserve`.
 

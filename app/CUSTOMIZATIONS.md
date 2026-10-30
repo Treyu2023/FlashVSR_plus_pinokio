@@ -1,6 +1,6 @@
 # FlashVSR+ Pinokio — Custom Configuration & Code Changes
 
-**Last updated:** 2026-10-18  
+**Last updated:** 2026-10-30  
 **Install path:** `C:\pinokio\api\FlashVSR_plus_pinokio.git\app`  
 **Purpose:** Persistent record of customizations applied outside stock FlashVSR (survives app rollback/reinstall). Re-apply or merge these after updating the Pinokio launcher.
 
@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-10-30 | **Reinstall puts the fork back.** Update / Install / Start still reapply custom files. A stock `webui.py` now also restores the rest of the fork (RIFE, pipelines, tests, docs). `webui_config` and `job_profiles.json` come back when they are missing. Reset unlinks `app\models` → `O:\MODELS` and `app\outputs` → `D:\OUTPUTS\FlashVSR` before deleting `app\`, and Install recreates those junctions. A copy lives in `%LOCALAPPDATA%\FAFO\FlashVSR-preserve`. The logon task `FAFO\FlashVSR Restore` checks out `mine/main` when a Pinokio reinstall left the stock launcher and `webui.py` is not running. |
 | 2026-10-28 | **Stale queue lock:** Group Therapy stayed “running” after its process died because Windows reused that pid (svchost at 4:27 PM). A lock now counts only while that pid is still python and started before the lock. |
 | 2026-10-28 | **Reapply keeps the current fork:** `env_guard` now requires the stage-color board, per-file metrics, raw-file regroup, and the thrash alert. A snapshot from before those strings cannot be copied back over the live files. |
 | 2026-10-26 | **Stage time and RAM:** Bar colors accordion on the session board picks the upscale, RIFE, and saved colors. Each file lists the finished time and RAM for that stage in the same color. Group Therapy writes those numbers when the stage completes. Needs a FlashVSR restart; do not restart mid-file. |

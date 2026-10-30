@@ -86,7 +86,7 @@ module.exports = {
           icon: "fa-regular fa-circle-xmark",
           text: "<div><strong>Reset</strong><div>Deletes app/ — use only if you can restore from mine remote or C:\\pinokio\\backups</div></div>",
           href: "reset.js",
-          confirm: "Reset deletes the entire app/ folder (code, env, models link). Offline backups live under C:\\pinokio\\backups\\FlashVSR_plus_pinokio. Are you sure?"
+          confirm: "Reset deletes the app folder after unlinking models (O:\\MODELS) and outputs (D:\\OUTPUTS\\FlashVSR). Those disks are not deleted. Install puts the fork, settings, and junctions back. Backups: C:\\pinokio\\backups\\FlashVSR_plus_pinokio and %LOCALAPPDATA%\\FAFO\\FlashVSR-preserve. Are you sure?"
         }]
       }
     } else {

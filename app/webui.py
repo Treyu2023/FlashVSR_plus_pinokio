@@ -107,6 +107,7 @@ import session_board
 from naming_utils import (
     upscale_video_filename,
     upscale_image_filename,
+    archive_readonly_source,
     move_to_bin,
     rename_to_step2,
     step2_filename,
@@ -3068,6 +3069,38 @@ def release_processing_vram():
     clean_vram()
 
 
+def _release_between_items() -> None:
+    """Cleanup between queue files. A failure here must not end the run."""
+    try:
+        release_processing_vram()
+    except Exception as e:
+        log(f"VRAM release failed (queue continues): {e}", message_type="warning")
+    try:
+        clear_session()
+    except Exception as e:
+        log(f"Session clear failed (queue continues): {e}", message_type="warning")
+
+
+def _queue_continue_after_error(wq, path: str, exc: BaseException, label: str) -> None:
+    """Log one file's failure and keep the rest of the queue running.
+
+    A saved file stays done. Marker: queue continues after item error
+    """
+    name = os.path.basename(path or "") or (path or "item")
+    log(f"❌ {label} error on {name}: {exc} — queue continues", message_type="error")
+    if not path or wq is None:
+        return
+    try:
+        for it in wq.all_items():
+            if os.path.normcase(it.get("path") or "") == os.path.normcase(path):
+                if it.get("status") == "done":
+                    return
+                break
+        wq.set_item_status(path, "failed", error=str(exc)[:500])
+    except Exception as mark_err:
+        log(f"Could not mark {name} failed: {mark_err}", message_type="warning")
+
+
 def run_flashvsr_batch(
     input_paths,
     mode,
@@ -4320,31 +4353,29 @@ def ensure_workflow_dirs(ui: Optional[dict] = None) -> dict:
 
 def archive_original_source(source_path: str, archive_dir: str) -> Optional[str]:
     """
-    Move the original (pre-upscale) video into the archive folder for later pairing.
+    Move the original (pre-upscale) file into the archive folder for later pairing.
     Upscaled output is left in its normal completed/output location.
+
+    Read-only ODrive downloads fail shutil.move with WinError 5 after the copy
+    lands. clear_readonly_before_archive removes that bit, then deletes the source.
     """
     if not source_path or not archive_dir:
         return None
     if not os.path.isfile(source_path):
         log(f"Original not found to archive: {source_path}", message_type="warning")
         return None
-    try:
-        os.makedirs(archive_dir, exist_ok=True)
-        name = os.path.basename(source_path)
-        dest = os.path.join(archive_dir, name)
-        if os.path.abspath(source_path) == os.path.abspath(dest):
-            return dest
-        if os.path.exists(dest):
-            stem, ext = os.path.splitext(name)
-            dest = os.path.join(
-                archive_dir, f"{stem}_src_{time.strftime('%Y%m%d_%H%M%S')}{ext}"
-            )
-        shutil.move(source_path, dest)
+    dest, err = archive_readonly_source(source_path, archive_dir)
+    if dest and not err:
         log(f"📦 Original moved for pairing → {dest}", message_type="info")
         return dest
-    except Exception as e:
-        log(f"Could not archive original {source_path}: {e}", message_type="warning")
-        return None
+    if dest and err:
+        log(
+            f"Archived copy kept at {dest} but could not remove original {source_path}: {err}",
+            message_type="warning",
+        )
+        return dest
+    log(f"Could not archive original {source_path}: {err}", message_type="warning")
+    return None
 
 
 def _queue_search_dirs(source_path: str, *extra_dirs: str) -> list:
@@ -4768,39 +4799,46 @@ def _run_flashvsr_work_queue_body(
             )
             log(note, message_type="warning")
             return last_output_path, wq.status_html(note)
-        if not os.path.isfile(video_path):
-            result = handle_missing_queue_source(
-                wq,
-                video_path,
-                archive_dirs=[watch_folder, source_archive, handoff],
-                output_dirs=[completed_dir, handoff, get_output_dir()],
-                prefer_exported=False,
-            )
-            if result == "retry":
-                relocated = find_relocated_source(
-                    video_path, watch_folder, source_archive, handoff
+        try:
+            if not os.path.isfile(video_path):
+                result = handle_missing_queue_source(
+                    wq,
+                    video_path,
+                    archive_dirs=[watch_folder, source_archive, handoff],
+                    output_dirs=[completed_dir, handoff, get_output_dir()],
+                    prefer_exported=False,
                 )
-                if relocated:
-                    video_path = relocated
+                if result == "retry":
+                    relocated = find_relocated_source(
+                        video_path, watch_folder, source_archive, handoff
+                    )
+                    if relocated:
+                        video_path = relocated
+                    else:
+                        continue
                 else:
                     continue
-            else:
-                continue
 
-        idx, total_q = wq.index_of(video_path)
-        label = f"Queue {idx}/{total_q} (this run {run_i + 1}/{pending_count}): {os.path.basename(video_path)}"
-        progress((run_i / max(pending_count, 1)), desc=label)
-        log(f"\n--- {label} ---", message_type="info")
-        wq.set_item_status(video_path, "running")
-        done_n = sum(1 for it in wq.all_items() if it.get("status") == "done")
-        set_session(
-            done_n, total_q, idx, os.path.basename(video_path), "upscale",
-            chunks=chunk_units(video_path, chunk_duration),
-            chunks_left=queue_chunk_units(
-                [video_path] + [it.get("path") for it in wq.pending_items()],
-                chunk_duration,
-            ),
-        )
+            idx, total_q = wq.index_of(video_path)
+            label = f"Queue {idx}/{total_q} (this run {run_i + 1}/{pending_count}): {os.path.basename(video_path)}"
+            progress((run_i / max(pending_count, 1)), desc=label)
+            log(f"\n--- {label} ---", message_type="info")
+            wq.set_item_status(video_path, "running")
+            done_n = sum(1 for it in wq.all_items() if it.get("status") == "done")
+            set_session(
+                done_n, total_q, idx, os.path.basename(video_path), "upscale",
+                chunks=chunk_units(video_path, chunk_duration),
+                chunks_left=queue_chunk_units(
+                    [video_path] + [it.get("path") for it in wq.pending_items()],
+                    chunk_duration,
+                ),
+            )
+        except Exception as e:
+            if wq.stop_requested() or e.__class__.__name__ == "CancelledError":
+                raise
+            _queue_continue_after_error(wq, video_path, e, "Video")
+            _release_between_items()
+            continue
 
         if fatal_oom or cuda_context_poisoned(min_free_mb=1500):
             fatal_oom = True
@@ -4917,7 +4955,9 @@ def _run_flashvsr_work_queue_body(
                 )
 
         except Exception as e:
-            log(f"❌ [{idx}/{total_q}] Error: {e}", message_type="error")
+            if e.__class__.__name__ == "CancelledError":
+                raise
+            log(f"❌ [{idx}/{total_q}] Error: {e} — queue continues", message_type="error")
             wq.set_item_status(video_path, "failed", error=str(e))
             write_live_batch_progress(
                 batch_output_dir,
@@ -4935,8 +4975,7 @@ def _run_flashvsr_work_queue_body(
                     message_type="error",
                 )
         finally:
-            release_processing_vram()
-            clear_session()
+            _release_between_items()
 
         # Soft-stop: finish current (already done), then pause before next
         if wq.stop_requested():
@@ -5122,33 +5161,40 @@ def _run_flashvsr_image_work_queue_body(
             )
             log(note, message_type="warning")
             return last_output, wq.status_html(note)
-        if not os.path.isfile(image_path):
-            result = handle_missing_queue_source(
-                wq,
-                image_path,
-                archive_dirs=[watch_folder, source_archive, handoff],
-                output_dirs=[completed_dir, handoff],
-                prefer_exported=False,
-            )
-            if result == "retry":
-                relocated = find_relocated_source(
-                    image_path, watch_folder, source_archive, handoff
+        try:
+            if not os.path.isfile(image_path):
+                result = handle_missing_queue_source(
+                    wq,
+                    image_path,
+                    archive_dirs=[watch_folder, source_archive, handoff],
+                    output_dirs=[completed_dir, handoff],
+                    prefer_exported=False,
                 )
-                if relocated:
-                    image_path = relocated
+                if result == "retry":
+                    relocated = find_relocated_source(
+                        image_path, watch_folder, source_archive, handoff
+                    )
+                    if relocated:
+                        image_path = relocated
+                    else:
+                        continue
                 else:
+                    if result == "done":
+                        processed += 1
                     continue
-            else:
-                if result == "done":
-                    processed += 1
-                continue
-        idx, total_q = wq.index_of(image_path)
-        label = f"Image {idx}/{total_q} (run {run_i + 1}/{pending_count}): {os.path.basename(image_path)}"
-        progress(run_i / max(pending_count, 1), desc=label)
-        log(f"\n--- {label} ---", message_type="info")
-        wq.set_item_status(image_path, "running")
-        done_n = sum(1 for it in wq.all_items() if it.get("status") == "done")
-        set_session(done_n, total_q, idx, os.path.basename(image_path), "image")
+            idx, total_q = wq.index_of(image_path)
+            label = f"Image {idx}/{total_q} (run {run_i + 1}/{pending_count}): {os.path.basename(image_path)}"
+            progress(run_i / max(pending_count, 1), desc=label)
+            log(f"\n--- {label} ---", message_type="info")
+            wq.set_item_status(image_path, "running")
+            done_n = sum(1 for it in wq.all_items() if it.get("status") == "done")
+            set_session(done_n, total_q, idx, os.path.basename(image_path), "image")
+        except Exception as e:
+            if wq.stop_requested() or e.__class__.__name__ == "CancelledError":
+                raise
+            _queue_continue_after_error(wq, image_path, e, "Image")
+            _release_between_items()
+            continue
 
         try:
             class DummyProgress:
@@ -5215,11 +5261,11 @@ def _run_flashvsr_image_work_queue_body(
             else:
                 wq.set_item_status(image_path, "failed", error="no output")
         except Exception as e:
-            log(f"❌ Image error: {e}", message_type="error")
-            wq.set_item_status(image_path, "failed", error=str(e))
+            if e.__class__.__name__ == "CancelledError":
+                raise
+            _queue_continue_after_error(wq, image_path, e, "Image")
         finally:
-            release_processing_vram()
-            clear_session()
+            _release_between_items()
 
         if wq.stop_requested():
             wq.clear_stop()
@@ -5232,6 +5278,7 @@ def _run_flashvsr_image_work_queue_body(
         if remaining == 0
         else f"Pass done ({processed}). {remaining} pending."
     )
+    log(note, message_type="finish" if remaining == 0 else "info")
     progress(1.0, desc=note)
     return last_output, wq.status_html(note)
 
@@ -6192,65 +6239,72 @@ def _run_toolbox_work_queue_body(wq, progress):
             )
             log(note, message_type="warning")
             return last_out, wq.status_html(note)
-        if not os.path.isfile(video_path):
-            result = handle_missing_queue_source(
-                wq,
-                video_path,
-                archive_dirs=[inbox, source_archive],
-                output_dirs=[
-                    ready_civ,
-                    paths.get("ready_civ", ""),
-                    str(Path(ROOT_DIR) / "outputs" / "toolbox"),
-                ],
-                prefer_exported=True,
-            )
-            if result == "done":
-                processed += 1
-                continue
-            if result == "retry":
-                relocated = find_relocated_source(video_path, inbox, source_archive)
-                if relocated:
-                    video_path = relocated
+        try:
+            if not os.path.isfile(video_path):
+                result = handle_missing_queue_source(
+                    wq,
+                    video_path,
+                    archive_dirs=[inbox, source_archive],
+                    output_dirs=[
+                        ready_civ,
+                        paths.get("ready_civ", ""),
+                        str(Path(ROOT_DIR) / "outputs" / "toolbox"),
+                    ],
+                    prefer_exported=True,
+                )
+                if result == "done":
+                    processed += 1
+                    continue
+                if result == "retry":
+                    relocated = find_relocated_source(video_path, inbox, source_archive)
+                    if relocated:
+                        video_path = relocated
+                    else:
+                        permanent_fail += 1
+                        continue
                 else:
                     permanent_fail += 1
                     continue
-            else:
+
+            idx, total_q = wq.index_of(video_path)
+            attempt_n = int(item.get("attempts") or 0) + 1
+            label = (
+                f"Toolbox {idx}/{total_q} (run {run_i + 1}/{pending_count}, "
+                f"try {attempt_n}/{max_attempts}): {os.path.basename(video_path)}"
+            )
+            progress(run_i / max(pending_count, 1), desc=label)
+            log(f"\n--- {label} ---", message_type="info")
+            src_fps = probe_file_fps(video_path)
+            if src_fps >= high_fps_floor:
+                q = quarantine_high_fps(video_path, fps=src_fps, scale_to=scale_back_fps_to)
+                reason = (
+                    f"Already {src_fps:.0f} FPS — not 4× RIFE (would be ~{src_fps * 4:.0f}). "
+                    f"Moved to HighFPS"
+                    + (f" → {q}" if q else "")
+                )
+                log(reason, message_type="warning")
+                _fail_toolbox_item_requeue(
+                    wq, video_path, reason, max_attempts=max_attempts, permanent=True
+                )
                 permanent_fail += 1
                 continue
-
-        idx, total_q = wq.index_of(video_path)
-        attempt_n = int(item.get("attempts") or 0) + 1
-        label = (
-            f"Toolbox {idx}/{total_q} (run {run_i + 1}/{pending_count}, "
-            f"try {attempt_n}/{max_attempts}): {os.path.basename(video_path)}"
-        )
-        progress(run_i / max(pending_count, 1), desc=label)
-        log(f"\n--- {label} ---", message_type="info")
-        src_fps = probe_file_fps(video_path)
-        if src_fps >= high_fps_floor:
-            q = quarantine_high_fps(video_path, fps=src_fps, scale_to=scale_back_fps_to)
-            reason = (
-                f"Already {src_fps:.0f} FPS — not 4× RIFE (would be ~{src_fps * 4:.0f}). "
-                f"Moved to HighFPS"
-                + (f" → {q}" if q else "")
+            wq.set_item_status(video_path, "running")
+            done_n = sum(1 for it in wq.all_items() if it.get("status") == "done")
+            _chunk_step = get_ui_defaults().get("chunk_duration") or 10.25
+            set_session(
+                done_n, total_q, idx, os.path.basename(video_path), "toolbox",
+                chunks=chunk_units(video_path, _chunk_step),
+                chunks_left=queue_chunk_units(
+                    [video_path] + [it.get("path") for it in wq.pending_items()],
+                    _chunk_step,
+                ),
             )
-            log(reason, message_type="warning")
-            _fail_toolbox_item_requeue(
-                wq, video_path, reason, max_attempts=max_attempts, permanent=True
-            )
-            permanent_fail += 1
+        except Exception as e:
+            if wq.stop_requested() or e.__class__.__name__ == "CancelledError":
+                raise
+            _queue_continue_after_error(wq, video_path, e, "Toolbox")
+            _release_between_items()
             continue
-        wq.set_item_status(video_path, "running")
-        done_n = sum(1 for it in wq.all_items() if it.get("status") == "done")
-        _chunk_step = get_ui_defaults().get("chunk_duration") or 10.25
-        set_session(
-            done_n, total_q, idx, os.path.basename(video_path), "toolbox",
-            chunks=chunk_units(video_path, _chunk_step),
-            chunks_left=queue_chunk_units(
-                [video_path] + [it.get("path") for it in wq.pending_items()],
-                _chunk_step,
-            ),
-        )
         t0 = time.time()
         result_path, messages = None, ""
 
@@ -6373,7 +6427,9 @@ def _run_toolbox_work_queue_body(wq, progress):
                 else:
                     permanent_fail += 1
         except Exception as e:
-            log(f"❌ Toolbox error: {e}", message_type="error")
+            if e.__class__.__name__ == "CancelledError":
+                raise
+            log(f"❌ Toolbox error: {e} — queue continues", message_type="error")
             if _toolbox_error_is_permanent(str(e)):
                 q = quarantine_novideo_source(video_path)
                 if q:
@@ -6390,8 +6446,7 @@ def _run_toolbox_work_queue_body(wq, progress):
             else:
                 permanent_fail += 1
         finally:
-            release_processing_vram()
-            clear_session()
+            _release_between_items()
 
         if wq.stop_requested():
             wq.clear_stop()

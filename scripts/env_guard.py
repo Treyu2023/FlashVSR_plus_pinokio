@@ -98,6 +98,7 @@ CRITICAL = [
     "app/teaser.jpg",
     "app/test_busy_heartbeat_metrics.py",
     "app/test_grok_id_dupes.py",
+    "app/test_archive_readonly.py",
     "app/test_pipeline_stage_skip.py",
     "app/test_session_board.py",
     "app/test_thrash_alert.py",
@@ -129,7 +130,7 @@ CRITICAL = [
 
 # Strings that MUST appear in a live custom file. Missing ⇒ stock overwrite.
 MARKERS = {
-    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir", "no size recode", "accurate_rnd+full_chroma_int", "orientation_input_box", "_gt_rife_flags", "resolve_resize_encode", "tonemap=hable", "open_media_folder", "open_video_output_folder", "session_board.render", "session_board.render_job", "session_board.load_stage_colors", "thrash_alert.render_overlay", "_log_queue_scan", "def path_textbox", "HeartbeatTqdm", "handle_scan_grok_outputs", "chrome_copy_number", "apply_saved_gpu_headroom", "gpu_multitask_g", "stop_finish_path", "tick_stop_banner", "alloc_stitch_canvases", "GPU scheduling retired", "_enable_fast_gpu_math", '"randomize_seed": (True'),
+    "app/webui.py": ("def run_group_therapy", "with_pid_name", "gt_before_dir", "no size recode", "accurate_rnd+full_chroma_int", "orientation_input_box", "_gt_rife_flags", "resolve_resize_encode", "tonemap=hable", "open_media_folder", "open_video_output_folder", "session_board.render", "session_board.render_job", "session_board.load_stage_colors", "thrash_alert.render_overlay", "_log_queue_scan", "def path_textbox", "HeartbeatTqdm", "handle_scan_grok_outputs", "chrome_copy_number", "apply_saved_gpu_headroom", "gpu_multitask_g", "stop_finish_path", "tick_stop_banner", "alloc_stitch_canvases", "GPU scheduling retired", "_enable_fast_gpu_math", '"randomize_seed": (True', "clear_readonly_before_archive", "queue continues after item error"),
     "app/stitch_canvas.py": ("class DiskStitchCanvas", "torch.from_file", "release_host_cache"),
     "app/src/models/wan_video_dit.py": ("stream KV clone drops prefix storage",),
     "app/gpu_headroom.py": ("apply_gpu_headroom", "D3DKMTSetProcessSchedulingPriorityClass", "nvidia-smi", "GPU scheduling retired", "always Normal"),
@@ -142,7 +143,7 @@ MARKERS = {
     "app/src/pipelines/flashvsr_tiny.py": ("BusySpan", "show_progress_bar=True", "drop_dit_stream_kv", "park stream KV"),
     "app/group_therapy.py": ("stamp_title_pid", "flatten_gt_pair_folders", "pid_token", "item_in_progress", "version_keys_in_folder", "reclaim_watch_folder", "get_after_lookup", "migrate_legacy_pair_sidecars", "_pairs", "looks_like_finished_export", "moved_after", "mark_finished_exports", "peels unstarted siblings"),
     "app/flashvsr_work_queue.py": ("gt_pair_id", "drop_wrong_stage_pending", "class AddResult", "grok_id_dupes", "first_matching_version", "looks_like_finished_export", "seed_pipeline_fields", "lock_holder_matches"),
-    "app/naming_utils.py": ("clean_original_stem", "step1_filename"),
+    "app/naming_utils.py": ("clean_original_stem", "step1_filename", "clear_readonly_before_archive"),
     "app/toolbox/toolbox.py": ("_choose_interp_factor", "_has_video_stream"),
     "app/src/pipelines/flashvsr_tiny_long.py": (
         "tiny-long pipeline requires output_path",

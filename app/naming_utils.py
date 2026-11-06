@@ -19,6 +19,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -310,6 +311,100 @@ def comparison_video_filename(stem: str) -> str:
 def comparison_image_filename(stem: str) -> str:
     bare = clean_original_stem(stem)
     return f"{bare}_comparison.png"
+
+
+def clear_readonly(path: str) -> None:
+    """Drop the read-only bit so Windows can delete the file.
+
+    ODrive downloads in the watch folder are FILE_ATTRIBUTE_READONLY.
+    A cross-volume move copies the file, then DeleteFile returns WinError 5
+    and the original stays in the watch folder. Marker: clear_readonly_before_archive
+    """
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    except OSError:
+        pass
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        readonly = 0x1
+        invalid = 0xFFFFFFFF
+        get_attrs = ctypes.windll.kernel32.GetFileAttributesW
+        set_attrs = ctypes.windll.kernel32.SetFileAttributesW
+        attrs = get_attrs(str(path))
+        if attrs != invalid and (attrs & readonly):
+            set_attrs(str(path), attrs & ~readonly)
+    except Exception:
+        pass
+
+
+def _same_positive_size(a: str, b: str) -> bool:
+    try:
+        sa = os.path.getsize(a)
+        sb = os.path.getsize(b)
+    except OSError:
+        return False
+    return sa > 0 and sa == sb
+
+
+def _remove_archived_source(source_path: str) -> Optional[str]:
+    """Delete source after the archive copy exists. None means it is gone."""
+    clear_readonly(source_path)
+    try:
+        os.remove(source_path)
+    except OSError as e:
+        if not os.path.exists(source_path):
+            return None
+        return str(e)
+    return None
+
+
+def archive_readonly_source(source_path: str, archive_dir: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Copy ``source_path`` into ``archive_dir`` and delete the source.
+
+    Returns ``(dest, error)``. ``dest`` is set when the archive copy is in place.
+    ``error`` is set when the copy failed, or the copy is there but the source
+    could not be removed. An equal-size file already at the archive name is
+    reused so a failed delete does not write another ``_src_`` copy.
+    """
+    if not source_path or not archive_dir:
+        return None, "missing path"
+    if not os.path.isfile(source_path):
+        return None, "source missing"
+    try:
+        os.makedirs(archive_dir, exist_ok=True)
+    except OSError as e:
+        return None, str(e)
+
+    name = os.path.basename(source_path)
+    canonical = os.path.join(archive_dir, name)
+    if os.path.abspath(source_path) == os.path.abspath(canonical):
+        return canonical, None
+
+    dest = canonical
+    if os.path.isfile(canonical) and _same_positive_size(source_path, canonical):
+        err = _remove_archived_source(source_path)
+        return canonical, err
+
+    if os.path.exists(dest):
+        stem, ext = os.path.splitext(name)
+        dest = os.path.join(
+            archive_dir, f"{stem}_src_{time.strftime('%Y%m%d_%H%M%S')}{ext}"
+        )
+        if os.path.exists(dest):
+            dest = os.path.join(
+                archive_dir,
+                f"{stem}_src_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}{ext}",
+            )
+    try:
+        shutil.copy2(source_path, dest)
+    except OSError as e:
+        return None, str(e)
+    err = _remove_archived_source(source_path)
+    return dest, err
 
 
 def move_to_bin(source_path: str, *, bin_name: str = "Bin") -> Optional[str]:

@@ -136,7 +136,7 @@ MARKERS = {
     "app/gpu_headroom.py": ("apply_gpu_headroom", "D3DKMTSetProcessSchedulingPriorityClass", "nvidia-smi", "GPU scheduling retired", "always Normal"),
     "app/grok_id_index.py": ("extract_grok_ids", "SIZE_TOLERANCE", "screen_folder", "def version_key"),
     "app/src/busy_heartbeat.py": ("class HeartbeatTqdm", "still busy", "STOP ARMED", "tick_stop_banner", "def snapshot", "def set_file_metrics", "file_metrics"),
-    "app/session_board.py": ("def render", "def classify_health", "def save_profile", "load_stage_colors", "gt_upscale_secs", "def now_banner"),
+    "app/session_board.py": ("def render", "def classify_health", "def save_profile", "load_stage_colors", "gt_upscale_secs", "def now_banner", "stall wall is not file time"),
     "app/toolbox/system_monitor.py": ("power.draw", "last_metrics"),
     "app/toolbox/thrash_alert.py": ("def thrash_score", "def render_overlay"),
     "app/toolbox/thrash_config.json": ("thrash_at", "watts_per_util_start"),

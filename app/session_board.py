@@ -697,7 +697,7 @@ def _empty_stats(now: float) -> dict:
         "lifetime_done": 0,
         "last_status": {},
         "file_seconds": [],
-        "file_seconds_v": 2,
+        "file_seconds_v": 3,
         "session_file_seconds": [],
         "step_seconds": [],
         "open_file": None,
@@ -838,9 +838,19 @@ def _bucket_stats(rec: Optional[dict], now: float) -> dict:
     base = _empty_stats(now)
     if not data:
         return base
-    if data.get("file_seconds_v") != 2:
+    if data.get("file_seconds_v") not in (2, 3):
         # One-time trim: entries written before the FV-STOP idle-gap fix carry no marker.
         data["file_seconds"] = []
+        data["session_file_seconds"] = []
+    if data.get("file_seconds_v") != 3:
+        # stall wall is not file time: a frozen stage used to be stored as the whole
+        # open span (hours) even when the GPU work was ~15 minutes or never finished.
+        recent = data.get("recent_files") or []
+        data["file_seconds"] = _scrub_file_times(data.get("file_seconds"), recent)[-40:]
+        data["session_file_seconds"] = _scrub_file_times(
+            data.get("session_file_seconds"), recent
+        )[-500:]
+        data["file_seconds_v"] = 3
     if int(data.get("pid") or 0) != os.getpid():
         base["lifetime_done"] = int(data.get("lifetime_done") or 0) + len(data.get("session_done") or [])
         base["active_profile"] = str(data.get("active_profile") or "")
@@ -881,7 +891,7 @@ def reset_bucket(app_dir, bucket: str, now: Optional[float] = None) -> str:
         # All-time only: the current session's numbers stay.
         rec = _bucket_stats(old, _now(now))
         rec.update({
-            "lifetime_done": 0, "file_seconds": [], "file_seconds_v": 2,
+            "lifetime_done": 0, "file_seconds": [], "file_seconds_v": 3,
             "step_seconds": [], "by_cfg": {}, "recent_files": [], "rollup": _empty_rollup(),
         })
         store["buckets"][bucket] = rec
@@ -955,6 +965,86 @@ def clear_history(app_dir, bucket: str, unlocked: bool = False) -> str:
 
 def _load_stats(app_dir: Path, now: float, bucket: str = "group") -> dict:
     return _bucket_stats(_read_store(app_dir)["buckets"].get(bucket), now)
+
+
+# Unfinished files above this are a frozen stage, not a runtime. A finished file
+# always keeps its own span. Bare samples (no per-file record) above two hours are
+# the same stall class from before recent_files existed.
+_STALL_UNFINISHED_S = 45 * 60
+_STALL_BARE_S = 2 * 3600
+
+
+def charge_file_seconds(entry: dict) -> Optional[float]:
+    """Seconds that belong in the average. None leaves the sample out.
+
+    stall wall is not file time. The board used to close a file with
+    now - started, so a stage that froze after the frames loaded (or after
+    process_s was already ~15 min) was stored as 3–11 hours.
+    """
+    try:
+        wall = float(entry.get("secs") or 0)
+    except (TypeError, ValueError):
+        wall = 0.0
+    try:
+        proc = float(entry.get("process_s") or 0)
+    except (TypeError, ValueError):
+        proc = 0.0
+    try:
+        load = float(entry.get("load_s") or 0)
+    except (TypeError, ValueError):
+        load = 0.0
+    compute = proc + max(0.0, load) if proc > 1 else 0.0
+    finished_at = entry.get("finished")
+    finished = entry.get("ok") is True or (
+        finished_at not in (None, "", False) and not isinstance(finished_at, bool)
+    )
+    if finished:
+        if compute > 1 and wall > compute * 2 + 180:
+            return compute
+        if wall > 1:
+            return wall
+        return compute if compute > 1 else None
+    if compute > 1:
+        return compute
+    if wall > _STALL_UNFINISHED_S:
+        return None
+    if wall > 1:
+        return wall
+    return None
+
+
+def _scrub_file_times(times, recent) -> list:
+    """Replace stored walls with compute time when a recent file explains them."""
+    pairs = []
+    for entry in recent or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            wall = float(entry.get("secs") or 0)
+        except (TypeError, ValueError):
+            continue
+        pairs.append((wall, charge_file_seconds(entry)))
+    out = []
+    for raw in times or []:
+        try:
+            wall = float(raw)
+        except (TypeError, ValueError):
+            continue
+        match = None
+        best = 16.0
+        for recent_wall, charged in pairs:
+            delta = abs(recent_wall - wall)
+            if delta < best:
+                best = delta
+                match = charged
+        if best <= 15:
+            if match is not None and match > 1:
+                out.append(float(match))
+            continue
+        if wall > _STALL_BARE_S or wall <= 1:
+            continue
+        out.append(wall)
+    return out
 
 
 def _add_file_seconds(stats: dict, secs: float) -> None:
@@ -1524,7 +1614,23 @@ def _record_file(stats: dict, open_file: dict, now: float) -> None:
 
 
 def _close_file(stats: dict, open_file: dict, now: float) -> None:
-    _add_file_seconds(stats, max(0.0, now - float(open_file["started"])))
+    metrics = dict(open_file.get("metrics") or {})
+    started = float(open_file.get("started") or now)
+    wall = max(0.0, now - started)
+    if metrics.get("finished") not in (None, "", False):
+        try:
+            wall = max(0.0, float(metrics["finished"]) - started)
+        except (TypeError, ValueError):
+            pass
+    charged = charge_file_seconds({
+        "secs": wall,
+        "process_s": metrics.get("process_s"),
+        "load_s": metrics.get("load_s"),
+        "ok": metrics.get("ok"),
+        "finished": metrics.get("finished"),
+    })
+    if charged is not None:
+        _add_file_seconds(stats, charged)
     if not open_file.get("recorded"):
         _record_file(stats, open_file, now)
 
@@ -2339,7 +2445,7 @@ def _profiles_path(app_dir: Path) -> Path:
 
 def _builtin_profiles() -> Dict[str, dict]:
     clarity = {
-        "note": "Current 4090 Group Therapy. Tile 320, quality 10, 10.25s chunks, RIFE 4×, groups of 5.",
+        "note": "Current 4090 Group Therapy. Tile 320 overlap 32, sparse 1.0, KV 6, quality 10, 10.25s chunks, RIFE 4×, groups of 5.",
         "mode": "tiny",
         "model_version": "v1.1",
         "scale": 4,
@@ -2352,8 +2458,8 @@ def _builtin_profiles() -> Dict[str, dict]:
         "chunk_duration": 10.25,
         "quality": 10,
         "sparse_ratio": 1.0,
-        "local_range": 7,
-        "kv_ratio": 3,
+        "local_range": 11,
+        "kv_ratio": 6,
         "attention_mode": "sage",
         "dtype": "bf16",
         "color_fix": True,
@@ -2374,6 +2480,8 @@ def _builtin_profiles() -> Dict[str, dict]:
         "tile_overlap": 16,
         "quality": 7,
         "sparse_ratio": 2.0,
+        "local_range": 7,
+        "kv_ratio": 3,
         "chunk_duration": 8.0,
         "gt_group_size": 8,
         "gt_rife_mode": "2x Frames",
@@ -2386,6 +2494,8 @@ def _builtin_profiles() -> Dict[str, dict]:
         "tile_overlap": 48,
         "gt_group_size": 3,
         "sparse_ratio": 1.0,
+        "local_range": 7,
+        "kv_ratio": 3,
         "quality": 10,
     })
     return {

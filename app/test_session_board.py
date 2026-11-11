@@ -123,7 +123,7 @@ def test_migration_and_bak() -> None:
         st = _store(app)
         assert st["v"] == 3
         g = st["buckets"]["group"]
-        assert g["file_seconds_v"] == 2 and g["file_seconds"] == [100.0, 120.0]
+        assert g["file_seconds_v"] == 3 and g["file_seconds"] == [100.0, 120.0]
         assert g["lifetime_done"] == 7
         bak = out / "session_board_stats.v2.bak.json"
         assert json.loads(bak.read_text(encoding="utf-8")) == flat
@@ -276,6 +276,40 @@ def test_sessions() -> None:
         assert up["session_file_seconds"] == [] and up["started"] == t + 10
         assert len(up["file_seconds"]) == 10 + sb.SESSION_ETA_MIN
         assert sb._load_stats(app, t, "image")["session_file_seconds"] == [5.0]
+
+
+def test_stall_wall_is_not_file_time() -> None:
+    import os
+    assert sb.charge_file_seconds({"secs": 40015, "process_s": 780, "load_s": 6, "ok": None}) == 786
+    assert sb.charge_file_seconds({"secs": 11657, "process_s": 0, "ok": None, "frames": 246}) is None
+    assert sb.charge_file_seconds({"secs": 1132, "process_s": 1176, "ok": True}) == 1132
+    assert sb.charge_file_seconds({"secs": 60}) == 60
+    with tempfile.TemporaryDirectory() as tmp:
+        app = Path(tmp)
+        out = app / "outputs"
+        out.mkdir(parents=True)
+        recent = [
+            {"name": "stalled.mp4", "secs": 40015, "process_s": 780, "load_s": 6, "ok": None},
+            {"name": "frozen.mp4", "secs": 11657, "process_s": 0, "ok": None},
+            {"name": "done.mp4", "secs": 1132, "process_s": 1176, "ok": True},
+        ]
+        hist = {
+            "pid": os.getpid(),
+            "lifetime_done": 3,
+            "file_seconds": [40015, 11657, 1132, 900],
+            "file_seconds_v": 2,
+            "session_file_seconds": [40015, 11657, 1132],
+            "recent_files": recent,
+        }
+        (out / "session_board_stats.json").write_text(
+            json.dumps({"v": 3, "buckets": {"group": hist}}), encoding="utf-8"
+        )
+        _queue(app, "group", [])
+        _lock(app, "group")
+        got = sb._load_stats(app, 50.0, "group")
+        assert got["file_seconds_v"] == 3
+        assert got["file_seconds"] == [786, 1132, 900]
+        assert got["session_file_seconds"] == [786, 1132]
 
 
 def test_eta_threshold() -> None:
@@ -709,6 +743,7 @@ if __name__ == "__main__":
     test_tick_writes_only_on_change()
     test_in_file_archive_migrates()
     test_sessions()
+    test_stall_wall_is_not_file_time()
     test_eta_threshold()
     test_v3_to_v4_bak_once()
     test_v2_still_v2_bak()

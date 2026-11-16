@@ -1,6 +1,6 @@
 # FlashVSR+ Pinokio — Custom Configuration & Code Changes
 
-**Last updated:** 2026-11-11  
+**Last updated:** 2026-11-16  
 **Install path:** `C:\pinokio\api\FlashVSR_plus_pinokio.git\app`  
 **Purpose:** Persistent record of customizations applied outside stock FlashVSR (survives app rollback/reinstall). Re-apply or merge these after updating the Pinokio launcher.
 
@@ -10,6 +10,7 @@
 
 | Date | Summary |
 |------|---------|
+| 2026-11-16 | **Duplicates parked before inference.** Video, image, and Group Therapy scan the source folder before any file is inferred. A copy of a take already on disk (same UUID + Chrome `(N)`, same byte size as an archived original, catalog match, or an output that already exists) is marked `DUPE_` and moved into `<source>\duplicates` with a line in `MARKED.txt`. Extra copies in the folder keep one file. A different Chrome `(N)` with a different size stays and is inferred. Needs a FlashVSR restart. |
 | 2026-11-11 | **Session average ignores stall wall clock.** A file left open while a stage was frozen (frames loaded, `process_s` still 0, or compute already done) was stored as 3–11 hours and pulled the Group Therapy average to about 2.5 h. The average now uses finish time or `process_s`, and drops an unfinished file that sat more than 45 minutes with no compute. Needs a FlashVSR restart after the current file; do not restart mid-file. |
 | 2026-10-30 | **Reinstall puts the fork back.** Update / Install / Start still reapply custom files. A stock `webui.py` now also restores the rest of the fork (RIFE, pipelines, tests, docs). `webui_config` and `job_profiles.json` come back when they are missing. Reset unlinks `app\models` → `O:\MODELS` and `app\outputs` → `D:\OUTPUTS\FlashVSR` before deleting `app\`, and Install recreates those junctions. A copy lives in `%LOCALAPPDATA%\FAFO\FlashVSR-preserve`. The logon task `FAFO\FlashVSR Restore` checks out `mine/main` when a Pinokio reinstall left the stock launcher and `webui.py` is not running. |
 | 2026-10-28 | **Stale queue lock:** Group Therapy stayed “running” after its process died because Windows reused that pid (svchost at 4:27 PM). A lock now counts only while that pid is still python and started before the lock. |

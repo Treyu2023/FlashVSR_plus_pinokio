@@ -23,7 +23,7 @@ MEDIA_EXTS = VIDEO_EXTS | IMAGE_EXTS
 
 SKIP_DIR_NAMES = {
     "novideo", "highfps", "over4k", "work", "failed", "queue_logs",
-    "__pycache__", ".git", "node_modules",
+    "__pycache__", ".git", "node_modules", "duplicates",
 }
 
 # grok-video-<uuid>  (Chrome "(2)" download copies share this id)

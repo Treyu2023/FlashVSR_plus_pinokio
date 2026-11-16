@@ -117,6 +117,57 @@ def test_reclaim_moves_export_keeps_tiny() -> None:
         assert "_PID_" in after_files[0].name
 
 
+def test_reclaim_parks_duplicate_instead_of_deleting() -> None:
+    gid = "grok-video-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        inbox = root / "inbox"
+        before = root / "before"
+        after = root / "after"
+        inbox.mkdir()
+        before.mkdir()
+        after.mkdir()
+        blob = b"x" * (40 * 1024)
+        (before / f"{gid}_PID_abcd1234.mp4").write_bytes(blob)
+        (after / f"{gid}_Upscaled_PID_abcd1234.mp4").write_bytes(blob + b"up")
+        redo = inbox / f"{gid}.mp4"
+        redo.write_bytes(blob)
+        _age(redo)
+        rec = gt.reclaim_watch_folder(str(inbox), str(before), str(after))
+        assert rec["moved_duplicates"] == 1, rec
+        assert rec["moved_before"] == 0
+        assert not redo.exists()
+        parked = list((inbox / "duplicates").glob("*.mp4"))
+        assert len(parked) == 1
+        assert parked[0].name == f"DUPE_{gid}.mp4"
+        assert (inbox / "duplicates" / "MARKED.txt").is_file()
+
+
+def test_reclaim_still_archives_original_to_before() -> None:
+    gid = "grok-video-bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee"
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        inbox = root / "inbox"
+        before = root / "before"
+        after = root / "after"
+        inbox.mkdir()
+        before.mkdir()
+        after.mkdir()
+        blob = b"y" * (40 * 1024)
+        (after / f"{gid}_Upscaled_PID_abcd1234.mp4").write_bytes(blob + b"up")
+        src = inbox / f"{gid}.mp4"
+        src.write_bytes(blob)
+        _age(src)
+        rec = gt.reclaim_watch_folder(str(inbox), str(before), str(after))
+        assert rec["moved_before"] == 1, rec
+        assert rec["moved_duplicates"] == 0
+        assert not src.exists()
+        assert not (inbox / "duplicates").exists()
+        archived = list(before.glob("*.mp4"))
+        assert len(archived) == 1
+        assert "_PID_" in archived[0].name
+
+
 def test_mark_finished_exports_queue_row() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -351,6 +402,8 @@ if __name__ == "__main__":
     test_group_keeps_tiny_skips_export()
     test_video_queue_skips_all_pipeline_outputs()
     test_reclaim_moves_export_keeps_tiny()
+    test_reclaim_parks_duplicate_instead_of_deleting()
+    test_reclaim_still_archives_original_to_before()
     test_mark_finished_exports_queue_row()
     test_bare_stage_does_not_beat_newest()
     test_unstarted_sibling_does_not_beat_newest()

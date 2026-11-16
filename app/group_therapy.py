@@ -31,6 +31,7 @@ from flashvsr_work_queue import (
     looks_like_finished_export,
     looks_like_rife_output,
     looks_like_upscaled_output,
+    park_duplicate,
 )
 
 _PAIR_ID_RE = re.compile(r"^[0-9a-f]{8}$")
@@ -52,6 +53,7 @@ _SKIP_DIR_NAMES = {
     "bin",
     "crushed_old_fix",
     "_pairs",
+    "duplicates",
 }
 
 STAGES = ("upscale", "rife1", "rife2", "export")
@@ -1108,22 +1110,36 @@ def reclaim_watch_folder(
     still need RIFE/export).
 
     If After already has this Imagine take (UUID + Chrome N):
-      - Before already has it → delete the inbox copy
+      - Before already has it → mark the inbox copy DUPE_ and move it to
+        <watch>/duplicates (not deleted, not inferred again)
       - else move the original into Before, reusing the After PID
-    Same-size Chrome re-downloads of an archived original are deleted.
-    Finished Toolbox exports are moved to After (not reprocessed, not deleted).
-    Leftover upscaled/RIFE names are deleted only when After already has that take.
+    Same-size Chrome re-downloads of an archived original go to duplicates.
+    Finished Toolbox exports are moved to After (not reprocessed).
+    Leftover upscaled/RIFE names go to duplicates only when After already has that take.
     """
     stats = {
         "scanned": 0,
         "moved_before": 0,
         "moved_after": 0,
+        "moved_duplicates": 0,
+        "park_errors": 0,
         "deleted_already_paired": 0,
         "deleted_same_size": 0,
         "deleted_intermediate": 0,
         "kept_partial": 0,
         "kept_unprocessed": 0,
     }
+
+    def _park(path: str, reason: str) -> None:
+        dest = None
+        try:
+            dest = park_duplicate(watch_dir, path, reason)
+        except Exception:
+            dest = None
+        if dest:
+            stats["moved_duplicates"] += 1
+        else:
+            stats["park_errors"] += 1
     if not watch_dir or not os.path.isdir(watch_dir):
         return stats
     os.makedirs(before_dir, exist_ok=True)
@@ -1171,19 +1187,11 @@ def reclaim_watch_folder(
 
         if looks_like_finished_export(ap):
             if vk and vk in after_map:
-                try:
-                    os.remove(ap)
-                    stats["deleted_already_paired"] += 1
-                except OSError:
-                    pass
+                _park(ap, "finished export already in After")
                 continue
             existing = find_after_named_like(after_dir, p.name)
             if existing:
-                try:
-                    os.remove(ap)
-                    stats["deleted_already_paired"] += 1
-                except OSError:
-                    pass
+                _park(ap, "finished export already in After")
                 continue
             try:
                 dest = adopt_finished_export(ap, after_dir)
@@ -1196,11 +1204,7 @@ def reclaim_watch_folder(
 
         if looks_like_upscaled_output(ap) or looks_like_rife_output(ap):
             if vk and vk in after_map:
-                try:
-                    os.remove(ap)
-                    stats["deleted_intermediate"] += 1
-                except OSError:
-                    pass
+                _park(ap, "upscaled/RIFE copy of a take already in After")
                 continue
             # After does not have this take yet — keep so remaining stages can run
             stats["kept_partial"] += 1
@@ -1210,11 +1214,7 @@ def reclaim_watch_folder(
         if vk and vk in after_map:
             after_p = after_map[vk]
             if vk in before_map:
-                try:
-                    os.remove(ap)
-                    stats["deleted_already_paired"] += 1
-                except OSError:
-                    pass
+                _park(ap, "same Imagine take already in Before and After")
                 continue
             pid = pair_id_from_name(after_p) or make_pair_id()
             try:
@@ -1239,11 +1239,7 @@ def reclaim_watch_folder(
         except OSError:
             sz = 0
         if sz > 0 and sz in before_sizes:
-            try:
-                os.remove(ap)
-                stats["deleted_same_size"] += 1
-            except OSError:
-                pass
+            _park(ap, "same byte size as an archived original")
             continue
         kept.append(ap)
 
@@ -1270,11 +1266,7 @@ def reclaim_watch_folder(
         for extra in group:
             if os.path.normcase(extra) == os.path.normcase(winner):
                 continue
-            try:
-                os.remove(extra)
-                stats["deleted_same_size"] += 1
-            except OSError:
-                pass
+            _park(extra, "same-size copy in this folder")
     for ap in kept:
         try:
             sz = os.path.getsize(ap)

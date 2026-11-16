@@ -8,7 +8,11 @@ import tempfile
 import time
 
 import grok_id_index as g
-from flashvsr_work_queue import FlashVSRWorkQueue, ST_PENDING
+from flashvsr_work_queue import (
+    FlashVSRWorkQueue,
+    ST_PENDING,
+    sweep_source_duplicates,
+)
 
 
 def _age(path: Path) -> None:
@@ -193,6 +197,107 @@ def test_add_paths_queues_near_size_other_take() -> None:
         assert scan.added == 1
 
 
+def test_sweep_parks_done_take_and_keeps_other_chrome() -> None:
+    gid = "grok-video-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        inbox = root / "inbox"
+        before = root / "before"
+        inbox.mkdir()
+        before.mkdir()
+        blob = b"x" * (40 * 1024)
+        (before / f"{gid}.mp4").write_bytes(blob)
+        redo = inbox / f"{gid}.mp4"
+        other = inbox / f"{gid} (2).mp4"
+        extra = inbox / f"{gid} (2) extra.mp4"
+        redo.write_bytes(blob)
+        other.write_bytes(blob + b"22")
+        extra.write_bytes(blob + b"22")
+        for p in list(inbox.iterdir()) + list(before.iterdir()):
+            _age(p)
+        app = root / "app"
+        app.mkdir()
+        wq = FlashVSRWorkQueue(str(app), name="video", extensions={".mp4"}, label="t")
+        data = wq.load()
+        data["items"] = [{
+            "path": str(redo),
+            "status": ST_PENDING,
+            "output": None,
+            "error": None,
+            "size": redo.stat().st_size,
+        }]
+        wq.save(data)
+        stats = sweep_source_duplicates(
+            str(inbox),
+            extensions={".mp4"},
+            known_folders=[str(before)],
+            archive_folders=[str(before)],
+            queue_items=wq.all_items(),
+        )
+        assert stats["moved"] == 2, stats
+        assert not redo.exists()
+        left = [p.name for p in inbox.glob("*.mp4")]
+        assert left == [other.name] or left == [extra.name], left
+        parked = sorted(p.name for p in (inbox / "duplicates").glob("*.mp4"))
+        assert f"DUPE_{gid}.mp4" in parked, parked
+        assert sum("(2)" in name for name in parked) == 1, parked
+        marked = (inbox / "duplicates" / "MARKED.txt").read_text(encoding="utf-8")
+        assert "DUPE_" in marked
+        assert "same Imagine take" in marked
+        assert wq.drop_sources(stats["moved_from"]) == 1
+        assert wq.load()["items"] == []
+
+
+def test_sweep_keeps_other_chrome_take() -> None:
+    gid = "grok-video-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        inbox = root / "inbox"
+        before = root / "before"
+        inbox.mkdir()
+        before.mkdir()
+        blob = b"x" * (40 * 1024)
+        (before / f"{gid}.mp4").write_bytes(blob)
+        other = inbox / f"{gid} (1).mp4"
+        other.write_bytes(blob + b"other-take")
+        _age(other)
+        _age(before / f"{gid}.mp4")
+        stats = sweep_source_duplicates(
+            str(inbox),
+            extensions={".mp4"},
+            known_folders=[str(before)],
+            archive_folders=[str(before)],
+        )
+        assert stats["moved"] == 0, stats
+        assert other.exists()
+        assert not (inbox / "duplicates").exists()
+
+
+def test_sweep_trusts_already_done_callback() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        inbox = root / "inbox"
+        inbox.mkdir()
+        name = "interview_take_without_grok_id_long_name.mp4"
+        src = inbox / name
+        src.write_bytes(b"v" * (40 * 1024))
+        _age(src)
+        evidence = root / "already_upscaled.mp4"
+        evidence.write_bytes(b"o" * (80 * 1024))
+
+        def done(path: str):
+            return str(evidence) if name in path else None
+
+        stats = sweep_source_duplicates(
+            str(inbox),
+            extensions={".mp4"},
+            already_done=done,
+        )
+        assert stats["moved"] == 1, stats
+        assert not src.exists()
+        assert (inbox / "duplicates" / f"DUPE_{name}").is_file()
+
+
 if __name__ == "__main__":
     test_extract_and_rank()
     test_add_paths_keeps_distinct_imagine_takes()
@@ -200,4 +305,7 @@ if __name__ == "__main__":
     test_preflight_keeps_distinct_takes()
     test_match_file_keeps_other_chrome_take()
     test_add_paths_queues_near_size_other_take()
+    test_sweep_parks_done_take_and_keeps_other_chrome()
+    test_sweep_keeps_other_chrome_take()
+    test_sweep_trusts_already_done_callback()
     print("ok")

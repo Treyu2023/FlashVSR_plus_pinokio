@@ -11,11 +11,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import stat
 import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".m4v", ".wmv", ".gif", ".ts", ".mts", ".m2ts"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}
@@ -34,9 +36,14 @@ QUEUE_LABELS = {
 }
 
 # Nested folders hygiene / pipeline never queues from
+# duplicates/ holds copies parked before inference (DUPE_ prefix + MARKED.txt).
+DUPLICATES_DIR_NAME = "duplicates"
+DUPE_NAME_PREFIX = "DUPE_"
+
 SKIP_PARENT_DIRS = {
     "novideo", "highfps", "over4k", "bin", "at_60fps",
     "done", "archive", "work", "failed", "completed",
+    DUPLICATES_DIR_NAME,
 }
 
 # Already-upscaled / step-1 outputs — video / image queues must not 4× these again
@@ -221,6 +228,345 @@ def _path_in_sidecar_dir(path: str) -> bool:
     except Exception:
         return False
     return bool(parts & SKIP_PARENT_DIRS)
+
+
+def _direct_child(path: str, folder: str) -> bool:
+    """True when path is a file sitting directly in folder (not a sidecar)."""
+    if not path or not folder:
+        return False
+    try:
+        parent = os.path.normcase(os.path.abspath(os.path.dirname(path)))
+        root = os.path.normcase(os.path.abspath(folder))
+    except OSError:
+        return False
+    return parent == root
+
+
+def duplicates_dir(source_folder: str) -> str:
+    return os.path.join(source_folder, DUPLICATES_DIR_NAME)
+
+
+def _unique_marked_name(dest_dir: str, original_name: str) -> str:
+    base = original_name
+    if not base.upper().startswith(DUPE_NAME_PREFIX):
+        base = DUPE_NAME_PREFIX + base
+    candidate = os.path.join(dest_dir, base)
+    if not os.path.exists(candidate):
+        return candidate
+    stem, ext = os.path.splitext(base)
+    n = 2
+    while True:
+        candidate = os.path.join(dest_dir, f"{stem}__{n}{ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
+
+
+def park_duplicate(source_folder: str, path: str, reason: str) -> Optional[str]:
+    """
+    Move a source-folder file into <source>/duplicates and mark it.
+
+    The mark is a DUPE_ filename prefix plus a line in duplicates/MARKED.txt.
+    Only a direct child of source_folder is moved, so archives and outputs stay put.
+    Returns the new path, or None when the file was left in place.
+    """
+    if not source_folder or not path or not os.path.isfile(path):
+        return None
+    if not _direct_child(path, source_folder):
+        return None
+    if _path_in_sidecar_dir(path):
+        return None
+    dest_dir = duplicates_dir(source_folder)
+    os.makedirs(dest_dir, exist_ok=True)
+    original_name = os.path.basename(path)
+    dest = _unique_marked_name(dest_dir, original_name)
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    except OSError:
+        pass
+    shutil.move(path, dest)
+    note = str(reason or "duplicate").replace("\t", " ").replace("\n", " ").strip()
+    line = f"{_now_iso()}\t{os.path.basename(dest)}\t{original_name}\t{note}\n"
+    try:
+        with open(os.path.join(dest_dir, "MARKED.txt"), "a", encoding="utf-8") as handle:
+            handle.write(line)
+    except OSError:
+        pass
+    return dest
+
+
+def _remember_size(bucket: Dict[int, str], size: int, path: str) -> None:
+    if size > 0 and size not in bucket and path:
+        bucket[size] = path
+
+
+def _remember_version(bucket: Dict[Tuple[str, int], str], path: str) -> None:
+    if not path:
+        return
+    try:
+        from grok_id_index import version_key
+        vk = version_key(Path(path).name)
+    except Exception:
+        return
+    if vk and vk not in bucket:
+        bucket[vk] = path
+
+
+def sweep_source_duplicates(
+    source_folder: str,
+    *,
+    extensions: Set[str],
+    known_folders: Optional[Sequence[str]] = None,
+    archive_folders: Optional[Sequence[str]] = None,
+    queue_items: Optional[Sequence[Dict[str, Any]]] = None,
+    grok_index: Optional[Dict[str, Any]] = None,
+    already_done: Optional[Callable[[str], Optional[str]]] = None,
+) -> Dict[str, Any]:
+    """
+    Before inference, park source files that would redo finished work.
+
+    A file is a duplicate when it is the same Imagine take (UUID + Chrome N),
+    the same byte size as an archived or already-queued original, a catalog
+    match, or an output that already exists. Extra copies inside the folder
+    keep one canonical name. Different Chrome (N) sizes stay. Pipeline
+    leftovers (upscaled / RIFE / finished export) stay for the stage that
+    still owns them.
+
+    Parked files land in <source>/duplicates with a DUPE_ prefix.
+    """
+    stats: Dict[str, Any] = {
+        "scanned": 0,
+        "moved": 0,
+        "kept": 0,
+        "errors": 0,
+        "moved_from": [],
+        "names": [],
+    }
+    if not source_folder or not os.path.isdir(source_folder):
+        return stats
+
+    ext = {e.lower() if str(e).startswith(".") else f".{e}".lower() for e in extensions}
+    known_versions: Dict[Tuple[str, int], str] = {}
+    archive_sizes: Dict[int, str] = {}
+    done_sizes: Dict[int, str] = {}
+    outside_sizes: Dict[int, str] = {}
+    running: Set[str] = set()
+
+    try:
+        from grok_id_index import (
+            match_file,
+            pick_canonical_path,
+            version_key,
+            version_keys_in_folder,
+        )
+    except Exception:
+        match_file = None  # type: ignore
+        pick_canonical_path = None  # type: ignore
+        version_key = None  # type: ignore
+        version_keys_in_folder = None  # type: ignore
+
+    if version_keys_in_folder:
+        for folder in known_folders or ():
+            try:
+                known_versions.update(version_keys_in_folder(str(folder or "")))
+            except Exception:
+                continue
+    for folder in archive_folders or ():
+        if not folder or not os.path.isdir(folder):
+            continue
+        try:
+            entries = list(Path(folder).iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_file() or entry.suffix.lower() not in ext:
+                continue
+            if looks_like_pipeline_output(str(entry)):
+                _remember_version(known_versions, str(entry))
+                continue
+            _remember_size(archive_sizes, _file_size(entry), str(entry))
+            _remember_version(known_versions, str(entry))
+
+    for it in queue_items or ():
+        path = str(it.get("path") or "")
+        status = it.get("status") or ST_PENDING
+        if status == ST_RUNNING and path:
+            running.add(_norm(path))
+        size = _item_size(it)
+        output = str(it.get("output") or "")
+        finished = status == ST_DONE or (bool(output) and os.path.isfile(output))
+        if finished:
+            _remember_version(known_versions, path or output)
+            _remember_size(done_sizes, size, path or output or "done")
+            continue
+        if path and not _direct_child(path, source_folder):
+            if status in (ST_PENDING, ST_RUNNING):
+                _remember_version(known_versions, path)
+                _remember_size(outside_sizes, size, path)
+
+    try:
+        entries = [p for p in Path(source_folder).iterdir() if p.is_file()]
+    except OSError:
+        return stats
+
+    candidates: List[str] = []
+    for entry in entries:
+        if entry.suffix.lower() not in ext:
+            continue
+        ap = str(entry)
+        stats["scanned"] += 1
+        if _norm(ap) in running:
+            stats["kept"] += 1
+            continue
+        if looks_like_pipeline_output(ap):
+            stats["kept"] += 1
+            continue
+        size = _file_size(ap)
+        if size < _MIN_QUEUE_BYTES:
+            stats["kept"] += 1
+            continue
+        try:
+            age = time.time() - os.path.getmtime(ap)
+        except OSError:
+            age = 999
+        if age < _RECENT_WRITE_SEC:
+            stats["kept"] += 1
+            continue
+        candidates.append(ap)
+
+    def _other(bucket_path: str, path: str) -> bool:
+        return bool(bucket_path) and _norm(bucket_path) != _norm(path)
+
+    parked: Set[str] = set()
+    reasons: Dict[str, str] = {}
+
+    def _flag(path: str, reason: str) -> None:
+        key = _norm(path)
+        if key in parked:
+            return
+        parked.add(key)
+        reasons[key] = reason
+
+    for ap in candidates:
+        size = _file_size(ap)
+        name = Path(ap).name
+        vk = None
+        if version_key:
+            try:
+                vk = version_key(name)
+            except Exception:
+                vk = None
+        if vk and vk in known_versions and _other(known_versions[vk], ap):
+            _flag(ap, "same Imagine take already on disk")
+            continue
+        if grok_index and match_file is not None:
+            try:
+                hit = match_file(ap, grok_index)
+            except Exception:
+                hit = None
+            if hit:
+                orig = str(hit.get("original_path") or "")
+                outs = [
+                    o for o in (hit.get("outputs") or [])
+                    if isinstance(o, dict) and o.get("path")
+                ]
+                same_orig = bool(orig) and _norm(orig) == _norm(ap)
+                if same_orig and not outs:
+                    hit = None
+                elif same_orig and outs:
+                    _flag(ap, "already processed (catalog has an output)")
+                    continue
+                elif hit:
+                    _flag(ap, str(hit.get("reason") or "catalog duplicate"))
+                    continue
+        if size > 0 and size in archive_sizes and _other(archive_sizes[size], ap):
+            _flag(ap, "same byte size as an archived original")
+            continue
+        if size > 0 and size in done_sizes and _other(done_sizes[size], ap):
+            _flag(ap, "same byte size as an already-finished file")
+            continue
+        if size > 0 and size in outside_sizes and _other(outside_sizes[size], ap):
+            _flag(ap, "same byte size as a file already queued")
+            continue
+        if already_done is not None:
+            try:
+                evidence = already_done(ap)
+            except Exception:
+                evidence = None
+            if evidence and _other(str(evidence), ap):
+                _flag(ap, f"already processed → {Path(str(evidence)).name}")
+
+    survivors = [ap for ap in candidates if _norm(ap) not in parked]
+
+    def _keep_one(group: List[str]) -> str:
+        if pick_canonical_path:
+            try:
+                winner = pick_canonical_path(group)
+                if winner:
+                    return winner
+            except Exception:
+                pass
+        return max(group, key=lambda p: (_file_mtime(p), p.lower()))
+
+    if version_key and survivors:
+        by_ver: Dict[Tuple[str, int], List[str]] = {}
+        no_id: List[str] = []
+        for ap in survivors:
+            try:
+                vk = version_key(Path(ap).name)
+            except Exception:
+                vk = None
+            if vk:
+                by_ver.setdefault(vk, []).append(ap)
+            else:
+                no_id.append(ap)
+        survivors = list(no_id)
+        for group in by_ver.values():
+            if len(group) == 1:
+                survivors.append(group[0])
+                continue
+            winner = _keep_one(group)
+            survivors.append(winner)
+            for extra in group:
+                if _norm(extra) == _norm(winner):
+                    continue
+                _flag(extra, "extra copy of the same Imagine take")
+
+    by_size: Dict[int, List[str]] = {}
+    no_size: List[str] = []
+    for ap in survivors:
+        size = _file_size(ap)
+        if size > 0:
+            by_size.setdefault(size, []).append(ap)
+        else:
+            no_size.append(ap)
+    survivors = list(no_size)
+    for group in by_size.values():
+        if len(group) == 1:
+            survivors.append(group[0])
+            continue
+        winner = _keep_one(group)
+        survivors.append(winner)
+        for extra in group:
+            if _norm(extra) == _norm(winner):
+                continue
+            _flag(extra, "same-size copy in this folder")
+
+    for ap in candidates:
+        if _norm(ap) not in parked:
+            continue
+        try:
+            dest = park_duplicate(source_folder, ap, reasons.get(_norm(ap), "duplicate"))
+        except Exception:
+            dest = None
+        if dest:
+            stats["moved"] += 1
+            stats["moved_from"].append(ap)
+            stats["names"].append(os.path.basename(dest))
+        else:
+            stats["errors"] += 1
+    stats["kept"] += len([ap for ap in candidates if _norm(ap) not in parked and os.path.isfile(ap)])
+    return stats
 
 
 def _now_iso() -> str:
@@ -1111,6 +1457,25 @@ class FlashVSRWorkQueue:
         removed = before - len(data["items"])
         self.save(data)
         return removed
+
+    def drop_sources(self, paths: Sequence[str]) -> int:
+        """Drop non-running rows whose source was parked as a duplicate."""
+        wanted = {_norm(p) for p in paths if p}
+        if not wanted:
+            return 0
+        data = self.load()
+        kept: List[Dict[str, Any]] = []
+        dropped = 0
+        for it in data.get("items") or []:
+            key = _norm(it.get("path") or "")
+            if key in wanted and it.get("status") != ST_RUNNING:
+                dropped += 1
+                continue
+            kept.append(it)
+        if dropped:
+            data["items"] = kept
+            self.save(data)
+        return dropped
 
     def preflight_before_start(
         self,

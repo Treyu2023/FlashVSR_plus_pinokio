@@ -99,6 +99,7 @@ from flashvsr_work_queue import (
     AddResult,
     queue_runner_alive,
     release_finished_stop,
+    sweep_source_duplicates,
 )
 import grok_id_index
 import group_therapy as gt
@@ -3824,17 +3825,14 @@ def _run_group_therapy_body(
         rec = gt.reclaim_watch_folder(watch_folder, before_dir, after_dir)
         moved = rec.get("moved_before", 0)
         moved_after = rec.get("moved_after", 0)
-        dropped = (
-            rec.get("deleted_already_paired", 0)
-            + rec.get("deleted_same_size", 0)
-            + rec.get("deleted_intermediate", 0)
-        )
-        if moved or moved_after or dropped:
+        dupes_moved = rec.get("moved_duplicates", 0)
+        if moved or moved_after or dupes_moved or rec.get("park_errors"):
             log(
                 "🧹 Watch reclaim: "
                 f"{moved} original(s) → Pre Scaled, "
                 f"{moved_after} already-exported final(s) → Ready for CIV, "
-                f"{dropped} already-done/duplicate/intermediate deleted, "
+                f"{dupes_moved} duplicate(s) marked DUPE_ and moved to duplicates\\, "
+                f"{rec.get('park_errors', 0)} duplicate(s) left in place, "
                 f"{rec.get('kept_partial', 0)} partial(s) kept for remaining stages, "
                 f"{rec.get('kept_unprocessed', 0)} unprocessed left in Downloads",
                 message_type="info",
@@ -3845,6 +3843,14 @@ def _run_group_therapy_body(
             watch_folder,
             "watch",
             hygiene_scan_folder(watch_folder, role="watch", scale=int(scale or 4)),
+        )
+        _screen_source_duplicates(
+            wq,
+            watch_folder,
+            extensions=VIDEO_EXTS,
+            known_folders=[before_dir, after_dir],
+            archive_folders=[before_dir],
+            already_done=lambda p: gt.find_existing_pair(after_dir, {"path": p}),
         )
         scan = wq.add_folder(
             watch_folder,
@@ -4681,7 +4687,8 @@ def _run_flashvsr_work_queue_body(
     ).strip()
     handoff = (ui.get("batch_upscale_handoff_dir") or paths["ready_toolbox"]).strip()
 
-    # Auto-pick up new downloads from the watch folder each Start / Resume
+    # Auto-pick up new downloads from the watch folder each Start / Resume.
+    # Duplicate screen runs after stuck rows are reset and before any file is inferred.
     if watch_folder and os.path.isdir(watch_folder):
         _log_hygiene(
             watch_folder,
@@ -4692,13 +4699,38 @@ def _run_flashvsr_work_queue_body(
                 scale=int(scale or ui.get("scale") or 4),
             ),
         )
+    elif watch_folder:
+        log(f"Watch folder missing (create it or fix path): {watch_folder}", message_type="warning")
+
+    stuck = wq.reset_stuck_running()
+    if stuck:
+        log(f"Re-queued {stuck} interrupted (was running) item(s)", message_type="info")
+
+    if watch_folder and os.path.isdir(watch_folder):
+        _screen_source_duplicates(
+            wq,
+            watch_folder,
+            extensions=VIDEO_EXTS,
+            known_folders=[
+                source_archive,
+                handoff,
+                paths.get("ready_civ", ""),
+                paths.get("ready_toolbox", ""),
+            ],
+            archive_folders=[source_archive],
+            already_done=lambda p: find_matching_deliverable(
+                p,
+                handoff,
+                paths.get("ready_toolbox", ""),
+                get_output_dir(),
+                prefer_exported=False,
+            ),
+        )
         scan = wq.add_folder(
             watch_folder,
             known_id_folders=[source_archive, handoff, paths.get("ready_civ", "")],
         )
         _log_queue_scan("Watch folder", watch_folder, scan, noun="video")
-    elif watch_folder:
-        log(f"Watch folder missing (create it or fix path): {watch_folder}", message_type="warning")
 
     dropped = wq.drop_wrong_stage_pending()
     if dropped:
@@ -4707,10 +4739,6 @@ def _run_flashvsr_work_queue_body(
             f"those belong on Toolbox (RIFE + export), not another FlashVSR pass",
             message_type="warning",
         )
-
-    stuck = wq.reset_stuck_running()
-    if stuck:
-        log(f"Re-queued {stuck} interrupted (was running) item(s)", message_type="info")
 
     # Upscaled videos go to Ready for Toolbox (next pipeline step)
     reconcile_work_queue(
@@ -5092,7 +5120,24 @@ def _run_flashvsr_image_work_queue_body(
     source_archive = (ui.get("batch_source_archive_dir") or paths["pre_scaled"]).strip()
     handoff = (ui.get("img_upscale_handoff_dir") or paths["img_handoff"]).strip()
 
+    stuck = wq.reset_stuck_running()
+    if stuck:
+        log(f"Re-queued {stuck} stuck image job(s)", message_type="info")
+
     if watch_folder and os.path.isdir(watch_folder):
+        _screen_source_duplicates(
+            wq,
+            watch_folder,
+            extensions=IMAGE_EXTS,
+            known_folders=[source_archive, handoff],
+            archive_folders=[source_archive],
+            already_done=lambda p: find_matching_deliverable(
+                p,
+                handoff,
+                paths.get("img_handoff", ""),
+                prefer_exported=False,
+            ),
+        )
         scan = wq.add_folder(
             watch_folder,
             known_id_folders=[source_archive, handoff],
@@ -5105,10 +5150,6 @@ def _run_flashvsr_image_work_queue_body(
             f"Image queue: removed {dropped} already-upscaled pending file(s)",
             message_type="warning",
         )
-
-    stuck = wq.reset_stuck_running()
-    if stuck:
-        log(f"Re-queued {stuck} stuck image job(s)", message_type="info")
 
     reconcile_work_queue(
         wq,
@@ -6038,6 +6079,60 @@ def hygiene_scan_folder(
             stats["errors"] += 1
             log(f"Hygiene skip {name}: {e}", message_type="warning")
     return stats
+
+
+def _screen_source_duplicates(
+    wq,
+    folder: str,
+    *,
+    extensions,
+    known_folders,
+    archive_folders,
+    already_done=None,
+) -> None:
+    """Park previously done copies into <source>/duplicates before inference."""
+    if not folder or not os.path.isdir(folder):
+        return
+    index = None
+    try:
+        index = grok_id_index.load_index(str(wq.app_dir))
+    except Exception:
+        index = None
+    stats = sweep_source_duplicates(
+        folder,
+        extensions=extensions,
+        known_folders=known_folders,
+        archive_folders=archive_folders,
+        queue_items=wq.all_items(),
+        grok_index=index,
+        already_done=already_done,
+    )
+    moved_from = stats.get("moved_from") or []
+    if moved_from:
+        dropped = wq.drop_sources(moved_from)
+        shown = list(stats.get("names") or [])[:8]
+        extra = int(stats.get("moved") or 0) - len(shown)
+        sample = ", ".join(shown)
+        if extra > 0:
+            sample = f"{sample}, +{extra} more"
+        log(
+            "🧹 Duplicate screen: marked "
+            f"{stats.get('moved', 0)} file(s) DUPE_ and moved them to "
+            f"{os.path.join(folder, 'duplicates')}"
+            + (f" ({sample})" if sample else "")
+            + (
+                f" · {dropped} queue row(s) removed so they are not inferred again"
+                if dropped
+                else ""
+            ),
+            message_type="info",
+        )
+    if stats.get("errors"):
+        log(
+            f"Duplicate screen: {stats['errors']} file(s) stayed in {folder} "
+            f"(could not move them into duplicates\\)",
+            message_type="warning",
+        )
 
 
 def _log_queue_scan(prefix: str, folder: str, result: AddResult, *, noun: str = "file") -> None:
